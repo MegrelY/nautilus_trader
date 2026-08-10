@@ -49,9 +49,9 @@ use nautilus_common::{
     messages::{
         ExecutionEvent, ExecutionReport,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateOrderStatusReport, GenerateOrderStatusReports, ModifyOrder, QueryAccount,
-            QueryOrder, SubmitOrder, SubmitOrderList,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
     testing::wait_until_async,
@@ -110,6 +110,8 @@ struct TestServerState {
     /// Optional override for the `order` response payload on the next
     /// exchange call (e.g. to simulate per-order mixed status arrays).
     order_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
+    /// Optional override for a modify response payload on the next exchange call.
+    modify_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Fail the next exchange call with an upstream error.
     fail_next_exchange: Arc<std::sync::atomic::AtomicBool>,
     /// Fail `frontendOpenOrders` info calls with a transport error (503) while
@@ -150,6 +152,7 @@ impl Default for TestServerState {
             inner_order_error_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             order_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            modify_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             fail_next_exchange: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_frontend_open_orders_count: Arc::new(AtomicUsize::new(0)),
             frontend_open_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -404,7 +407,7 @@ async fn handle_exchange(
         // Match the response `type` to the action type so the inner-error
         // shape mirrors what the venue would actually emit.
         let response_type = match action_type {
-            Some("modify") => "modify",
+            Some("modify" | "batchModify") => "modify",
             Some("cancel" | "cancelByCloid") => "cancel",
             _ => "order",
         };
@@ -457,20 +460,13 @@ async fn handle_exchange(
             }))
             .into_response()
         }
-        Some("modify") => Json(json!({
-            "status": "ok",
-            "response": {
-                "type": "modify",
-                "data": {
-                    "statuses": [{
-                        "resting": {
-                            "oid": 12346
-                        }
-                    }]
-                }
+        Some("modify" | "batchModify") => {
+            if let Some(body) = state.modify_response_override.lock().await.take() {
+                Json(body).into_response()
+            } else {
+                Json(default_modify_response(action)).into_response()
             }
-        }))
-        .into_response(),
+        }
         Some("updateLeverage") => Json(json!({
             "status": "ok",
             "response": {
@@ -488,6 +484,32 @@ async fn handle_exchange(
         }))
         .into_response(),
     }
+}
+
+fn default_modify_response(action: &Value) -> Value {
+    let status_count = action
+        .get("modifies")
+        .and_then(Value::as_array)
+        .map_or(1, Vec::len);
+    let statuses = (0..status_count)
+        .map(|index| {
+            json!({
+                "resting": {
+                    "oid": 12346 + index as u64
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "status": "ok",
+        "response": {
+            "type": "modify",
+            "data": {
+                "statuses": statuses
+            }
+        }
+    })
 }
 
 async fn handle_health() -> impl IntoResponse {
@@ -560,7 +582,7 @@ async fn handle_ws_post(socket: &mut WebSocket, state: &TestServerState, payload
 
     if state.inner_order_error_next.swap(false, Ordering::Relaxed) {
         let response_type = match action_type {
-            Some("modify") => "modify",
+            Some("modify" | "batchModify") => "modify",
             Some("cancel" | "cancelByCloid") => "cancel",
             _ => "order",
         };
@@ -613,19 +635,13 @@ async fn handle_ws_post(socket: &mut WebSocket, state: &TestServerState, payload
                 })
             }
         }
-        Some("modify") => json!({
-            "status": "ok",
-            "response": {
-                "type": "modify",
-                "data": {
-                    "statuses": [{
-                        "resting": {
-                            "oid": 12346
-                        }
-                    }]
-                }
+        Some("modify" | "batchModify") => {
+            if let Some(body) = state.modify_response_override.lock().await.take() {
+                body
+            } else {
+                default_modify_response(action)
             }
-        }),
+        }
         Some("updateLeverage") => json!({
             "status": "ok",
             "response": {
@@ -2892,6 +2908,179 @@ async fn test_modify_order_post_error_clears_pending_modify() {
     client.disconnect().await.unwrap();
 }
 
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_batch_modify_orders_posts_one_native_action() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let first = open_limit_order_in_cache(&cache, "O-BATCH-MOD-1", "41001");
+    let second = open_limit_order_in_cache(&cache, "O-BATCH-MOD-2", "41002");
+    client
+        .batch_modify_orders(make_batch_modify_cmd(&first, &second))
+        .unwrap();
+
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let action = state
+        .last_exchange_action
+        .lock()
+        .await
+        .clone()
+        .expect("missing batch modify action");
+    assert_eq!(*state.exchange_request_count.lock().await, 1);
+    assert_eq!(
+        action.get("type").and_then(Value::as_str),
+        Some("batchModify")
+    );
+    assert_eq!(action["modifies"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&first.client_order_id()),
+        Some(VenueOrderId::from("41001")),
+    );
+    assert_eq!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&second.client_order_id()),
+        Some(VenueOrderId::from("41002")),
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_batch_modify_orders_preflights_all_children_before_submission() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let valid = open_limit_order_in_cache(&cache, "O-BATCH-VALID", "42001");
+    let missing = make_limit_order("O-BATCH-MISSING");
+    client
+        .batch_modify_orders(make_batch_modify_cmd(&valid, &missing))
+        .unwrap();
+
+    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(*state.exchange_request_count.lock().await, 0);
+    assert!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&valid.client_order_id())
+            .is_none()
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_batch_modify_orders_clears_only_definitive_child_rejection() {
+    let state = TestServerState::default();
+    *state.modify_response_override.lock().await = Some(json!({
+        "status": "ok",
+        "response": {
+            "type": "modify",
+            "data": {
+                "statuses": [
+                    {"resting": {"oid": 43011}},
+                    {"error": "Order rejected: invalid trigger"}
+                ]
+            }
+        }
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let first = open_limit_order_in_cache(&cache, "O-BATCH-MIXED-1", "43001");
+    let second = open_limit_order_in_cache(&cache, "O-BATCH-MIXED-2", "43002");
+    client
+        .batch_modify_orders(make_batch_modify_cmd(&first, &second))
+        .unwrap();
+
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&first.client_order_id()),
+        Some(VenueOrderId::from("43001")),
+    );
+    assert!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&second.client_order_id())
+            .is_none()
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_batch_modify_orders_keeps_ambiguous_status_count_pending() {
+    let state = TestServerState::default();
+    *state.modify_response_override.lock().await = Some(json!({
+        "status": "ok",
+        "response": {
+            "type": "modify",
+            "data": {
+                "statuses": [{"resting": {"oid": 44011}}]
+            }
+        }
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let first = open_limit_order_in_cache(&cache, "O-BATCH-AMB-1", "44001");
+    let second = open_limit_order_in_cache(&cache, "O-BATCH-AMB-2", "44002");
+    client
+        .batch_modify_orders(make_batch_modify_cmd(&first, &second))
+        .unwrap();
+
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&first.client_order_id()),
+        Some(VenueOrderId::from("44001")),
+    );
+    assert_eq!(
+        client
+            .ws_dispatch_state()
+            .pending_modify(&second.client_order_id()),
+        Some(VenueOrderId::from("44002")),
+    );
+
+    client.disconnect().await.unwrap();
+}
+
 fn make_status_report_cmd(
     client_order_id: Option<ClientOrderId>,
     venue_order_id: Option<VenueOrderId>,
@@ -4791,6 +4980,23 @@ fn make_modify_cmd(order: &OrderAny, venue_order_id: Option<VenueOrderId>) -> Mo
         UnixNanos::default(),
         None,
         None, // correlation_id
+    )
+}
+
+fn make_batch_modify_cmd(first: &OrderAny, second: &OrderAny) -> BatchModifyOrders {
+    BatchModifyOrders::new(
+        first.trader_id(),
+        Some(*HYPERLIQUID_CLIENT_ID),
+        first.strategy_id(),
+        first.instrument_id(),
+        vec![
+            make_modify_cmd(first, first.venue_order_id()),
+            make_modify_cmd(second, second.venue_order_id()),
+        ],
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
     )
 }
 
