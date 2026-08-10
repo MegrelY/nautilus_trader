@@ -150,6 +150,29 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.submit_order_with_command_id(order, position_id, client_id, params, UUID4::new())
+    }
+
+    /// Submits an order with a caller-owned command identity.
+    ///
+    /// This is intended for callers which durably commit an exact one-shot
+    /// submission identity before dispatch. All ordinary strategy validation,
+    /// cache insertion, initialization events, and routing remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered or order submission fails.
+    fn submit_order_with_command_id(
+        &mut self,
+        order: OrderAny,
+        position_id: Option<PositionId>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        command_id: UUID4,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
         let core = StrategyNative::strategy_core_mut(self);
 
         let trader_id = registered_trader_id(core)?;
@@ -201,7 +224,7 @@ pub trait Strategy: DataActor {
             order.exec_algorithm_id(),
             position_id,
             params,
-            UUID4::new(),
+            command_id,
             ts_init,
             None, // correlation_id
         );
@@ -226,10 +249,33 @@ pub trait Strategy: DataActor {
     /// or order list submission fails.
     fn submit_order_list(
         &mut self,
+        orders: Vec<OrderAny>,
+        position_id: Option<PositionId>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
+        self.submit_order_list_with_command_id(orders, position_id, client_id, params, UUID4::new())
+    }
+
+    /// Submits an order list with a caller-owned command identity.
+    ///
+    /// This preserves the standard strategy cache, initialization, risk, and
+    /// execution routing while allowing an exact durable pre-submit permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered, the order list is invalid,
+    /// or order list submission fails.
+    fn submit_order_list_with_command_id(
+        &mut self,
         mut orders: Vec<OrderAny>,
         position_id: Option<PositionId>,
         client_id: Option<ClientId>,
         params: Option<Params>,
+        command_id: UUID4,
     ) -> anyhow::Result<()>
     where
         Self: StrategyNative,
@@ -339,7 +385,7 @@ pub trait Strategy: DataActor {
             exec_algorithm_id,
             position_id,
             params,
-            UUID4::new(),
+            command_id,
             ts_init,
             None, // correlation_id
         );
@@ -491,6 +537,28 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.modify_orders_with_command_id(updates, client_id, params, UUID4::new())
+    }
+
+    /// Batch modifies orders with a caller-owned command identity.
+    ///
+    /// This retains normal ownership validation, pending-update state, risk
+    /// routing, and adapter behavior while binding an already durable permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered, the orders span multiple instruments,
+    /// contain emulated/local orders, or a child modify is invalid.
+    fn modify_orders_with_command_id(
+        &mut self,
+        updates: Vec<BatchModifyOrder>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        command_id: UUID4,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
         if updates.is_empty() {
             anyhow::bail!("Cannot batch modify empty order list");
         }
@@ -613,7 +681,7 @@ pub trait Strategy: DataActor {
             strategy_id,
             instrument_id,
             modifies,
-            UUID4::new(),
+            command_id,
             ts_init,
             params,
             None, // correlation_id
@@ -3337,6 +3405,36 @@ mod tests {
     }
 
     #[rstest]
+    fn test_submit_order_list_preserves_caller_owned_command_identity() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let command_id = UUID4::new();
+        strategy
+            .submit_order_list_with_command_id(
+                vec![
+                    make_initialized_market_order("O-DURABLE-LIST-001"),
+                    make_initialized_market_order("O-DURABLE-LIST-002"),
+                ],
+                None,
+                None,
+                None,
+                command_id,
+            )
+            .unwrap();
+        let messages = risk_messages.get_messages();
+        let Some(TradingCommand::SubmitOrderList(command)) = messages.first() else {
+            panic!("expected SubmitOrderList command")
+        };
+        assert_eq!(command.command_id, command_id);
+    }
+
+    #[rstest]
     fn test_modify_order_routes_non_emulated_orders_to_risk() {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
@@ -3523,6 +3621,49 @@ mod tests {
                 .iter()
                 .all(|event| matches!(event, OrderEventAny::PendingUpdate(_)))
         );
+    }
+
+    #[rstest]
+    fn test_modify_orders_preserves_caller_owned_command_identity() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let order1 = make_accepted_limit_order("O-DURABLE-MODIFY-001");
+        let order2 = make_accepted_limit_order("O-DURABLE-MODIFY-002");
+        add_order_to_cache(&strategy, &order1);
+        add_order_to_cache(&strategy, &order2);
+        let command_id = UUID4::new();
+        strategy
+            .modify_orders_with_command_id(
+                vec![
+                    (
+                        order1.client_order_id(),
+                        Some(Quantity::from(200_000)),
+                        None,
+                        None,
+                    ),
+                    (
+                        order2.client_order_id(),
+                        Some(Quantity::from(200_000)),
+                        None,
+                        None,
+                    ),
+                ],
+                None,
+                None,
+                command_id,
+            )
+            .unwrap();
+        let messages = risk_messages.get_messages();
+        let Some(TradingCommand::ModifyOrders(command)) = messages.first() else {
+            panic!("expected BatchModifyOrders command")
+        };
+        assert_eq!(command.command_id, command_id);
     }
 
     #[rstest]

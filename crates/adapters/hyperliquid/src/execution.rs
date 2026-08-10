@@ -50,7 +50,47 @@ use nautilus_model::{
 };
 use tokio::sync::broadcast;
 
-const BATCH_MODIFY_OUTCOME_CAPACITY: usize = 256;
+const BATCH_OUTCOME_CAPACITY: usize = 256;
+
+/// One child status from a complete native order-list response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperliquidOrderListChildOutcome {
+    pub client_order_id: ClientOrderId,
+    pub succeeded: bool,
+}
+
+/// Response classification for one native order-list request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HyperliquidOrderListResponse {
+    Complete(Vec<HyperliquidOrderListChildOutcome>),
+    Ambiguous,
+    NotSubmitted,
+}
+
+/// Typed response evidence for one high-level order-list command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperliquidOrderListOutcome {
+    pub command_id: UUID4,
+    pub instrument_id: InstrumentId,
+    pub response: HyperliquidOrderListResponse,
+}
+
+/// Subscribes to bounded native order-list response evidence.
+///
+/// A receiver must be created before submission. Lag or closure is ambiguous.
+#[must_use]
+pub fn subscribe_order_list_outcomes() -> broadcast::Receiver<HyperliquidOrderListOutcome> {
+    order_list_outcome_sender().subscribe()
+}
+
+fn order_list_outcome_sender() -> &'static broadcast::Sender<HyperliquidOrderListOutcome> {
+    static SENDER: OnceLock<broadcast::Sender<HyperliquidOrderListOutcome>> = OnceLock::new();
+    SENDER.get_or_init(|| broadcast::channel(BATCH_OUTCOME_CAPACITY).0)
+}
+
+fn publish_order_list_outcome(outcome: HyperliquidOrderListOutcome) {
+    let _ = order_list_outcome_sender().send(outcome);
+}
 
 /// One child status from a complete native `batchModify` response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +133,7 @@ pub fn subscribe_batch_modify_outcomes() -> broadcast::Receiver<HyperliquidBatch
 
 fn batch_modify_outcome_sender() -> &'static broadcast::Sender<HyperliquidBatchModifyOutcome> {
     static SENDER: OnceLock<broadcast::Sender<HyperliquidBatchModifyOutcome>> = OnceLock::new();
-    SENDER.get_or_init(|| broadcast::channel(BATCH_MODIFY_OUTCOME_CAPACITY).0)
+    SENDER.get_or_init(|| broadcast::channel(BATCH_OUTCOME_CAPACITY).0)
 }
 
 fn publish_batch_modify_outcome(outcome: HyperliquidBatchModifyOutcome) {
@@ -104,6 +144,12 @@ fn publish_batch_modify_outcome(outcome: HyperliquidBatchModifyOutcome) {
 struct StagedBracketChild {
     order: OrderAny,
     request: HyperliquidExecPlaceOrderRequest,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderListOutcomeContext {
+    command_id: UUID4,
+    instrument_id: InstrumentId,
 }
 
 #[derive(Debug, Default)]
@@ -986,6 +1032,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         let mut valid_orders = Vec::new();
         let mut hyperliquid_orders = Vec::new();
+        let mut preflight_failed = false;
 
         for order in &orders {
             match self.order_request(order, slippage_bps) {
@@ -994,19 +1041,34 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     valid_orders.push(order.clone());
                 }
                 Err(e) => {
+                    preflight_failed = true;
                     self.emitter
                         .emit_order_denied(order, &format!("Order conversion failed: {e}"));
                 }
             }
         }
 
-        if valid_orders.is_empty() {
-            log::warn!("No valid orders to submit in order list");
+        if preflight_failed {
+            for order in &valid_orders {
+                self.emitter
+                    .emit_order_denied(order, "Order list preflight failed for another child");
+            }
+            publish_order_list_outcome(HyperliquidOrderListOutcome {
+                command_id: cmd.command_id,
+                instrument_id: cmd.instrument_id,
+                response: HyperliquidOrderListResponse::NotSubmitted,
+            });
+            log::warn!("Order list preflight failed; no child was submitted");
             return Ok(());
         }
 
         let grouping = determine_order_list_grouping(&valid_orders);
         log::debug!("Order list grouping: {grouping:?}");
+        let outcome_context =
+            (grouping != HyperliquidExecGrouping::NormalTpsl).then_some(OrderListOutcomeContext {
+                command_id: cmd.command_id,
+                instrument_id: cmd.instrument_id,
+            });
         let (mut valid_orders, mut hyperliquid_orders) =
             order_normal_tpsl_submission(valid_orders, hyperliquid_orders, grouping);
 
@@ -1059,6 +1121,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 dispatch_state,
                 staged_brackets,
                 clock,
+                outcome_context,
             )
             .await;
 
@@ -2921,6 +2984,7 @@ async fn post_order_batch(
     dispatch_state: Arc<WsDispatchState>,
     staged_brackets: Arc<Mutex<StagedBracketState>>,
     clock: &'static AtomicTime,
+    outcome_context: Option<OrderListOutcomeContext>,
 ) {
     let cloid_hexes: Vec<Ustr> = requests
         .iter()
@@ -2946,7 +3010,7 @@ async fn post_order_batch(
         staged_brackets,
     );
 
-    match ws_client.post_action_exec(http_client, &action).await {
+    let outcome_response = match ws_client.post_action_exec(http_client, &action).await {
         Ok(response) if response.is_ok() => {
             let inner_errors = extract_inner_errors(&response);
             let ts = clock.get_time_ns();
@@ -2965,6 +3029,16 @@ async fn post_order_batch(
                         rejection_route.emit_once(order, error_msg, ts, cloid_hex);
                     }
                 }
+                HyperliquidOrderListResponse::Complete(
+                    orders
+                        .iter()
+                        .zip(inner_errors.iter())
+                        .map(|(order, error)| HyperliquidOrderListChildOutcome {
+                            client_order_id: order.client_order_id(),
+                            succeeded: error.is_none(),
+                        })
+                        .collect(),
+                )
             } else if orders.len() > 1
                 && inner_errors.len() == 1
                 && let Some(error_msg) = inner_errors[0].as_ref()
@@ -2973,6 +3047,15 @@ async fn post_order_batch(
                 for (order, cloid_hex) in orders.iter().zip(cloid_hexes.iter()) {
                     rejection_route.emit_once(order, error_msg, ts, cloid_hex);
                 }
+                HyperliquidOrderListResponse::Complete(
+                    orders
+                        .iter()
+                        .map(|order| HyperliquidOrderListChildOutcome {
+                            client_order_id: order.client_order_id(),
+                            succeeded: false,
+                        })
+                        .collect(),
+                )
             } else if !inner_errors.is_empty() {
                 log::warn!(
                     "{label} returned {} statuses for {} orders; preserving unresolved identities \
@@ -2980,8 +3063,10 @@ async fn post_order_batch(
                     inner_errors.len(),
                     orders.len(),
                 );
+                HyperliquidOrderListResponse::Ambiguous
             } else {
                 log::debug!("{label} submitted successfully: {response:?}");
+                HyperliquidOrderListResponse::Ambiguous
             }
         }
         Ok(response) => {
@@ -2992,12 +3077,30 @@ async fn post_order_batch(
             for (order, cloid_hex) in orders.iter().zip(cloid_hexes.iter()) {
                 rejection_route.emit_once(order, &error_msg, ts, cloid_hex);
             }
+            HyperliquidOrderListResponse::Complete(
+                orders
+                    .iter()
+                    .map(|order| HyperliquidOrderListChildOutcome {
+                        client_order_id: order.client_order_id(),
+                        succeeded: false,
+                    })
+                    .collect(),
+            )
         }
         Err(e) => {
             // The batch may have landed. WebSocket events or startup
             // reconciliation must resolve every identity after transport loss.
             log::error!("{label} WebSocket post request failed: {e}");
+            HyperliquidOrderListResponse::Ambiguous
         }
+    };
+
+    if let Some(context) = outcome_context {
+        publish_order_list_outcome(HyperliquidOrderListOutcome {
+            command_id: context.command_id,
+            instrument_id: context.instrument_id,
+            response: outcome_response,
+        });
     }
 
     let ts = clock.get_time_ns();
@@ -3047,6 +3150,7 @@ fn spawn_staged_children(
             dispatch_state,
             staged_brackets,
             clock,
+            None,
         )
         .await;
     });

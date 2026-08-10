@@ -67,7 +67,9 @@ pub use crate::{
     execution::{
         HyperliquidBatchModifyChildOutcome, HyperliquidBatchModifyOutcome,
         HyperliquidBatchModifyResponse, HyperliquidExecutionClient,
-        subscribe_batch_modify_outcomes,
+        HyperliquidOrderListChildOutcome, HyperliquidOrderListOutcome,
+        HyperliquidOrderListResponse, subscribe_batch_modify_outcomes,
+        subscribe_order_list_outcomes,
     },
     factories::{
         HyperliquidDataClientFactory, HyperliquidExecFactoryConfig,

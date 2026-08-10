@@ -59,13 +59,15 @@ use nautilus_common::{
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_hyperliquid::{
     HyperliquidBatchModifyOutcome, HyperliquidBatchModifyResponse, HyperliquidHttpClient,
-    HyperliquidWebSocketClient,
+    HyperliquidOrderListOutcome, HyperliquidOrderListResponse, HyperliquidWebSocketClient,
     common::{
         consts::{HYPERLIQUID_CLIENT_ID, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
         enums::HyperliquidEnvironment,
     },
     config::HyperliquidExecClientConfig,
-    execution::{HyperliquidExecutionClient, subscribe_batch_modify_outcomes},
+    execution::{
+        HyperliquidExecutionClient, subscribe_batch_modify_outcomes, subscribe_order_list_outcomes,
+    },
     http::models::Cloid,
 };
 use nautilus_live::ExecutionClientCore;
@@ -3127,6 +3129,25 @@ async fn recv_batch_modify_outcome(
     .expect("batch outcome timed out")
 }
 
+async fn recv_order_list_outcome(
+    receiver: &mut tokio::sync::broadcast::Receiver<HyperliquidOrderListOutcome>,
+    command_id: UUID4,
+) -> HyperliquidOrderListOutcome {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let outcome = receiver
+                .recv()
+                .await
+                .expect("order-list outcome stream closed");
+            if outcome.command_id == command_id {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("order-list outcome timed out")
+}
+
 fn make_status_report_cmd(
     client_order_id: Option<ClientOrderId>,
     venue_order_id: Option<VenueOrderId>,
@@ -5156,6 +5177,8 @@ async fn test_submit_order_list_denies_outcome_reduce_only() {
         UnixNanos::default(),
     );
 
+    let mut outcomes = subscribe_order_list_outcomes();
+    let command_id = UUID4::new();
     let cmd = SubmitOrderList::new(
         trader_id,
         Some(*HYPERLIQUID_CLIENT_ID),
@@ -5165,7 +5188,7 @@ async fn test_submit_order_list_denies_outcome_reduce_only() {
         None,
         None,
         None,
-        UUID4::new(),
+        command_id,
         UnixNanos::default(),
         None, // correlation_id
     );
@@ -5191,6 +5214,8 @@ async fn test_submit_order_list_denies_outcome_reduce_only() {
         0,
         "no trading action should reach the venue",
     );
+    let outcome = recv_order_list_outcome(&mut outcomes, command_id).await;
+    assert_eq!(outcome.response, HyperliquidOrderListResponse::NotSubmitted);
 
     client.disconnect().await.unwrap();
 }
@@ -5675,6 +5700,8 @@ async fn test_submit_order_list_per_order_inner_error_rejects_only_failing() {
         UnixNanos::default(),
     );
 
+    let mut outcomes = subscribe_order_list_outcomes();
+    let command_id = UUID4::new();
     let cmd = SubmitOrderList::new(
         trader_id,
         Some(*HYPERLIQUID_CLIENT_ID),
@@ -5684,7 +5711,7 @@ async fn test_submit_order_list_per_order_inner_error_rejects_only_failing() {
         None,
         None,
         None,
-        UUID4::new(),
+        command_id,
         UnixNanos::default(),
         None, // correlation_id
     );
@@ -5719,6 +5746,15 @@ async fn test_submit_order_list_per_order_inner_error_rejects_only_failing() {
         client.ws_dispatch_state().lookup_identity(&cid_b).is_none(),
         "failed order identity must be cleaned up",
     );
+    let outcome = recv_order_list_outcome(&mut outcomes, command_id).await;
+    let HyperliquidOrderListResponse::Complete(children) = outcome.response else {
+        panic!("expected complete order-list response evidence")
+    };
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].client_order_id, cid_a);
+    assert!(children[0].succeeded);
+    assert_eq!(children[1].client_order_id, cid_b);
+    assert!(!children[1].succeeded);
 
     client.disconnect().await.unwrap();
 }
