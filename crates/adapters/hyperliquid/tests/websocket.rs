@@ -785,6 +785,15 @@ async fn test_public_trade_replay_is_suppressed_after_reconnection() {
         "an active connection must accept the reconnect request"
     );
 
+    let reconnect = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+        .await
+        .expect("timeout waiting for ordered reconnect event")
+        .expect("strategy-facing stream closed before reconnect event");
+    assert!(
+        matches!(reconnect, NautilusWsMessage::Reconnected),
+        "reconnect must be forwarded before resubscribed data: {reconnect:?}"
+    );
+
     wait_until_async(
         || {
             let state = state.clone();

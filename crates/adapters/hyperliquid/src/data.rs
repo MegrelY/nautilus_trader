@@ -72,7 +72,10 @@ use crate::{
         parse::bar_type_to_interval,
     },
     config::HyperliquidDataClientConfig,
-    data_types::register_hyperliquid_custom_data,
+    data_types::{
+        HyperliquidConnectionDiscontinuity, HyperliquidDiscontinuityKind,
+        register_hyperliquid_custom_data,
+    },
     http::{
         client::HyperliquidHttpClient,
         models::{HyperliquidCandle, HyperliquidFundingHistoryEntry, HyperliquidL2Book},
@@ -376,9 +379,12 @@ impl HyperliquidDataClient {
         let data_sender = self.data_sender.clone();
         let cancellation_token = self.cancellation_token.clone();
         let stream_health = Arc::clone(&self.stream_health);
+        let clock = self.clock;
 
         let task = get_runtime().spawn(async move {
             log::debug!("Hyperliquid WebSocket consumption loop started");
+            let mut connection_generation = 0_u64;
+            let mut stream_closed = false;
 
             loop {
                 tokio::select! {
@@ -388,6 +394,7 @@ impl HyperliquidDataClient {
                     }
                     msg_opt = ws_client.next_event() => {
                         if let Some(msg) = msg_opt {
+                            stream_closed = false;
                             if let Some((channel, instrument_id, ts_event)) =
                                 stream_health_update(&msg)
                             {
@@ -467,6 +474,17 @@ impl HyperliquidDataClient {
                                 }
                                 NautilusWsMessage::Reconnected => {
                                     log::info!("WebSocket reconnected");
+                                    connection_generation = connection_generation.saturating_add(1);
+                                    let ts_init = clock.get_time_ns();
+                                    if let Err(e) = data_sender.send(connection_discontinuity_event(
+                                        connection_generation,
+                                        HyperliquidDiscontinuityKind::Reconnected,
+                                        ts_init,
+                                    )) {
+                                        log::error!(
+                                            "Failed to send WebSocket reconnect discontinuity: {e}"
+                                        );
+                                    }
                                 }
                                 NautilusWsMessage::Error(e) => {
                                     log::warn!("WebSocket error: {e}");
@@ -478,6 +496,20 @@ impl HyperliquidDataClient {
                         } else {
                             // Connection closed or error
                             log::debug!("WebSocket next_event returned None, stream closed");
+                            if !stream_closed && !cancellation_token.is_cancelled() {
+                                stream_closed = true;
+                                connection_generation = connection_generation.saturating_add(1);
+                                let ts_init = clock.get_time_ns();
+                                if let Err(e) = data_sender.send(connection_discontinuity_event(
+                                    connection_generation,
+                                    HyperliquidDiscontinuityKind::StreamClosed,
+                                    ts_init,
+                                )) {
+                                    log::error!(
+                                        "Failed to send WebSocket closure discontinuity: {e}"
+                                    );
+                                }
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         }
                     }
@@ -492,6 +524,18 @@ impl HyperliquidDataClient {
 
         Ok(())
     }
+}
+
+fn connection_discontinuity_event(
+    connection_generation: u64,
+    kind: HyperliquidDiscontinuityKind,
+    ts_init: UnixNanos,
+) -> DataEvent {
+    let discontinuity =
+        HyperliquidConnectionDiscontinuity::new(connection_generation, kind, ts_init, ts_init);
+    let data_type = DataType::new("HyperliquidConnectionDiscontinuity", None, None);
+    let custom = CustomData::new(Arc::new(discontinuity), data_type);
+    DataEvent::Data(Data::Custom(custom))
 }
 
 #[async_trait::async_trait(?Send)]
@@ -629,6 +673,12 @@ impl DataClient for HyperliquidDataClient {
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
         let data_type = cmd.data_type.type_name();
 
+        if data_type == "HyperliquidConnectionDiscontinuity" {
+            // Lifecycle events are emitted by the already-connected adapter;
+            // subscribing requires no additional venue subscription.
+            return Ok(());
+        }
+
         if data_type == "HyperliquidAllMids" {
             let ws = self.ws_client.clone();
             let dex = cmd
@@ -692,6 +742,10 @@ impl DataClient for HyperliquidDataClient {
 
     fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
         let data_type = cmd.data_type.type_name();
+
+        if data_type == "HyperliquidConnectionDiscontinuity" {
+            return Ok(());
+        }
 
         if data_type == "HyperliquidAllMids" {
             let ws = self.ws_client.clone();
@@ -2484,6 +2538,33 @@ mod tests {
             )),
         );
         assert_eq!(stream_health_update(&NautilusWsMessage::Reconnected), None,);
+    }
+
+    #[rstest]
+    #[case(HyperliquidDiscontinuityKind::Reconnected)]
+    #[case(HyperliquidDiscontinuityKind::StreamClosed)]
+    fn test_connection_discontinuity_event_is_typed_transport_fact(
+        #[case] kind: HyperliquidDiscontinuityKind,
+    ) {
+        let ts = UnixNanos::from(42);
+        let DataEvent::Data(Data::Custom(custom)) = connection_discontinuity_event(7, kind, ts)
+        else {
+            panic!("expected custom discontinuity data");
+        };
+        let event = custom
+            .data
+            .as_any()
+            .downcast_ref::<HyperliquidConnectionDiscontinuity>()
+            .expect("expected HyperliquidConnectionDiscontinuity");
+
+        assert_eq!(
+            custom.data_type,
+            DataType::new("HyperliquidConnectionDiscontinuity", None, None)
+        );
+        assert_eq!(event.connection_generation, 7);
+        assert_eq!(event.kind, kind);
+        assert_eq!(event.ts_event, ts);
+        assert_eq!(event.ts_init, ts);
     }
 
     #[rstest]

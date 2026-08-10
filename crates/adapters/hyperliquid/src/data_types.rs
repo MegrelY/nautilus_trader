@@ -30,6 +30,38 @@ use nautilus_persistence_macros::custom_data;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// Transport-level reason that invalidates continuity of adapter market data.
+///
+/// This is deliberately an adapter fact. Downstream consumers own any recovery
+/// generation, buffering, replay, persistence, or readiness state derived from
+/// the discontinuity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HyperliquidDiscontinuityKind {
+    /// The WebSocket transport reconnected after an interruption.
+    Reconnected,
+    /// The strategy-facing WebSocket stream ended unexpectedly.
+    StreamClosed,
+}
+
+/// Ordered notification that Hyperliquid market-data continuity is no longer proven.
+///
+/// `connection_generation` is local to this adapter instance and increments for
+/// each emitted discontinuity. It is diagnostic transport identity only; it is
+/// not a FiboPulse recovery or persistence generation.
+#[custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.hyperliquid")]
+pub struct HyperliquidConnectionDiscontinuity {
+    /// Adapter-local monotonically increasing discontinuity generation.
+    pub connection_generation: u64,
+    /// Transport fact that caused continuity to become unproven.
+    #[custom_data_field(serde)]
+    pub kind: HyperliquidDiscontinuityKind,
+    /// UNIX timestamp (nanoseconds) when the discontinuity was observed.
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the instance was initialized.
+    pub ts_init: UnixNanos,
+}
+
 /// Hyperliquid all mid prices snapshot from the `allMids` WebSocket channel.
 #[cfg_attr(
     feature = "arrow",
@@ -186,6 +218,9 @@ pub fn register_hyperliquid_custom_data() {
 
     let _ =
         nautilus_model::data::ensure_custom_data_json_registered::<HyperliquidAllDexsAssetCtxs>();
+    let _ = nautilus_model::data::ensure_custom_data_json_registered::<
+        HyperliquidConnectionDiscontinuity,
+    >();
 }
 
 #[cfg(test)]

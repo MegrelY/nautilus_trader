@@ -372,8 +372,19 @@ impl HyperliquidWebSocketClient {
 
             loop {
                 match handler.next().await {
-                    Some(NautilusWsMessage::Reconnected) => {
+                    Some(message @ NautilusWsMessage::Reconnected) => {
                         log::info!("WebSocket reconnected");
+                        // The discontinuity must enter the same ordered output
+                        // channel before resubscription can produce any new
+                        // strategy-facing market data.
+                        if handler.send(message).is_err() {
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send reconnect event (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send reconnect event (receiver dropped)");
+                            }
+                            break;
+                        }
                         resubscribe_all();
                     }
                     Some(msg) => {
