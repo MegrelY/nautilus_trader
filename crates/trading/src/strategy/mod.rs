@@ -705,6 +705,28 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.cancel_order_with_command_id(client_order_id, client_id, params, UUID4::new())
+    }
+
+    /// Cancels an order with a caller-owned command identity.
+    ///
+    /// This preserves normal cache ownership and pending-cancel transitions
+    /// while allowing a finite cleanup packet to bind the exact command before
+    /// dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered or order cancellation fails.
+    fn cancel_order_with_command_id(
+        &mut self,
+        client_order_id: ClientOrderId,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        command_id: UUID4,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
         let (trader_id, strategy_id, ts_init) = {
             let core = StrategyNative::strategy_core_mut(self);
             (
@@ -736,7 +758,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.venue_order_id(),
-            UUID4::new(),
+            command_id,
             ts_init,
             params,
             None, // correlation_id
@@ -3710,6 +3732,29 @@ mod tests {
             event_messages.first(),
             Some(OrderEventAny::PendingCancel(_))
         ));
+    }
+
+    #[rstest]
+    fn test_cancel_order_preserves_caller_owned_command_identity() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+        let order = make_accepted_market_order("O-DURABLE-CANCEL-001");
+        add_order_to_cache(&strategy, &order);
+        let command_id = UUID4::new();
+        strategy
+            .cancel_order_with_command_id(order.client_order_id(), None, None, command_id)
+            .unwrap();
+        let messages = exec_messages.get_messages();
+        let Some(TradingCommand::CancelOrder(command)) = messages.first() else {
+            panic!("expected CancelOrder command")
+        };
+        assert_eq!(command.command_id, command_id);
     }
 
     #[rstest]
