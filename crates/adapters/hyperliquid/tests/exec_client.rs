@@ -58,13 +58,14 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_hyperliquid::{
-    HyperliquidHttpClient, HyperliquidWebSocketClient,
+    HyperliquidBatchModifyOutcome, HyperliquidBatchModifyResponse, HyperliquidHttpClient,
+    HyperliquidWebSocketClient,
     common::{
         consts::{HYPERLIQUID_CLIENT_ID, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
         enums::HyperliquidEnvironment,
     },
     config::HyperliquidExecClientConfig,
-    execution::HyperliquidExecutionClient,
+    execution::{HyperliquidExecutionClient, subscribe_batch_modify_outcomes},
     http::models::Cloid,
 };
 use nautilus_live::ExecutionClientCore;
@@ -2919,9 +2920,10 @@ async fn test_batch_modify_orders_posts_one_native_action() {
 
     let first = open_limit_order_in_cache(&cache, "O-BATCH-MOD-1", "41001");
     let second = open_limit_order_in_cache(&cache, "O-BATCH-MOD-2", "41002");
-    client
-        .batch_modify_orders(make_batch_modify_cmd(&first, &second))
-        .unwrap();
+    let mut outcomes = subscribe_batch_modify_outcomes();
+    let command = make_batch_modify_cmd(&first, &second);
+    let command_id = command.command_id;
+    client.batch_modify_orders(command).unwrap();
 
     wait_until_async(
         || async { client.pending_tasks_all_finished() },
@@ -2953,6 +2955,12 @@ async fn test_batch_modify_orders_posts_one_native_action() {
             .pending_modify(&second.client_order_id()),
         Some(VenueOrderId::from("41002")),
     );
+    let outcome = recv_batch_modify_outcome(&mut outcomes, command_id).await;
+    let HyperliquidBatchModifyResponse::Complete(children) = outcome.response else {
+        panic!("expected complete batch-modify response evidence")
+    };
+    assert_eq!(children.len(), 2);
+    assert!(children.iter().all(|child| child.succeeded));
 
     client.disconnect().await.unwrap();
 }
@@ -2969,9 +2977,10 @@ async fn test_batch_modify_orders_preflights_all_children_before_submission() {
 
     let valid = open_limit_order_in_cache(&cache, "O-BATCH-VALID", "42001");
     let missing = make_limit_order("O-BATCH-MISSING");
-    client
-        .batch_modify_orders(make_batch_modify_cmd(&valid, &missing))
-        .unwrap();
+    let mut outcomes = subscribe_batch_modify_outcomes();
+    let command = make_batch_modify_cmd(&valid, &missing);
+    let command_id = command.command_id;
+    client.batch_modify_orders(command).unwrap();
 
     let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
     assert_eq!(events.len(), 2);
@@ -2981,6 +2990,12 @@ async fn test_batch_modify_orders_preflights_all_children_before_submission() {
             .ws_dispatch_state()
             .pending_modify(&valid.client_order_id())
             .is_none()
+    );
+    assert_eq!(
+        recv_batch_modify_outcome(&mut outcomes, command_id)
+            .await
+            .response,
+        HyperliquidBatchModifyResponse::NotSubmitted,
     );
 
     client.disconnect().await.unwrap();
@@ -3009,9 +3024,10 @@ async fn test_batch_modify_orders_clears_only_definitive_child_rejection() {
 
     let first = open_limit_order_in_cache(&cache, "O-BATCH-MIXED-1", "43001");
     let second = open_limit_order_in_cache(&cache, "O-BATCH-MIXED-2", "43002");
-    client
-        .batch_modify_orders(make_batch_modify_cmd(&first, &second))
-        .unwrap();
+    let mut outcomes = subscribe_batch_modify_outcomes();
+    let command = make_batch_modify_cmd(&first, &second);
+    let command_id = command.command_id;
+    client.batch_modify_orders(command).unwrap();
 
     wait_until_async(
         || async { client.pending_tasks_all_finished() },
@@ -3031,6 +3047,13 @@ async fn test_batch_modify_orders_clears_only_definitive_child_rejection() {
             .pending_modify(&second.client_order_id())
             .is_none()
     );
+    let outcome = recv_batch_modify_outcome(&mut outcomes, command_id).await;
+    let HyperliquidBatchModifyResponse::Complete(children) = outcome.response else {
+        panic!("expected complete mixed batch-modify response evidence")
+    };
+    assert_eq!(children.len(), 2);
+    assert!(children[0].succeeded);
+    assert!(!children[1].succeeded);
 
     client.disconnect().await.unwrap();
 }
@@ -3055,9 +3078,10 @@ async fn test_batch_modify_orders_keeps_ambiguous_status_count_pending() {
 
     let first = open_limit_order_in_cache(&cache, "O-BATCH-AMB-1", "44001");
     let second = open_limit_order_in_cache(&cache, "O-BATCH-AMB-2", "44002");
-    client
-        .batch_modify_orders(make_batch_modify_cmd(&first, &second))
-        .unwrap();
+    let mut outcomes = subscribe_batch_modify_outcomes();
+    let command = make_batch_modify_cmd(&first, &second);
+    let command_id = command.command_id;
+    client.batch_modify_orders(command).unwrap();
 
     wait_until_async(
         || async { client.pending_tasks_all_finished() },
@@ -3077,8 +3101,30 @@ async fn test_batch_modify_orders_keeps_ambiguous_status_count_pending() {
             .pending_modify(&second.client_order_id()),
         Some(VenueOrderId::from("44002")),
     );
+    assert_eq!(
+        recv_batch_modify_outcome(&mut outcomes, command_id)
+            .await
+            .response,
+        HyperliquidBatchModifyResponse::Ambiguous,
+    );
 
     client.disconnect().await.unwrap();
+}
+
+async fn recv_batch_modify_outcome(
+    receiver: &mut tokio::sync::broadcast::Receiver<HyperliquidBatchModifyOutcome>,
+    command_id: UUID4,
+) -> HyperliquidBatchModifyOutcome {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let outcome = receiver.recv().await.expect("batch outcome stream closed");
+            if outcome.command_id == command_id {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("batch outcome timed out")
 }
 
 fn make_status_report_cmd(

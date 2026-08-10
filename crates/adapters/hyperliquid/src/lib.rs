@@ -64,7 +64,11 @@ pub mod python;
 pub use crate::{
     config::{HyperliquidDataClientConfig, HyperliquidExecClientConfig},
     data::HyperliquidDataClient,
-    execution::HyperliquidExecutionClient,
+    execution::{
+        HyperliquidBatchModifyChildOutcome, HyperliquidBatchModifyOutcome,
+        HyperliquidBatchModifyResponse, HyperliquidExecutionClient,
+        subscribe_batch_modify_outcomes,
+    },
     factories::{
         HyperliquidDataClientFactory, HyperliquidExecFactoryConfig,
         HyperliquidExecutionClientFactory,

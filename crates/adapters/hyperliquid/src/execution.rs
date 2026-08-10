@@ -16,7 +16,7 @@
 //! Live execution client implementation for the Hyperliquid adapter.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -48,6 +48,57 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
 };
+use tokio::sync::broadcast;
+
+const BATCH_MODIFY_OUTCOME_CAPACITY: usize = 256;
+
+/// One child status from a complete native `batchModify` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperliquidBatchModifyChildOutcome {
+    pub client_order_id: ClientOrderId,
+    pub succeeded: bool,
+}
+
+/// Response classification for one native `batchModify` request.
+///
+/// `Complete` contains one exact status per submitted child. `Ambiguous`
+/// deliberately carries no inferred child result. `NotSubmitted` means local
+/// validation rejected the whole batch before signing or transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HyperliquidBatchModifyResponse {
+    Complete(Vec<HyperliquidBatchModifyChildOutcome>),
+    Ambiguous,
+    NotSubmitted,
+}
+
+/// Typed response evidence emitted by the Hyperliquid execution adapter.
+///
+/// This is response evidence only. It does not claim private-report delivery,
+/// cache agreement, or transactional all-or-nothing venue acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperliquidBatchModifyOutcome {
+    pub command_id: UUID4,
+    pub instrument_id: InstrumentId,
+    pub response: HyperliquidBatchModifyResponse,
+}
+
+/// Subscribes to bounded native batch-modify response evidence.
+///
+/// A receiver must be created before submitting a batch. Lag or closure is an
+/// ambiguity which callers must reconcile rather than treating as success.
+#[must_use]
+pub fn subscribe_batch_modify_outcomes() -> broadcast::Receiver<HyperliquidBatchModifyOutcome> {
+    batch_modify_outcome_sender().subscribe()
+}
+
+fn batch_modify_outcome_sender() -> &'static broadcast::Sender<HyperliquidBatchModifyOutcome> {
+    static SENDER: OnceLock<broadcast::Sender<HyperliquidBatchModifyOutcome>> = OnceLock::new();
+    SENDER.get_or_init(|| broadcast::channel(BATCH_MODIFY_OUTCOME_CAPACITY).0)
+}
+
+fn publish_batch_modify_outcome(outcome: HyperliquidBatchModifyOutcome) {
+    let _ = batch_modify_outcome_sender().send(outcome);
+}
 
 #[derive(Debug, Clone)]
 struct StagedBracketChild {
@@ -1107,6 +1158,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
             return Ok(());
         }
 
+        let command_id = cmd.command_id;
+        let instrument_id = cmd.instrument_id;
+
         let preparations = cmd
             .modifies
             .iter()
@@ -1122,6 +1176,11 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     Err(rejection) => emit_modify_rejection(self, &rejection),
                 }
             }
+            publish_batch_modify_outcome(HyperliquidBatchModifyOutcome {
+                command_id,
+                instrument_id,
+                response: HyperliquidBatchModifyResponse::NotSubmitted,
+            });
             return Ok(());
         }
 
@@ -1143,6 +1202,14 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     let inner_errors = extract_inner_errors(&response);
 
                     if inner_errors.len() == active.len() {
+                        let children = active
+                            .iter()
+                            .zip(&inner_errors)
+                            .map(|(modify, error)| HyperliquidBatchModifyChildOutcome {
+                                client_order_id: modify.client_order_id,
+                                succeeded: error.is_none(),
+                            })
+                            .collect();
                         for (modify, error) in active.iter().zip(inner_errors) {
                             if let Some(error) = error {
                                 log::warn!(
@@ -1157,12 +1224,22 @@ impl ExecutionClient for HyperliquidExecutionClient {
                                 );
                             }
                         }
+                        publish_batch_modify_outcome(HyperliquidBatchModifyOutcome {
+                            command_id,
+                            instrument_id,
+                            response: HyperliquidBatchModifyResponse::Complete(children),
+                        });
                     } else {
                         log::warn!(
                             "Batch modification returned {} statuses for {} children; awaiting WS reconciliation",
                             inner_errors.len(),
                             active.len(),
                         );
+                        publish_batch_modify_outcome(HyperliquidBatchModifyOutcome {
+                            command_id,
+                            instrument_id,
+                            response: HyperliquidBatchModifyResponse::Ambiguous,
+                        });
                     }
                 }
                 Ok(response) => {
@@ -1172,11 +1249,21 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     for modify in &active {
                         clear_failed_modify(modify, &dispatch_state, &http_client, &ws_client);
                     }
+                    publish_batch_modify_outcome(HyperliquidBatchModifyOutcome {
+                        command_id,
+                        instrument_id,
+                        response: HyperliquidBatchModifyResponse::Ambiguous,
+                    });
                 }
                 Err(e) if e.is_transport_error() => {
                     log::warn!(
                         "Batch modification transport failure: {e}; awaiting WS reconciliation",
                     );
+                    publish_batch_modify_outcome(HyperliquidBatchModifyOutcome {
+                        command_id,
+                        instrument_id,
+                        response: HyperliquidBatchModifyResponse::Ambiguous,
+                    });
                 }
                 Err(e) => {
                     log::warn!("Batch modification WebSocket post request failed: {e}");
@@ -1184,6 +1271,11 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     for modify in &active {
                         clear_failed_modify(modify, &dispatch_state, &http_client, &ws_client);
                     }
+                    publish_batch_modify_outcome(HyperliquidBatchModifyOutcome {
+                        command_id,
+                        instrument_id,
+                        response: HyperliquidBatchModifyResponse::Ambiguous,
+                    });
                 }
             }
 
