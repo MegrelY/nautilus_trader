@@ -859,6 +859,24 @@ mod tests {
     }
 
     #[rstest]
+    fn test_active_asset_leverage_data_deserialization() {
+        let input = r#"{
+            "user": "0xabc",
+            "coin": "PUMP",
+            "leverage": {"type": "cross", "value": 10},
+            "maxTradeSzs": ["1", "2"],
+            "availableToTrade": ["3", "4"]
+        }"#;
+
+        let data: HyperliquidActiveAssetData = serde_json::from_str(input).unwrap();
+
+        assert_eq!(data.user, "0xabc");
+        assert_eq!(data.coin, "PUMP");
+        assert_eq!(data.leverage.leverage_type, HyperliquidLeverageType::Cross);
+        assert_eq!(data.leverage.value, 10);
+    }
+
+    #[rstest]
     fn test_funding_history_entry_with_premium() {
         let json = r#"{
             "coin": "BTC",
@@ -2014,8 +2032,17 @@ pub struct AssetPosition {
     pub position_type: HyperliquidPositionType,
 }
 
-/// Leverage information for a position.
+/// Current user leverage for one active asset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HyperliquidActiveAssetData {
+    pub user: String,
+    pub coin: Ustr,
+    pub leverage: LeverageInfo,
+}
+
+/// Leverage information for a position or active asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeverageInfo {
     #[serde(rename = "type")]

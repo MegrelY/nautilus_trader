@@ -15,7 +15,12 @@
 
 //! Factory functions for creating Hyperliquid clients and components.
 
-use std::{any::Any, cell::RefCell, rc::Rc};
+use std::{
+    any::Any,
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use nautilus_common::{
     cache::CacheView,
@@ -28,12 +33,17 @@ use nautilus_model::{
     enums::{AccountType, OmsType},
     identifiers::{AccountId, ClientId, TraderId},
 };
+use tokio::sync::mpsc;
 
 use crate::{
     common::consts::{HYPERLIQUID, HYPERLIQUID_VENUE},
     config::{HyperliquidDataClientConfig, HyperliquidExecClientConfig},
     data::HyperliquidDataClient,
-    execution::HyperliquidExecutionClient,
+    execution::{
+        HyperliquidExecutionClient, HyperliquidLeveragePreflightChannels,
+        HyperliquidLeveragePreflightOutcome, HyperliquidLeveragePreflightRequest,
+        LEVERAGE_PREFLIGHT_CAPACITY,
+    },
 };
 
 impl ClientConfig for HyperliquidDataClientConfig {
@@ -183,35 +193,7 @@ impl ExecutionClientFactory for HyperliquidExecutionClientFactory {
         config: &dyn ClientConfig,
         cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
-        let factory_config = config
-            .as_any()
-            .downcast_ref::<HyperliquidExecFactoryConfig>()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Invalid config type for HyperliquidExecutionClientFactory. Expected HyperliquidExecFactoryConfig, was {config:?}",
-                )
-            })?
-            .clone();
-
-        // Hyperliquid uses netting for perpetual futures
-        let oms_type = OmsType::Netting;
-
-        // Hyperliquid is always margin (perpetual futures)
-        let account_type = AccountType::Margin;
-
-        let core = ExecutionClientCore::new(
-            factory_config.trader_id,
-            ClientId::from(name),
-            *HYPERLIQUID_VENUE,
-            oms_type,
-            factory_config.account_id,
-            account_type,
-            None,
-            cache,
-        );
-
-        let client = HyperliquidExecutionClient::new(core, factory_config.config)?;
-        Ok(Box::new(client))
+        create_execution_client(name, config, cache, None)
     }
 
     fn name(&self) -> &'static str {
@@ -221,6 +203,93 @@ impl ExecutionClientFactory for HyperliquidExecutionClientFactory {
     fn config_type(&self) -> &'static str {
         "HyperliquidExecFactoryConfig"
     }
+}
+
+/// One-use factory which exposes a non-signing command channel to the exact
+/// execution client that owns the Hyperliquid signer.
+#[derive(Debug, Clone)]
+pub struct HyperliquidLeveragePreflightExecutionClientFactory {
+    channels: Arc<Mutex<Option<HyperliquidLeveragePreflightChannels>>>,
+}
+
+impl HyperliquidLeveragePreflightExecutionClientFactory {
+    /// Creates one factory plus its bounded request and typed outcome channels.
+    #[must_use]
+    pub fn new() -> (
+        Self,
+        mpsc::Sender<HyperliquidLeveragePreflightRequest>,
+        mpsc::Receiver<HyperliquidLeveragePreflightOutcome>,
+    ) {
+        let (request_sender, requests) = mpsc::channel(LEVERAGE_PREFLIGHT_CAPACITY);
+        let (outcomes, outcome_receiver) = mpsc::channel(LEVERAGE_PREFLIGHT_CAPACITY);
+        (
+            Self {
+                channels: Arc::new(Mutex::new(Some(HyperliquidLeveragePreflightChannels {
+                    requests,
+                    outcomes,
+                }))),
+            },
+            request_sender,
+            outcome_receiver,
+        )
+    }
+}
+
+impl ExecutionClientFactory for HyperliquidLeveragePreflightExecutionClientFactory {
+    fn create(
+        &self,
+        name: &str,
+        config: &dyn ClientConfig,
+        cache: CacheView,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        let channels = self
+            .channels
+            .lock()
+            .map_err(|_| anyhow::anyhow!("leverage preflight factory channel is poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("leverage preflight factory is one-use"))?;
+        create_execution_client(name, config, cache, Some(channels))
+    }
+
+    fn name(&self) -> &'static str {
+        HYPERLIQUID
+    }
+
+    fn config_type(&self) -> &'static str {
+        "HyperliquidExecFactoryConfig"
+    }
+}
+
+fn create_execution_client(
+    name: &str,
+    config: &dyn ClientConfig,
+    cache: CacheView,
+    leverage_channels: Option<HyperliquidLeveragePreflightChannels>,
+) -> anyhow::Result<Box<dyn ExecutionClient>> {
+    let factory_config = config
+        .as_any()
+        .downcast_ref::<HyperliquidExecFactoryConfig>()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid config type for HyperliquidExecutionClientFactory. Expected HyperliquidExecFactoryConfig, was {config:?}",
+            )
+        })?
+        .clone();
+    let core = ExecutionClientCore::new(
+        factory_config.trader_id,
+        ClientId::from(name),
+        *HYPERLIQUID_VENUE,
+        OmsType::Netting,
+        factory_config.account_id,
+        AccountType::Margin,
+        None,
+        cache,
+    );
+    let mut client = HyperliquidExecutionClient::new(core, factory_config.config)?;
+    if let Some(channels) = leverage_channels {
+        client.install_leverage_preflight_channels(channels);
+    }
+    Ok(Box::new(client))
 }
 
 #[cfg(test)]
@@ -262,6 +331,17 @@ mod tests {
     fn test_hyperliquid_execution_client_factory_default() {
         let factory = HyperliquidExecutionClientFactory;
         assert_eq!(factory.name(), HYPERLIQUID);
+    }
+
+    #[rstest]
+    fn test_leverage_preflight_factory_exposes_only_bounded_non_signing_channels() {
+        let (factory, request_sender, outcome_receiver) =
+            HyperliquidLeveragePreflightExecutionClientFactory::new();
+
+        assert_eq!(factory.name(), HYPERLIQUID);
+        assert_eq!(factory.config_type(), "HyperliquidExecFactoryConfig");
+        assert_eq!(request_sender.capacity(), LEVERAGE_PREFLIGHT_CAPACITY);
+        assert_eq!(outcome_receiver.capacity(), LEVERAGE_PREFLIGHT_CAPACITY);
     }
 
     #[rstest]

@@ -16,7 +16,10 @@
 //! Live execution client implementation for the Hyperliquid adapter.
 
 use std::{
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -48,9 +51,61 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 const BATCH_OUTCOME_CAPACITY: usize = 256;
+pub(crate) const LEVERAGE_PREFLIGHT_CAPACITY: usize = 16;
+
+/// Caller-owned identity for one exact maximum-cross-leverage preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperliquidLeveragePreflightRequest {
+    pub command_id: UUID4,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub raw_symbol: Ustr,
+}
+
+/// Fail-closed classification for an incomplete leverage preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HyperliquidLeveragePreflightFailure {
+    NotConnected,
+    AccountMismatch,
+    VenueMismatch,
+    InstrumentUnavailable,
+    InstrumentIdentityMismatch,
+    MaximumUnavailable,
+    CrossMarginUnsupported,
+    UpdateAmbiguous,
+    VerificationUnavailable,
+    VerificationMismatch,
+}
+
+/// Exact result from the execution client which owns the Hyperliquid signer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HyperliquidLeveragePreflightResponse {
+    Proven {
+        maximum_leverage: u32,
+        observed_leverage: u32,
+        observed_at: UnixNanos,
+    },
+    Failed(HyperliquidLeveragePreflightFailure),
+}
+
+/// Typed response evidence for one caller-owned leverage preflight command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperliquidLeveragePreflightOutcome {
+    pub command_id: UUID4,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub raw_symbol: Ustr,
+    pub response: HyperliquidLeveragePreflightResponse,
+}
+
+#[derive(Debug)]
+pub(crate) struct HyperliquidLeveragePreflightChannels {
+    pub requests: mpsc::Receiver<HyperliquidLeveragePreflightRequest>,
+    pub outcomes: mpsc::Sender<HyperliquidLeveragePreflightOutcome>,
+}
 
 /// One child status from a complete native order-list response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,7 +311,7 @@ use crate::{
             HYPERLIQUID_POST_ONLY_WOULD_MATCH, HYPERLIQUID_VENUE,
         },
         credential::Secrets,
-        enums::HyperliquidProductType,
+        enums::{HyperliquidLeverageType, HyperliquidProductType},
         parse::{
             clamp_price_to_precision, derive_limit_from_trigger, derive_market_order_price,
             extract_error_message, extract_inner_error, extract_inner_errors, normalize_price,
@@ -268,13 +323,15 @@ use crate::{
     http::{
         client::HyperliquidHttpClient,
         models::{
-            ClearinghouseState, Cloid, HyperliquidExecAction, HyperliquidExecCancelByCloidRequest,
-            HyperliquidExecCancelOrderRequest, HyperliquidExecGrouping,
-            HyperliquidExecModifyOrderRequest, HyperliquidExecModifyTarget,
-            HyperliquidExecOrderKind, HyperliquidExecPlaceOrderRequest, HyperliquidExecTpSl,
+            ClearinghouseState, Cloid, HyperliquidActiveAssetData, HyperliquidExecAction,
+            HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelOrderRequest,
+            HyperliquidExecGrouping, HyperliquidExecModifyOrderRequest,
+            HyperliquidExecModifyTarget, HyperliquidExecOrderKind,
+            HyperliquidExecPlaceOrderRequest, HyperliquidExecTpSl, HyperliquidMeta,
             SpotClearinghouseState,
         },
         parse::derive_outcome_settlements,
+        query::ExchangeAction,
     },
     outcome_settlement::{OutcomeSettlementTracker, build_settlement_fills},
     websocket::{
@@ -298,6 +355,9 @@ pub struct HyperliquidExecutionClient {
     pending_tasks: TaskHandles,
     ws_stream_handle: Option<JoinHandle<()>>,
     settlement_poll_handle: Option<JoinHandle<()>>,
+    leverage_preflight_channels: Option<HyperliquidLeveragePreflightChannels>,
+    leverage_preflight_handle: Option<JoinHandle<()>>,
+    leverage_connected: Arc<AtomicBool>,
     ws_dispatch_state: Arc<WsDispatchState>,
     staged_brackets: Arc<Mutex<StagedBracketState>>,
     outcome_settlement_tracker: Arc<Mutex<OutcomeSettlementTracker>>,
@@ -570,10 +630,55 @@ impl HyperliquidExecutionClient {
             pending_tasks: TaskHandles::default(),
             ws_stream_handle: None,
             settlement_poll_handle: None,
+            leverage_preflight_channels: None,
+            leverage_preflight_handle: None,
+            leverage_connected: Arc::new(AtomicBool::new(false)),
             ws_dispatch_state: Arc::new(WsDispatchState::new()),
             staged_brackets: Arc::new(Mutex::new(StagedBracketState::default())),
             outcome_settlement_tracker: Arc::new(Mutex::new(OutcomeSettlementTracker::new())),
         })
+    }
+
+    pub(crate) fn install_leverage_preflight_channels(
+        &mut self,
+        channels: HyperliquidLeveragePreflightChannels,
+    ) {
+        self.leverage_preflight_channels = Some(channels);
+    }
+
+    fn start_leverage_preflight_processor(&mut self) {
+        if self.leverage_preflight_handle.is_some() {
+            return;
+        }
+        let Some(mut channels) = self.leverage_preflight_channels.take() else {
+            return;
+        };
+        let http_client = self.http_client.clone();
+        let connected = self.leverage_connected.clone();
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+        self.leverage_preflight_handle = Some(get_runtime().spawn(async move {
+            while let Some(request) = channels.requests.recv().await {
+                let response = execute_leverage_preflight(
+                    &http_client,
+                    &connected,
+                    account_id,
+                    request,
+                    clock,
+                )
+                .await;
+                let outcome = HyperliquidLeveragePreflightOutcome {
+                    command_id: request.command_id,
+                    account_id: request.account_id,
+                    instrument_id: request.instrument_id,
+                    raw_symbol: request.raw_symbol,
+                    response,
+                };
+                if channels.outcomes.send(outcome).await.is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     fn register_order_identity(&self, order: &OrderAny) {
@@ -790,6 +895,113 @@ impl HyperliquidExecutionClient {
     }
 }
 
+async fn execute_leverage_preflight(
+    http_client: &HyperliquidHttpClient,
+    connected: &AtomicBool,
+    expected_account_id: AccountId,
+    request: HyperliquidLeveragePreflightRequest,
+    clock: &'static AtomicTime,
+) -> HyperliquidLeveragePreflightResponse {
+    use HyperliquidLeveragePreflightFailure as Failure;
+
+    if !connected.load(Ordering::Acquire) {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::NotConnected);
+    }
+    if request.account_id != expected_account_id {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::AccountMismatch);
+    }
+    if request.instrument_id.venue != *HYPERLIQUID_VENUE {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::VenueMismatch);
+    }
+    let Some(cached_asset_index) =
+        http_client.get_asset_index(request.instrument_id.symbol.as_str())
+    else {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::InstrumentUnavailable);
+    };
+    let Ok(meta) = http_client.info_meta().await else {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::VerificationUnavailable);
+    };
+    let (fresh_asset_index, maximum_leverage) =
+        match resolve_maximum_cross_leverage(&meta, request.raw_symbol) {
+            Ok(resolved) => resolved,
+            Err(failure) => return HyperliquidLeveragePreflightResponse::Failed(failure),
+        };
+    if cached_asset_index != fresh_asset_index {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::InstrumentIdentityMismatch);
+    }
+    let action = ExchangeAction::update_leverage(fresh_asset_index, true, maximum_leverage);
+    let Ok(response) = http_client.post_action(&action).await else {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::UpdateAmbiguous);
+    };
+    if !response.is_ok() {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::UpdateAmbiguous);
+    }
+    let Ok(account_address) = http_client.get_account_address() else {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::VerificationUnavailable);
+    };
+    let Ok(observed) = http_client
+        .info_active_asset_data(&account_address, request.raw_symbol.as_str())
+        .await
+    else {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::VerificationUnavailable);
+    };
+    if !verified_maximum_cross_leverage(
+        &observed,
+        &account_address,
+        request.raw_symbol.as_str(),
+        maximum_leverage,
+    ) {
+        return HyperliquidLeveragePreflightResponse::Failed(Failure::VerificationMismatch);
+    }
+
+    HyperliquidLeveragePreflightResponse::Proven {
+        maximum_leverage,
+        observed_leverage: observed.leverage.value,
+        observed_at: clock.get_time_ns(),
+    }
+}
+
+fn resolve_maximum_cross_leverage(
+    meta: &HyperliquidMeta,
+    raw_symbol: Ustr,
+) -> Result<(u32, u32), HyperliquidLeveragePreflightFailure> {
+    use HyperliquidLeveragePreflightFailure as Failure;
+
+    let mut matches = meta
+        .universe
+        .iter()
+        .enumerate()
+        .filter(|(_, asset)| asset.name == raw_symbol);
+    let (index, asset) = matches.next().ok_or(Failure::InstrumentUnavailable)?;
+    if matches.next().is_some() {
+        return Err(Failure::InstrumentIdentityMismatch);
+    }
+    if asset.is_delisted.unwrap_or(false) {
+        return Err(Failure::InstrumentUnavailable);
+    }
+    if asset.only_isolated.unwrap_or(false) {
+        return Err(Failure::CrossMarginUnsupported);
+    }
+    let maximum = asset
+        .max_leverage
+        .filter(|value| *value > 0)
+        .ok_or(Failure::MaximumUnavailable)?;
+    let index = u32::try_from(index).map_err(|_| Failure::InstrumentUnavailable)?;
+    Ok((index, maximum))
+}
+
+fn verified_maximum_cross_leverage(
+    observed: &HyperliquidActiveAssetData,
+    account_address: &str,
+    coin: &str,
+    maximum_leverage: u32,
+) -> bool {
+    observed.user.eq_ignore_ascii_case(account_address)
+        && observed.coin.as_str() == coin
+        && observed.leverage.leverage_type == HyperliquidLeverageType::Cross
+        && observed.leverage.value == maximum_leverage
+}
+
 #[async_trait(?Send)]
 impl ExecutionClient for HyperliquidExecutionClient {
     fn is_connected(&self) -> bool {
@@ -836,6 +1048,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let sender = get_exec_event_sender();
         self.emitter.set_sender(sender);
         self.core.set_started();
+        self.start_leverage_preflight_processor();
 
         log::info!(
             "Started: client_id={}, account_id={}, environment={:?}, vault_address={:?}, proxy_url={:?}",
@@ -861,6 +1074,11 @@ impl ExecutionClient for HyperliquidExecutionClient {
         }
 
         if let Some(handle) = self.settlement_poll_handle.take() {
+            handle.abort();
+        }
+
+        self.leverage_connected.store(false, Ordering::Release);
+        if let Some(handle) = self.leverage_preflight_handle.take() {
             handle.abort();
         }
 
@@ -1751,6 +1969,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         };
 
         if let Err(e) = post_ws.await {
+            self.leverage_connected.store(false, Ordering::Release);
             log::warn!("Connect failed after WS started, tearing down: {e}");
             let _ = self.ws_client.disconnect().await;
             self.abort_pending_tasks();
@@ -1782,6 +2001,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         }
 
         self.core.set_connected();
+        self.leverage_connected.store(true, Ordering::Release);
 
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
@@ -1793,6 +2013,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         }
 
         log::info!("Disconnecting Hyperliquid execution client");
+        self.leverage_connected.store(false, Ordering::Release);
 
         // Disconnect WebSocket
         self.ws_client.disconnect().await?;
@@ -3592,8 +3813,22 @@ use crate::common::parse::determine_order_list_grouping;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
+        },
+    };
 
+    use axum::{
+        Json, Router,
+        body::Bytes,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::post,
+    };
     use nautilus_common::messages::{ExecutionEvent, execution::GenerateOrderStatusReports};
     use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
     use nautilus_live::ExecutionEventEmitter;
@@ -3613,24 +3848,407 @@ mod tests {
     use nautilus_network::websocket::TransportBackend;
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use serde_json::{Value, json};
     use ustr::Ustr;
 
     use super::{
         CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
         OrderIdentity, PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
         build_ouo_resize_request, can_fast_cancel_order, determine_order_list_grouping,
-        filter_order_status_reports_for_command, handle_execution_report,
-        register_order_identity_into, split_fast_cancel_requests, validate_order_for_hyperliquid,
+        execute_leverage_preflight, filter_order_status_reports_for_command,
+        handle_execution_report, register_order_identity_into, resolve_maximum_cross_leverage,
+        split_fast_cancel_requests, validate_order_for_hyperliquid,
+        verified_maximum_cross_leverage,
     };
     use crate::{
-        common::enums::HyperliquidEnvironment,
+        common::enums::{HyperliquidEnvironment, HyperliquidLeverageType},
         http::models::{
-            Cloid, HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecOrderKind,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
+            Cloid, HyperliquidActiveAssetData, HyperliquidAssetInfo, HyperliquidExecGrouping,
+            HyperliquidExecLimitParams, HyperliquidExecOrderKind, HyperliquidExecPlaceOrderRequest,
+            HyperliquidExecTif, HyperliquidMeta, LeverageInfo,
         },
     };
 
     const TEST_INSTRUMENT_ID: &str = "BTC-USD-PERP.HYPERLIQUID";
+    const LEVERAGE_TEST_ACCOUNT_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
+
+    #[derive(Clone)]
+    struct LeverageTestServerState {
+        cached_meta: Value,
+        fresh_meta: Arc<tokio::sync::RwLock<Value>>,
+        active_data: Arc<tokio::sync::RwLock<Value>>,
+        exchange_status: Arc<AtomicU16>,
+        exchange_body: Arc<tokio::sync::RwLock<Value>>,
+        exchange_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        active_data_requests: Arc<AtomicUsize>,
+    }
+
+    impl LeverageTestServerState {
+        fn new(cached_names: &[&str], fresh_names: &[&str]) -> Self {
+            Self {
+                cached_meta: leverage_meta_json(cached_names),
+                fresh_meta: Arc::new(tokio::sync::RwLock::new(leverage_meta_json(fresh_names))),
+                active_data: Arc::new(tokio::sync::RwLock::new(json!({
+                    "user": LEVERAGE_TEST_ACCOUNT_ADDRESS,
+                    "coin": "PUMP",
+                    "leverage": {"type": "cross", "value": 10},
+                    "maxTradeSzs": ["1", "1"],
+                    "availableToTrade": ["1", "1"]
+                }))),
+                exchange_status: Arc::new(AtomicU16::new(StatusCode::OK.as_u16())),
+                exchange_body: Arc::new(tokio::sync::RwLock::new(json!({
+                    "status": "ok",
+                    "response": {"type": "default"}
+                }))),
+                exchange_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                active_data_requests: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    fn leverage_meta_json(names: &[&str]) -> Value {
+        json!({
+            "universe": names
+                .iter()
+                .map(|name| json!({
+                    "name": name,
+                    "szDecimals": 0,
+                    "maxLeverage": if *name == "PUMP" { 10 } else { 20 },
+                    "onlyIsolated": false,
+                    "isDelisted": false
+                }))
+                .collect::<Vec<_>>(),
+            "marginTables": []
+        })
+    }
+
+    async fn handle_leverage_test_info(
+        State(state): State<LeverageTestServerState>,
+        body: Bytes,
+    ) -> Response {
+        let Ok(request): Result<Value, _> = serde_json::from_slice(&body) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        match request.get("type").and_then(Value::as_str) {
+            Some("spotMeta") => Json(json!({"tokens": [], "universe": []})).into_response(),
+            Some("allPerpMetas") => {
+                Json(Value::Array(vec![state.cached_meta.clone()])).into_response()
+            }
+            Some("outcomeMeta") => Json(json!({"outcomes": []})).into_response(),
+            Some("meta") => Json(state.fresh_meta.read().await.clone()).into_response(),
+            Some("activeAssetData") => {
+                state.active_data_requests.fetch_add(1, Ordering::SeqCst);
+                Json(state.active_data.read().await.clone()).into_response()
+            }
+            _ => StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+
+    async fn handle_leverage_test_exchange(
+        State(state): State<LeverageTestServerState>,
+        body: Bytes,
+    ) -> Response {
+        let Ok(request): Result<Value, _> = serde_json::from_slice(&body) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        state.exchange_requests.lock().await.push(request);
+        let status = StatusCode::from_u16(state.exchange_status.load(Ordering::SeqCst))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(state.exchange_body.read().await.clone())).into_response()
+    }
+
+    async fn start_leverage_test_server(state: LeverageTestServerState) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/info", post(handle_leverage_test_info))
+            .route("/exchange", post(handle_leverage_test_exchange))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        address
+    }
+
+    async fn leverage_test_client(state: LeverageTestServerState) -> HyperliquidHttpClient {
+        let address = start_leverage_test_server(state).await;
+        let mut client = HyperliquidHttpClient::with_credentials(
+            Some(format!("0x{}", "deadbeef".repeat(8))),
+            None,
+            Some(LEVERAGE_TEST_ACCOUNT_ADDRESS),
+            HyperliquidEnvironment::Testnet,
+            5,
+            None,
+        )
+        .unwrap();
+        client.set_base_info_url(format!("http://{address}/info"));
+        client.set_base_exchange_url(format!("http://{address}/exchange"));
+        client.request_instrument_defs().await.unwrap();
+        client
+    }
+
+    fn leverage_request() -> super::HyperliquidLeveragePreflightRequest {
+        super::HyperliquidLeveragePreflightRequest {
+            command_id: UUID4::new(),
+            account_id: AccountId::from("HYPERLIQUID-TESTNET-001"),
+            instrument_id: InstrumentId::from("PUMP-USD-PERP.HYPERLIQUID"),
+            raw_symbol: Ustr::from("PUMP"),
+        }
+    }
+
+    fn leverage_meta(asset: HyperliquidAssetInfo) -> HyperliquidMeta {
+        HyperliquidMeta {
+            universe: vec![asset],
+        }
+    }
+
+    #[rstest]
+    fn maximum_cross_leverage_requires_active_cross_capability() {
+        let active = HyperliquidAssetInfo {
+            name: Ustr::from("PUMP"),
+            sz_decimals: 0,
+            max_leverage: Some(10),
+            only_isolated: Some(false),
+            is_delisted: Some(false),
+        };
+        assert_eq!(
+            resolve_maximum_cross_leverage(&leverage_meta(active.clone()), Ustr::from("PUMP")),
+            Ok((0, 10))
+        );
+
+        let isolated = HyperliquidAssetInfo {
+            only_isolated: Some(true),
+            ..active.clone()
+        };
+        assert_eq!(
+            resolve_maximum_cross_leverage(&leverage_meta(isolated), Ustr::from("PUMP")),
+            Err(super::HyperliquidLeveragePreflightFailure::CrossMarginUnsupported)
+        );
+
+        let delisted = HyperliquidAssetInfo {
+            is_delisted: Some(true),
+            ..active
+        };
+        assert_eq!(
+            resolve_maximum_cross_leverage(&leverage_meta(delisted), Ustr::from("PUMP")),
+            Err(super::HyperliquidLeveragePreflightFailure::InstrumentUnavailable)
+        );
+    }
+
+    #[rstest]
+    fn maximum_cross_leverage_verification_is_exact() {
+        let observation = HyperliquidActiveAssetData {
+            user: "0xABC".to_string(),
+            coin: Ustr::from("PUMP"),
+            leverage: LeverageInfo {
+                leverage_type: HyperliquidLeverageType::Cross,
+                value: 10,
+            },
+        };
+
+        assert!(verified_maximum_cross_leverage(
+            &observation,
+            "0xabc",
+            "PUMP",
+            10
+        ));
+        assert!(!verified_maximum_cross_leverage(
+            &observation,
+            "0xabc",
+            "PUMP",
+            9
+        ));
+        assert!(!verified_maximum_cross_leverage(
+            &observation,
+            "0xdef",
+            "PUMP",
+            10
+        ));
+        assert!(!verified_maximum_cross_leverage(
+            &observation,
+            "0xabc",
+            "OTHER",
+            10
+        ));
+
+        let isolated = HyperliquidActiveAssetData {
+            leverage: LeverageInfo {
+                leverage_type: HyperliquidLeverageType::Isolated,
+                value: 10,
+            },
+            ..observation
+        };
+        assert!(!verified_maximum_cross_leverage(
+            &isolated, "0xabc", "PUMP", 10
+        ));
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_signs_exactly_once_after_fresh_identity_proof() {
+        let state = LeverageTestServerState::new(&["PUMP", "OTHER"], &["PUMP", "OTHER"]);
+        let client = leverage_test_client(state.clone()).await;
+        let request = leverage_request();
+
+        let response = execute_leverage_preflight(
+            &client,
+            &AtomicBool::new(true),
+            request.account_id,
+            request,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            super::HyperliquidLeveragePreflightResponse::Proven {
+                maximum_leverage: 10,
+                observed_leverage: 10,
+                ..
+            }
+        ));
+        let exchange_requests = state.exchange_requests.lock().await;
+        assert_eq!(exchange_requests.len(), 1);
+        assert_eq!(exchange_requests[0]["action"]["type"], "updateLeverage");
+        assert_eq!(exchange_requests[0]["action"]["asset"], 0);
+        assert_eq!(exchange_requests[0]["action"]["isCross"], true);
+        assert_eq!(exchange_requests[0]["action"]["leverage"], 10);
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_stale_cached_index_causes_zero_mutation() {
+        let state = LeverageTestServerState::new(&["PUMP", "OTHER"], &["OTHER", "PUMP"]);
+        let client = leverage_test_client(state.clone()).await;
+        let request = leverage_request();
+
+        let response = execute_leverage_preflight(
+            &client,
+            &AtomicBool::new(true),
+            request.account_id,
+            request,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::InstrumentIdentityMismatch
+            )
+        );
+        assert!(state.exchange_requests.lock().await.is_empty());
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_rejects_wrong_venue_before_http_or_mutation() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        let client = leverage_test_client(state.clone()).await;
+        let mut request = leverage_request();
+        request.instrument_id = InstrumentId::from("PUMP-USD-PERP.BINANCE");
+
+        let response = execute_leverage_preflight(
+            &client,
+            &AtomicBool::new(true),
+            request.account_id,
+            request,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::VenueMismatch
+            )
+        );
+        assert!(state.exchange_requests.lock().await.is_empty());
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_non_ok_and_transport_failures_remain_ambiguous() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        let client = leverage_test_client(state.clone()).await;
+        *state.exchange_body.write().await = json!({
+            "status": "err",
+            "response": "rejected"
+        });
+
+        for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
+            state
+                .exchange_status
+                .store(status.as_u16(), Ordering::SeqCst);
+            let request = leverage_request();
+            let response = execute_leverage_preflight(
+                &client,
+                &AtomicBool::new(true),
+                request.account_id,
+                request,
+                get_atomic_clock_realtime(),
+            )
+            .await;
+            assert_eq!(
+                response,
+                super::HyperliquidLeveragePreflightResponse::Failed(
+                    super::HyperliquidLeveragePreflightFailure::UpdateAmbiguous
+                )
+            );
+        }
+
+        assert_eq!(state.exchange_requests.lock().await.len(), 2);
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_verification_identity_and_value_mismatches_fail_closed() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        let client = leverage_test_client(state.clone()).await;
+        let mismatches = [
+            json!({
+                "user": "0x2222222222222222222222222222222222222222",
+                "coin": "PUMP",
+                "leverage": {"type": "cross", "value": 10}
+            }),
+            json!({
+                "user": LEVERAGE_TEST_ACCOUNT_ADDRESS,
+                "coin": "OTHER",
+                "leverage": {"type": "cross", "value": 10}
+            }),
+            json!({
+                "user": LEVERAGE_TEST_ACCOUNT_ADDRESS,
+                "coin": "PUMP",
+                "leverage": {"type": "isolated", "value": 10}
+            }),
+            json!({
+                "user": LEVERAGE_TEST_ACCOUNT_ADDRESS,
+                "coin": "PUMP",
+                "leverage": {"type": "cross", "value": 9}
+            }),
+        ];
+
+        for mismatch in mismatches {
+            *state.active_data.write().await = mismatch;
+            let request = leverage_request();
+            let response = execute_leverage_preflight(
+                &client,
+                &AtomicBool::new(true),
+                request.account_id,
+                request,
+                get_atomic_clock_realtime(),
+            )
+            .await;
+            assert_eq!(
+                response,
+                super::HyperliquidLeveragePreflightResponse::Failed(
+                    super::HyperliquidLeveragePreflightFailure::VerificationMismatch
+                )
+            );
+        }
+
+        assert_eq!(state.exchange_requests.lock().await.len(), 4);
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 4);
+    }
 
     fn test_emitter() -> (
         ExecutionEventEmitter,

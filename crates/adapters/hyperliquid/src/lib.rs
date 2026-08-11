@@ -67,13 +67,15 @@ pub use crate::{
     execution::{
         HyperliquidBatchModifyChildOutcome, HyperliquidBatchModifyOutcome,
         HyperliquidBatchModifyResponse, HyperliquidExecutionClient,
+        HyperliquidLeveragePreflightFailure, HyperliquidLeveragePreflightOutcome,
+        HyperliquidLeveragePreflightRequest, HyperliquidLeveragePreflightResponse,
         HyperliquidOrderListChildOutcome, HyperliquidOrderListOutcome,
         HyperliquidOrderListResponse, subscribe_batch_modify_outcomes,
         subscribe_order_list_outcomes,
     },
     factories::{
         HyperliquidDataClientFactory, HyperliquidExecFactoryConfig,
-        HyperliquidExecutionClientFactory,
+        HyperliquidExecutionClientFactory, HyperliquidLeveragePreflightExecutionClientFactory,
     },
     http::client::HyperliquidHttpClient,
     websocket::client::HyperliquidWebSocketClient,

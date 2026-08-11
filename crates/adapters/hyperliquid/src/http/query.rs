@@ -127,6 +127,13 @@ pub struct OpenOrdersParams {
     pub user: String,
 }
 
+/// Parameters for current user leverage and trading capacity for one asset.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveAssetDataParams {
+    pub user: String,
+    pub coin: String,
+}
+
 /// Parameters for clearinghouse state request.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClearinghouseStateParams {
@@ -174,6 +181,7 @@ pub enum InfoRequestParams {
     UserFills(UserFillsParams),
     OrderStatus(OrderStatusParams),
     OpenOrders(OpenOrdersParams),
+    ActiveAssetData(ActiveAssetDataParams),
     ClearinghouseState(ClearinghouseStateParams),
     SpotClearinghouseState(SpotClearinghouseStateParams),
     CandleSnapshot(CandleSnapshotParams),
@@ -304,6 +312,17 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::FrontendOpenOrders,
             params: InfoRequestParams::OpenOrders(OpenOrdersParams {
                 user: user.to_string(),
+            }),
+        }
+    }
+
+    /// Creates a request to get current user leverage for one asset.
+    pub fn active_asset_data(user: &str, coin: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::ActiveAssetData,
+            params: InfoRequestParams::ActiveAssetData(ActiveAssetDataParams {
+                user: user.to_string(),
+                coin: coin.to_string(),
             }),
         }
     }
@@ -519,6 +538,24 @@ mod tests {
         assert!(matches!(req.params, InfoRequestParams::None));
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"type":"outcomeMeta"}"#);
+    }
+
+    #[rstest]
+    fn test_info_request_active_asset_leverage_data() {
+        let request = InfoRequest::active_asset_data("0xabc", "PUMP");
+
+        assert_eq!(
+            request.request_type,
+            HyperliquidInfoRequestType::ActiveAssetData
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type": "activeAssetData",
+                "user": "0xabc",
+                "coin": "PUMP",
+            })
+        );
     }
 
     #[rstest]

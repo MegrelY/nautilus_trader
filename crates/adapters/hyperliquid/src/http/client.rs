@@ -79,13 +79,14 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            ClearinghouseState, Cloid, HyperliquidCandleSnapshot, HyperliquidExchangeRequest,
-            HyperliquidExchangeResponse, HyperliquidExecAction, HyperliquidExecBuilderFee,
-            HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelOrderRequest,
-            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecMergeOutcomeParams,
-            HyperliquidExecMergeQuestionParams, HyperliquidExecModifyOrderRequest,
-            HyperliquidExecModifyTarget, HyperliquidExecNegateOutcomeParams,
-            HyperliquidExecOrderKind, HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
+            ClearinghouseState, Cloid, HyperliquidActiveAssetData, HyperliquidCandleSnapshot,
+            HyperliquidExchangeRequest, HyperliquidExchangeResponse, HyperliquidExecAction,
+            HyperliquidExecBuilderFee, HyperliquidExecCancelByCloidRequest,
+            HyperliquidExecCancelOrderRequest, HyperliquidExecGrouping, HyperliquidExecLimitParams,
+            HyperliquidExecMergeOutcomeParams, HyperliquidExecMergeQuestionParams,
+            HyperliquidExecModifyOrderRequest, HyperliquidExecModifyTarget,
+            HyperliquidExecNegateOutcomeParams, HyperliquidExecOrderKind,
+            HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
             HyperliquidExecPlaceOrderRequest, HyperliquidExecSplitOutcomeParams,
             HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams,
             HyperliquidExecUserOutcomeOp, HyperliquidFills, HyperliquidFundingHistoryEntry,
@@ -469,6 +470,17 @@ impl HyperliquidRawHttpClient {
     pub async fn info_frontend_open_orders(&self, user: &str) -> Result<Value> {
         let request = InfoRequest::frontend_open_orders(user);
         self.send_info_request(&request).await
+    }
+
+    /// Get current user leverage and trading capacity for one asset.
+    pub async fn info_active_asset_data(
+        &self,
+        user: &str,
+        coin: &str,
+    ) -> Result<HyperliquidActiveAssetData> {
+        let request = InfoRequest::active_asset_data(user, coin);
+        let response = self.send_info_request(&request).await?;
+        serde_json::from_value(response).map_err(Error::Serde)
     }
 
     /// Get the most recent historical orders for a user.
@@ -1784,6 +1796,15 @@ impl HyperliquidHttpClient {
     /// Get frontend open orders (includes more detail) for a user.
     pub async fn info_frontend_open_orders(&self, user: &str) -> Result<Value> {
         self.inner.info_frontend_open_orders(user).await
+    }
+
+    /// Get current user leverage and trading capacity for one asset.
+    pub async fn info_active_asset_data(
+        &self,
+        user: &str,
+        coin: &str,
+    ) -> Result<HyperliquidActiveAssetData> {
+        self.inner.info_active_asset_data(user, coin).await
     }
 
     /// Get the most recent historical orders for a user.

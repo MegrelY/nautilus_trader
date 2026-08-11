@@ -889,6 +889,8 @@ pub enum HyperliquidInfoRequestType {
     OpenOrders,
     /// Get frontend open orders (includes more detail).
     FrontendOpenOrders,
+    /// Get current user leverage and trading capacity for one asset.
+    ActiveAssetData,
     /// Get user state (balances, positions, margin).
     ClearinghouseState,
     /// Get spot clearinghouse state.
@@ -947,6 +949,7 @@ impl HyperliquidInfoRequestType {
             Self::OrderStatus => "orderStatus",
             Self::OpenOrders => "openOrders",
             Self::FrontendOpenOrders => "frontendOpenOrders",
+            Self::ActiveAssetData => "activeAssetData",
             Self::ClearinghouseState => "clearinghouseState",
             Self::SpotClearinghouseState => "spotClearinghouseState",
             Self::ExchangeStatus => "exchangeStatus",

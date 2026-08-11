@@ -133,6 +133,7 @@ pub fn info_base_weight(req: &InfoRequest) -> u32 {
         HyperliquidInfoRequestType::L2Book
         | HyperliquidInfoRequestType::AllMids
         | HyperliquidInfoRequestType::RecentTrades
+        | HyperliquidInfoRequestType::ActiveAssetData
         | HyperliquidInfoRequestType::ClearinghouseState
         | HyperliquidInfoRequestType::OrderStatus
         | HyperliquidInfoRequestType::SpotClearinghouseState
