@@ -56,6 +56,13 @@ use tokio::sync::{broadcast, mpsc};
 const BATCH_OUTCOME_CAPACITY: usize = 256;
 pub(crate) const LEVERAGE_PREFLIGHT_CAPACITY: usize = 16;
 
+/// Whether a leverage preflight may converge state or must only observe it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HyperliquidLeveragePreflightMode {
+    ApplyAndVerify,
+    VerifyOnly,
+}
+
 /// Caller-owned identity for one exact maximum-cross-leverage preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HyperliquidLeveragePreflightRequest {
@@ -63,6 +70,7 @@ pub struct HyperliquidLeveragePreflightRequest {
     pub account_id: AccountId,
     pub instrument_id: InstrumentId,
     pub raw_symbol: Ustr,
+    pub mode: HyperliquidLeveragePreflightMode,
 }
 
 /// Fail-closed classification for an incomplete leverage preflight.
@@ -98,6 +106,7 @@ pub struct HyperliquidLeveragePreflightOutcome {
     pub account_id: AccountId,
     pub instrument_id: InstrumentId,
     pub raw_symbol: Ustr,
+    pub mode: HyperliquidLeveragePreflightMode,
     pub response: HyperliquidLeveragePreflightResponse,
 }
 
@@ -672,6 +681,7 @@ impl HyperliquidExecutionClient {
                     account_id: request.account_id,
                     instrument_id: request.instrument_id,
                     raw_symbol: request.raw_symbol,
+                    mode: request.mode,
                     response,
                 };
                 if channels.outcomes.send(outcome).await.is_err() {
@@ -929,12 +939,14 @@ async fn execute_leverage_preflight(
     if cached_asset_index != fresh_asset_index {
         return HyperliquidLeveragePreflightResponse::Failed(Failure::InstrumentIdentityMismatch);
     }
-    let action = ExchangeAction::update_leverage(fresh_asset_index, true, maximum_leverage);
-    let Ok(response) = http_client.post_action(&action).await else {
-        return HyperliquidLeveragePreflightResponse::Failed(Failure::UpdateAmbiguous);
-    };
-    if !response.is_ok() {
-        return HyperliquidLeveragePreflightResponse::Failed(Failure::UpdateAmbiguous);
+    if request.mode == HyperliquidLeveragePreflightMode::ApplyAndVerify {
+        let action = ExchangeAction::update_leverage(fresh_asset_index, true, maximum_leverage);
+        let Ok(response) = http_client.post_action(&action).await else {
+            return HyperliquidLeveragePreflightResponse::Failed(Failure::UpdateAmbiguous);
+        };
+        if !response.is_ok() {
+            return HyperliquidLeveragePreflightResponse::Failed(Failure::UpdateAmbiguous);
+        }
     }
     let Ok(account_address) = http_client.get_account_address() else {
         return HyperliquidLeveragePreflightResponse::Failed(Failure::VerificationUnavailable);
@@ -3993,6 +4005,7 @@ mod tests {
             account_id: AccountId::from("HYPERLIQUID-TESTNET-001"),
             instrument_id: InstrumentId::from("PUMP-USD-PERP.HYPERLIQUID"),
             raw_symbol: Ustr::from("PUMP"),
+            mode: super::HyperliquidLeveragePreflightMode::ApplyAndVerify,
         }
     }
 
@@ -4138,6 +4151,34 @@ mod tests {
         );
         assert!(state.exchange_requests.lock().await.is_empty());
         assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_verify_only_reconciles_without_mutation() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        let client = leverage_test_client(state.clone()).await;
+        let mut request = leverage_request();
+        request.mode = super::HyperliquidLeveragePreflightMode::VerifyOnly;
+
+        let response = execute_leverage_preflight(
+            &client,
+            &AtomicBool::new(true),
+            request.account_id,
+            request,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            super::HyperliquidLeveragePreflightResponse::Proven {
+                maximum_leverage: 10,
+                observed_leverage: 10,
+                ..
+            }
+        ));
+        assert!(state.exchange_requests.lock().await.is_empty());
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
