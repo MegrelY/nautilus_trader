@@ -13,7 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::VecDeque, fmt::Debug, ops::ControlFlow, pin::Pin, time::Duration};
+use std::{
+    collections::VecDeque,
+    fmt::Debug,
+    ops::ControlFlow,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -45,7 +52,7 @@ use nautilus_model::{
     types::{Currency, Money},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgConnectOptions};
+use sqlx::PgPool;
 use tokio::{time::Instant, try_join};
 use ustr::Ustr;
 
@@ -56,6 +63,7 @@ use crate::sql::{
 
 // Task and connection names
 const CACHE_PROCESS: &str = "cache-process";
+const DEFAULT_WRITE_CAPACITY: usize = 1_024;
 
 /// Configuration for a Postgres-backed cache database.
 ///
@@ -103,6 +111,7 @@ impl Debug for PostgresCacheConfig {
 mod tests {
     use rstest::rstest;
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
 
@@ -146,6 +155,71 @@ mod tests {
 
         assert!(error.to_string().contains("unknown field `type`"));
     }
+
+    #[tokio::test]
+    async fn rejects_zero_write_capacity_before_connecting() {
+        let error =
+            PostgresCacheDatabase::connect_with_write_capacity(None, None, None, None, None, 0)
+                .await
+                .expect_err("zero write capacity should fail");
+
+        assert!(error.to_string().contains("capacity must be positive"));
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_reports_full_and_closed() {
+        let (database, receiver) = disconnected_database(1);
+        database
+            .add("first".to_string(), Bytes::new())
+            .expect("first write should occupy the queue");
+        let full = database
+            .add("second".to_string(), Bytes::new())
+            .expect_err("second write should report saturation");
+        assert!(full.to_string().contains("queue is full"));
+
+        drop(receiver);
+        let closed = database
+            .add("third".to_string(), Bytes::new())
+            .expect_err("closed writer should reject new work");
+        assert!(closed.to_string().contains("writer is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn terminal_writer_failure_is_observable_and_rejects_new_work() {
+        let (database, _receiver) = disconnected_database(1);
+        *database.writer_health.lock().expect("health lock") =
+            PostgresCacheWriterHealth::Failed("injected failure".to_string());
+
+        assert_eq!(
+            database.writer_health(),
+            PostgresCacheWriterHealth::Failed("injected failure".to_string())
+        );
+        let error = database
+            .add("after-failure".to_string(), Bytes::new())
+            .expect_err("failed writer should reject new work");
+        assert!(error.to_string().contains("injected failure"));
+    }
+
+    fn disconnected_database(
+        capacity: usize,
+    ) -> (
+        PostgresCacheDatabase,
+        tokio::sync::mpsc::Receiver<DatabaseQuery>,
+    ) {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://nautilus:pass@localhost/nautilus")
+            .expect("lazy pool");
+        let (tx, receiver) = tokio::sync::mpsc::channel(capacity);
+        (
+            PostgresCacheDatabase {
+                pool,
+                tx,
+                handle: None,
+                writer_health: Arc::new(Mutex::new(PostgresCacheWriterHealth::Running)),
+            },
+            receiver,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -175,8 +249,18 @@ impl CacheDatabaseFactory for PostgresCacheConfig {
 )]
 pub struct PostgresCacheDatabase {
     pub pool: PgPool,
-    tx: tokio::sync::mpsc::UnboundedSender<DatabaseQuery>,
-    handle: tokio::task::JoinHandle<()>,
+    tx: tokio::sync::mpsc::Sender<DatabaseQuery>,
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    writer_health: Arc<Mutex<PostgresCacheWriterHealth>>,
+}
+
+/// Observable state for the bounded PostgreSQL cache writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostgresCacheWriterHealth {
+    Running,
+    Closing,
+    Closed,
+    Failed(String),
 }
 
 #[allow(
@@ -211,39 +295,73 @@ impl PostgresCacheDatabase {
     ///
     /// Returns an error if establishing the database connection fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal Postgres pool connection attempt (`connect_pg`) unwraps on error.
     pub async fn connect(
         host: Option<String>,
         port: Option<u16>,
         username: Option<String>,
         password: Option<String>,
         database: Option<String>,
-    ) -> Result<Self, sqlx::Error> {
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_write_capacity(
+            host,
+            port,
+            username,
+            password,
+            database,
+            DEFAULT_WRITE_CAPACITY,
+        )
+        .await
+    }
+
+    /// Connects with an explicit bounded write capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid capacity, failed connection, or stale schema.
+    pub async fn connect_with_write_capacity(
+        host: Option<String>,
+        port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+        database: Option<String>,
+        write_capacity: usize,
+    ) -> anyhow::Result<Self> {
+        if write_capacity == 0 {
+            anyhow::bail!("Postgres cache write capacity must be positive");
+        }
         let pg_connect_options =
             get_postgres_connect_options(host, port, username, password, database);
-        let pool = connect_pg(pg_connect_options.clone().into()).await.unwrap();
+        let pool = connect_pg(pg_connect_options.into()).await?;
         check_schema_migrated(&pool).await?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseQuery>();
-
+        let (tx, rx) = tokio::sync::mpsc::channel::<DatabaseQuery>(write_capacity);
+        let writer_health = Arc::new(Mutex::new(PostgresCacheWriterHealth::Running));
+        let task_health = Arc::clone(&writer_health);
+        let task_pool = pool.clone();
         let handle = get_runtime().spawn(async move {
-            Box::pin(Self::process_commands(
-                rx,
-                pg_connect_options.clone().into(),
-            ))
-            .await;
+            let result = Box::pin(Self::process_commands(rx, task_pool)).await;
+            let terminal = match &result {
+                Ok(()) => PostgresCacheWriterHealth::Closed,
+                Err(error) => PostgresCacheWriterHealth::Failed(error.to_string()),
+            };
+            match task_health.lock() {
+                Ok(mut health) => *health = terminal,
+                Err(poisoned) => *poisoned.into_inner() = terminal,
+            }
+            result
         });
-        Ok(Self { pool, tx, handle })
+        Ok(Self {
+            pool,
+            tx,
+            handle: Some(handle),
+            writer_health,
+        })
     }
 
     async fn process_commands(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseQuery>,
-        pg_connect_options: PgConnectOptions,
-    ) {
+        mut rx: tokio::sync::mpsc::Receiver<DatabaseQuery>,
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
         log_task_started(CACHE_PROCESS);
-
-        let pool = connect_pg(pg_connect_options).await.unwrap();
 
         // Buffering
         let mut buffer: VecDeque<DatabaseQuery> = VecDeque::new();
@@ -261,29 +379,64 @@ impl PostgresCacheDatabase {
         loop {
             tokio::select! {
                 maybe_msg = rx.recv() => {
-                    let result = Box::pin(handle_query(
+                    let flow = Box::pin(handle_query(
                         maybe_msg,
                         &mut buffer,
                         buffer_interval,
                         &pool,
                     ))
-                    .await;
+                    .await?;
 
-                    if result.is_break() {
+                    if flow.is_break() {
                         break;
                     }
                 }
                 () = &mut flush_timer, if !buffer_interval.is_zero() => {
-                    flush_buffer(&mut buffer, &pool, &mut flush_timer, buffer_interval).await;
+                    flush_buffer(&mut buffer, &pool, &mut flush_timer, buffer_interval).await?;
                 }
             }
         }
 
         if !buffer.is_empty() {
-            drain_buffer(&pool, &mut buffer).await;
+            drain_buffer(&pool, &mut buffer).await?;
         }
 
         log_task_stopped(CACHE_PROCESS);
+        Ok(())
+    }
+
+    /// Returns the current terminally observable writer health.
+    #[must_use]
+    pub fn writer_health(&self) -> PostgresCacheWriterHealth {
+        match self.writer_health.lock() {
+            Ok(health) => health.clone(),
+            Err(_) => PostgresCacheWriterHealth::Failed(
+                "Postgres cache writer health lock poisoned".to_string(),
+            ),
+        }
+    }
+
+    fn enqueue(&self, query: DatabaseQuery, operation: &str) -> anyhow::Result<()> {
+        match self.writer_health() {
+            PostgresCacheWriterHealth::Running => {}
+            PostgresCacheWriterHealth::Closing => {
+                anyhow::bail!("Postgres cache writer is closing; rejected {operation}")
+            }
+            PostgresCacheWriterHealth::Closed => {
+                anyhow::bail!("Postgres cache writer is closed; rejected {operation}")
+            }
+            PostgresCacheWriterHealth::Failed(error) => {
+                anyhow::bail!("Postgres cache writer failed before {operation}: {error}")
+            }
+        }
+        self.tx.try_send(query).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                anyhow::anyhow!("Postgres cache write queue is full; rejected {operation}")
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                anyhow::anyhow!("Postgres cache writer is unavailable; rejected {operation}")
+            }
+        })
     }
 }
 
@@ -322,26 +475,26 @@ async fn handle_query(
     buffer: &mut VecDeque<DatabaseQuery>,
     buffer_interval: Duration,
     pool: &PgPool,
-) -> ControlFlow<()> {
+) -> anyhow::Result<ControlFlow<()>> {
     let Some(msg) = maybe_msg else {
         log::debug!("Command channel closed");
-        return ControlFlow::Break(());
+        return Ok(ControlFlow::Break(()));
     };
 
     if matches!(msg, DatabaseQuery::Close) {
         if !buffer.is_empty() {
-            drain_buffer(pool, buffer).await;
+            drain_buffer(pool, buffer).await?;
         }
-        return ControlFlow::Break(());
+        return Ok(ControlFlow::Break(()));
     }
 
     buffer.push_back(msg);
 
     if buffer_interval.is_zero() {
-        drain_buffer(pool, buffer).await;
+        drain_buffer(pool, buffer).await?;
     }
 
-    ControlFlow::Continue(())
+    Ok(ControlFlow::Continue(()))
 }
 
 async fn flush_buffer(
@@ -349,11 +502,12 @@ async fn flush_buffer(
     pool: &PgPool,
     flush_timer: &mut Pin<&mut tokio::time::Sleep>,
     buffer_interval: Duration,
-) {
+) -> anyhow::Result<()> {
     if !buffer.is_empty() {
-        drain_buffer(pool, buffer).await;
+        drain_buffer(pool, buffer).await?;
     }
     flush_timer.as_mut().reset(Instant::now() + buffer_interval);
+    Ok(())
 }
 
 /// Retrieves a `PostgresCacheDatabase` using default connection options.
@@ -376,56 +530,52 @@ pub async fn get_pg_cache_database() -> anyhow::Result<PostgresCacheDatabase> {
 #[async_trait::async_trait]
 impl CacheDatabaseAdapter for PostgresCacheDatabase {
     fn close(&mut self) -> anyhow::Result<()> {
-        let pool = self.pool.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        log::debug!("Closing connection pool");
-
-        tokio::task::block_in_place(|| {
-            get_runtime().block_on(async {
-                pool.close().await;
-
-                if let Err(e) = tx.send(()) {
-                    log::error!("Error closing pool: {e:?}");
+        let should_signal = {
+            let mut health = self
+                .writer_health
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Postgres cache writer health lock poisoned"))?;
+            match &*health {
+                PostgresCacheWriterHealth::Running => {
+                    *health = PostgresCacheWriterHealth::Closing;
+                    true
                 }
-            });
-        });
-
-        // Cancel message handling task
-        if let Err(e) = self.tx.send(DatabaseQuery::Close) {
-            log::warn!("Error sending close: {e:?}");
-        }
+                PostgresCacheWriterHealth::Closing => false,
+                PostgresCacheWriterHealth::Closed => return Ok(()),
+                PostgresCacheWriterHealth::Failed(_) => false,
+            }
+        };
+        let close_signal = if should_signal {
+            tokio::task::block_in_place(|| {
+                get_runtime().block_on(self.tx.send(DatabaseQuery::Close))
+            })
+            .map_err(|_| anyhow::anyhow!("Postgres cache writer closed before drain request"))
+        } else {
+            Ok(())
+        };
 
         log_task_awaiting("cache-write");
-
-        tokio::task::block_in_place(|| {
-            if let Err(e) = get_runtime().block_on(&mut self.handle) {
-                log::error!("Error awaiting task 'cache-write': {e:?}");
-            }
-        });
-
+        let writer_result = if let Some(mut handle) = self.handle.take() {
+            tokio::task::block_in_place(|| get_runtime().block_on(&mut handle))
+                .map_err(|error| anyhow::anyhow!("Postgres cache writer task failed: {error}"))?
+        } else {
+            Ok(())
+        };
+        tokio::task::block_in_place(|| get_runtime().block_on(self.pool.close()));
+        writer_result?;
+        close_signal?;
+        if let PostgresCacheWriterHealth::Failed(error) = self.writer_health() {
+            anyhow::bail!("Postgres cache writer failed: {error}");
+        }
         log::debug!("Closed");
-
-        Ok(rx.recv()?)
+        Ok(())
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
         let pool = self.pool.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-
         tokio::task::block_in_place(|| {
-            get_runtime().block_on(async {
-                if let Err(e) = DatabaseQueries::truncate(&pool).await {
-                    log::error!("Error flushing pool: {e:?}");
-                }
-
-                if let Err(e) = tx.send(()) {
-                    log::error!("Error sending flush result: {e:?}");
-                }
-            });
-        });
-
-        Ok(rx.recv()?)
+            get_runtime().block_on(async { DatabaseQueries::truncate(&pool).await })
+        })
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
@@ -824,23 +974,17 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
         let query = DatabaseQuery::Add(key, value.into());
-        self.tx
-            .send(query)
-            .map_err(|e| anyhow::anyhow!("Failed to send query to database message handler: {e}"))
+        self.enqueue(query, "add")
     }
 
     fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddCurrency(*currency);
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to query add_currency to database message handler: {e}")
-        })
+        self.enqueue(query, "add_currency")
     }
 
     fn add_instrument(&self, instrument: &InstrumentAny) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddInstrument(instrument.clone());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_instrument to database message handler: {e}")
-        })
+        self.enqueue(query, "add_instrument")
     }
 
     fn add_synthetic(&self, _synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
@@ -849,42 +993,28 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddAccount(account_last_event(account)?, false);
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_account to database message handler: {e}")
-        })
+        self.enqueue(query, "add_account")
     }
 
     fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddOrder(order_initialized_event(order), client_id);
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_order to database message handler: {e}")
-        })
+        self.enqueue(query, "add_order")
     }
 
     fn add_order_snapshot(&self, snapshot: &OrderSnapshot) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddOrderSnapshot(snapshot.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to send query add_order_snapshot to database message handler: {e}"
-            )
-        })
+        self.enqueue(query, "add_order_snapshot")
     }
 
     fn add_position(&self, position: &Position) -> anyhow::Result<()> {
         let event = position_last_event(position)?;
         let query = DatabaseQuery::AddPosition(position.id, event);
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_position to database message handler: {e}")
-        })
+        self.enqueue(query, "add_position")
     }
 
     fn add_position_snapshot(&self, snapshot: &PositionSnapshot) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddPositionSnapshot(snapshot.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to send query add_position_snapshot to database message handler: {e}"
-            )
-        })
+        self.enqueue(query, "add_position_snapshot")
     }
 
     fn add_order_book(&self, _order_book: &OrderBook) -> anyhow::Result<()> {
@@ -893,9 +1023,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_quote(&self, quote: &QuoteTick) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddQuote(quote.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_quote to database message handler: {e}")
-        })
+        self.enqueue(query, "add_quote")
     }
 
     fn load_quotes(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<QuoteTick>> {
@@ -926,9 +1054,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_trade(&self, trade: &TradeTick) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddTrade(trade.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_trade to database message handler: {e}")
-        })
+        self.enqueue(query, "add_trade")
     }
 
     fn load_trades(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<TradeTick>> {
@@ -970,9 +1096,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_bar(&self, bar: &Bar) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddBar(bar.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_bar to database message handler: {e}")
-        })
+        self.enqueue(query, "add_bar")
     }
 
     fn load_bars(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<Bar>> {
@@ -1003,9 +1127,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_signal(&self, signal: &Signal) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddSignal(signal.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_signal to database message handler: {e}")
-        })
+        self.enqueue(query, "add_signal")
     }
 
     fn load_signals(&self, name: &str) -> anyhow::Result<Vec<Signal>> {
@@ -1034,9 +1156,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_custom_data(&self, data: &CustomData) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddCustom(data.to_owned());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_signal to database message handler: {e}")
-        })
+        self.enqueue(query, "add_custom_data")
     }
 
     fn load_custom_data(&self, data_type: &DataType) -> anyhow::Result<Vec<CustomData>> {
@@ -1135,11 +1255,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         position_id: PositionId,
     ) -> anyhow::Result<()> {
         let query = DatabaseQuery::IndexOrderPosition(client_order_id, position_id);
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to send query index_order_position to database message handler: {e}"
-            )
-        })
+        self.enqueue(query, "index_order_position")
     }
 
     fn update_actor(
@@ -1160,16 +1276,12 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn update_account(&self, account: &AccountAny) -> anyhow::Result<()> {
         let query = DatabaseQuery::AddAccount(account_last_event(account)?, true);
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query add_account to database message handler: {e}")
-        })
+        self.enqueue(query, "update_account")
     }
 
     fn update_order(&self, event: &OrderEventAny) -> anyhow::Result<()> {
         let query = DatabaseQuery::UpdateOrder(event.clone());
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query update_order to database message handler: {e}")
-        })
+        self.enqueue(query, "update_order")
     }
 
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
@@ -1178,9 +1290,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         } else {
             DatabaseQuery::AddPositionSnapshot(PositionSnapshot::from_replay_state(position, None))
         };
-        self.tx.send(query).map_err(|e| {
-            anyhow::anyhow!("Failed to send query update_position to database message handler: {e}")
-        })
+        self.enqueue(query, "update_position")
     }
 
     fn snapshot_order_state(&self, _order: &OrderAny) -> anyhow::Result<()> {
@@ -1221,7 +1331,7 @@ fn position_last_event(position: &Position) -> anyhow::Result<OrderFilled> {
     clippy::too_many_lines,
     reason = "database command dispatch enumerates each cache query variant explicitly"
 )]
-async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
+async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) -> anyhow::Result<()> {
     for cmd in buffer.drain(..) {
         let result: anyhow::Result<()> = match cmd {
             DatabaseQuery::Close => Ok(()),
@@ -1342,8 +1452,7 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
             }
         };
 
-        if let Err(e) = result {
-            log::error!("Error on query: {e:?}");
-        }
+        result?;
     }
+    Ok(())
 }
