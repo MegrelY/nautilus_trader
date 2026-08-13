@@ -188,6 +188,20 @@ pub async fn connect_pg(options: PgConnectOptions) -> anyhow::Result<PgPool> {
     Ok(PgPool::connect_with(options).await?)
 }
 
+/// Returns the exact PostgreSQL schema bundled with this Nautilus revision.
+///
+/// Consumers which provision a dedicated cache database can install these
+/// statements without depending on a source checkout at runtime.
+#[must_use]
+pub const fn embedded_postgres_schema() -> [&'static str; 4] {
+    [
+        include_str!("../../../../schema/sql/types.sql"),
+        include_str!("../../../../schema/sql/tables.sql"),
+        include_str!("../../../../schema/sql/functions.sql"),
+        include_str!("../../../../schema/sql/partitions.sql"),
+    ]
+}
+
 /// Scans the current working directory for the `nautilus_trader` repository
 /// and constructs the path to the SQL schema directory.
 ///
