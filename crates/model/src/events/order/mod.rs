@@ -97,6 +97,14 @@ pub trait OrderEvent: 'static + Send {
     fn time_in_force(&self) -> Option<TimeInForce>;
     fn liquidity_side(&self) -> Option<LiquiditySide>;
     fn post_only(&self) -> Option<bool>;
+    /// Whether a rejection was caused by a post-only order crossing the book.
+    ///
+    /// This is stored separately from the original order's `post_only` flag so
+    /// event persistence can preserve the rejection reason without changing
+    /// the meaning of [`OrderEvent::post_only`].
+    fn due_post_only(&self) -> Option<bool> {
+        None
+    }
     fn reduce_only(&self) -> Option<bool>;
     fn quote_quantity(&self) -> Option<bool>;
     fn reconciliation(&self) -> bool;
@@ -104,6 +112,14 @@ pub trait OrderEvent: 'static + Send {
     fn last_px(&self) -> Option<Price>;
     fn last_qty(&self) -> Option<Quantity>;
     fn activation_price(&self) -> Option<Price>;
+    /// The calculated execution-protection price carried by an update event.
+    fn protection_price(&self) -> Option<Price> {
+        None
+    }
+    /// The price at which an emulated order was released.
+    fn released_price(&self) -> Option<Price> {
+        None
+    }
     fn trigger_price(&self) -> Option<Price>;
     fn trigger_type(&self) -> Option<TriggerType>;
     fn limit_offset(&self) -> Option<Decimal>;

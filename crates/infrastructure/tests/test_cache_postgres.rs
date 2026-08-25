@@ -39,7 +39,12 @@ mod serial_tests {
         enums::{CurrencyType, OrderSide, OrderType},
         events::{
             OrderEventAny,
-            order::spec::{OrderCancelRejectedSpec, OrderModifyRejectedSpec},
+            order::spec::{
+                OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec,
+                OrderEmulatedSpec, OrderExpiredSpec, OrderFilledSpec, OrderModifyRejectedSpec,
+                OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderRejectedSpec,
+                OrderReleasedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
+            },
         },
         identifiers::{
             AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
@@ -51,7 +56,7 @@ mod serial_tests {
         },
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
-        types::{Currency, Quantity},
+        types::{Currency, Price, Quantity},
     };
     use ustr::Ustr;
 
@@ -510,6 +515,221 @@ mod serial_tests {
             }
             other => panic!("Expected OrderModifyRejected, was {other:?}"),
         }
+    }
+
+    async fn assert_order_event_round_trip(
+        pool: &sqlx::PgPool,
+        event: OrderEventAny,
+    ) -> anyhow::Result<()> {
+        let client_order_id = event.client_order_id();
+        let expected = event.clone();
+        DatabaseQueries::add_order_event(pool, event.into_boxed(), None).await?;
+        let events = DatabaseQueries::load_order_events(pool, &client_order_id).await?;
+        assert_eq!(events, vec![expected]);
+        Ok(())
+    }
+
+    async fn ensure_order_event_instrument(pool: &sqlx::PgPool) -> InstrumentId {
+        let instrument = currency_pair_ethusdt();
+        let instrument_id = instrument.id();
+        DatabaseQueries::add_currency(pool, Currency::from("ETH"))
+            .await
+            .expect("insert base currency");
+        DatabaseQueries::add_currency(pool, Currency::from("USDT"))
+            .await
+            .expect("insert quote currency");
+        DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument))
+            .await
+            .expect("insert instrument");
+        instrument_id
+    }
+
+    fn restart_pending_cancel_event() -> OrderEventAny {
+        OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .instrument_id(InstrumentId::from("ETHUSDT.BINANCE"))
+                .client_order_id(ClientOrderId::from("BUG-2026-173-PENDING-CANCEL"))
+                .venue_order_id(VenueOrderId::from("venue-order-restart"))
+                .account_id(AccountId::from("HYPERLIQUID-TESTNET-001"))
+                .event_id(UUID4::from("123e4567-e89b-42d3-a456-426614174000"))
+                .reconciliation(true)
+                .build(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_all_order_lifecycle_events_round_trip() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        let instrument_id = ensure_order_event_instrument(pool).await;
+        let account_id = AccountId::from("HYPERLIQUID-TESTNET-001");
+        let venue_order_id = VenueOrderId::from("venue-order-1");
+        let next_client_order_id = || {
+            let value = UUID4::new().to_string();
+            ClientOrderId::from(value.as_str())
+        };
+
+        let events = vec![
+            OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::CancelRejected(
+                OrderCancelRejectedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reason(Ustr::from("already absent"))
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::Canceled(
+                OrderCanceledSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::Denied(
+                OrderDeniedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .reason(Ustr::from("risk denied"))
+                    .build(),
+            ),
+            OrderEventAny::Emulated(
+                OrderEmulatedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .build(),
+            ),
+            OrderEventAny::Expired(
+                OrderExpiredSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .currency(Currency::from("USDT"))
+                    .last_qty(Quantity::from("2.66"))
+                    .last_px(Price::from("7.6122"))
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::ModifyRejected(
+                OrderModifyRejectedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reason(Ustr::from("modify rejected"))
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::Rejected(
+                OrderRejectedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .account_id(account_id)
+                    .reason(Ustr::from("post-only would cross"))
+                    .reconciliation(true)
+                    .due_post_only(true)
+                    .build(),
+            ),
+            OrderEventAny::Released(
+                OrderReleasedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .released_price(Price::from("7.6122"))
+                    .build(),
+            ),
+            OrderEventAny::Triggered(
+                OrderTriggeredSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ),
+            OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .quantity(Quantity::from("2.66"))
+                    .price(Price::from("7.7896"))
+                    .trigger_price(Price::from("7.4151"))
+                    .protection_price(Price::from("7.7000"))
+                    .is_quote_quantity(true)
+                    .reconciliation(true)
+                    .build(),
+            ),
+        ];
+
+        for event in events {
+            assert_order_event_round_trip(pool, event)
+                .await
+                .expect("round-trip order event");
+        }
+    }
+
+    #[ignore = "orchestrated before the fresh-process pending-cancel restore test"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pending_cancel_restart_write() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        ensure_order_event_instrument(pool).await;
+        let event = restart_pending_cancel_event();
+        DatabaseQueries::add_order_event(pool, event.into_boxed(), None)
+            .await
+            .expect("persist pending cancel");
+    }
+
+    #[ignore = "orchestrated after the pending-cancel writer process exits"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pending_cancel_restart_read() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let client_order_id = ClientOrderId::from("BUG-2026-173-PENDING-CANCEL");
+        let events = DatabaseQueries::load_order_events(&db.pool, &client_order_id)
+            .await
+            .expect("restore pending cancel");
+        assert_eq!(events, vec![restart_pending_cancel_event()]);
     }
 
     /// Tests that data is flushed immediately with the current hardcoded `buffer_interval=0`.

@@ -93,6 +93,54 @@ pub struct OrderUpdatedModel(pub OrderUpdated);
 #[derive(Debug)]
 pub struct OrderSnapshotModel(pub OrderSnapshot);
 
+struct CommonOrderEventFields {
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl CommonOrderEventFields {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            trader_id: row.try_get::<&str, _>("trader_id").map(TraderId::from)?,
+            strategy_id: row
+                .try_get::<&str, _>("strategy_id")
+                .map(StrategyId::from)?,
+            instrument_id: row
+                .try_get::<&str, _>("instrument_id")
+                .map(InstrumentId::from)?,
+            client_order_id: row
+                .try_get::<&str, _>("client_order_id")
+                .map(ClientOrderId::from)?,
+            event_id: row.try_get::<&str, _>("id").map(UUID4::from)?,
+            ts_event: row.try_get::<&str, _>("ts_event").map(UnixNanos::from)?,
+            ts_init: row.try_get::<&str, _>("ts_init").map(UnixNanos::from)?,
+        })
+    }
+}
+
+fn optional_execution_ids(
+    row: &PgRow,
+) -> Result<(Option<VenueOrderId>, Option<AccountId>), sqlx::Error> {
+    let venue_order_id = row
+        .try_get::<Option<&str>, _>("venue_order_id")?
+        .map(VenueOrderId::from);
+    let account_id = row
+        .try_get::<Option<&str>, _>("account_id")?
+        .map(AccountId::from);
+    Ok((venue_order_id, account_id))
+}
+
+fn reconciliation(row: &PgRow) -> Result<bool, sqlx::Error> {
+    Ok(row
+        .try_get::<Option<bool>, _>("reconciliation")?
+        .unwrap_or(false))
+}
+
 impl<'r> FromRow<'r, PgRow> for OrderEventAnyModel {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let kind = row.get::<String, _>("kind");
@@ -337,7 +385,7 @@ impl<'r> FromRow<'r, PgRow> for OrderAcceptedModel {
             event_id,
             ts_event,
             ts_init,
-            false,
+            reconciliation(row)?,
         );
         Ok(Self(order_event))
     }
@@ -384,26 +432,72 @@ impl<'r> FromRow<'r, PgRow> for OrderCancelRejectedModel {
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderCanceledModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let (venue_order_id, account_id) = optional_execution_ids(row)?;
+        Ok(Self(OrderCanceled::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            venue_order_id,
+            account_id,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderDeniedModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let reason = row.try_get::<&str, _>("reason").map(Ustr::from)?;
+        Ok(Self(OrderDenied::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            reason,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderEmulatedModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        Ok(Self(OrderEmulated::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderExpiredModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let (venue_order_id, account_id) = optional_execution_ids(row)?;
+        Ok(Self(OrderExpired::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            venue_order_id,
+            account_id,
+        )))
     }
 }
 
@@ -462,7 +556,7 @@ impl<'r> FromRow<'r, PgRow> for OrderFilledModel {
             event_id,
             ts_event,
             ts_init,
-            false,
+            reconciliation(row)?,
             position_id,
             commission,
             None,
@@ -512,26 +606,88 @@ impl<'r> FromRow<'r, PgRow> for OrderModifyRejectedModel {
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderPendingCancelModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let (venue_order_id, account_id) = optional_execution_ids(row)?;
+        Ok(Self(OrderPendingCancel::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            account_id,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            venue_order_id,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderPendingUpdateModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let (venue_order_id, account_id) = optional_execution_ids(row)?;
+        Ok(Self(OrderPendingUpdate::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            account_id,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            venue_order_id,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderRejectedModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let account_id = row.try_get::<&str, _>("account_id").map(AccountId::from)?;
+        let reason = row.try_get::<&str, _>("reason").map(Ustr::from)?;
+        let due_post_only = row
+            .try_get::<Option<bool>, _>("post_only")?
+            .unwrap_or(false);
+        Ok(Self(OrderRejected::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            account_id,
+            reason,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            due_post_only,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderReleasedModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let released_price = row
+            .try_get::<Option<&str>, _>("price")?
+            .map(Price::from)
+            .ok_or_else(|| {
+                sqlx::Error::Decode(
+                    "OrderReleased row is missing its required release price".into(),
+                )
+            })?;
+        Ok(Self(OrderReleased::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            released_price,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+        )))
     }
 }
 
@@ -570,14 +726,56 @@ impl<'r> FromRow<'r, PgRow> for OrderSubmittedModel {
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderTriggeredModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let (venue_order_id, account_id) = optional_execution_ids(row)?;
+        Ok(Self(OrderTriggered::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            venue_order_id,
+            account_id,
+        )))
     }
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderUpdatedModel {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let (venue_order_id, account_id) = optional_execution_ids(row)?;
+        let quantity = row.try_get::<&str, _>("quantity").map(Quantity::from)?;
+        let price = row.try_get::<Option<&str>, _>("price")?.map(Price::from);
+        let trigger_price = row
+            .try_get::<Option<&str>, _>("trigger_price")?
+            .map(Price::from);
+        let protection_price = row
+            .try_get::<Option<&str>, _>("activation_price")?
+            .map(Price::from);
+        let is_quote_quantity = row
+            .try_get::<Option<bool>, _>("quote_quantity")?
+            .unwrap_or(false);
+        Ok(Self(OrderUpdated::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            quantity,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            venue_order_id,
+            account_id,
+            price,
+            trigger_price,
+            protection_price,
+            is_quote_quantity,
+        )))
     }
 }
 

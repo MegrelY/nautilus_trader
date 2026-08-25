@@ -204,6 +204,10 @@ impl OrderEvent for OrderRejected {
         None
     }
 
+    fn due_post_only(&self) -> Option<bool> {
+        Some(self.due_post_only)
+    }
+
     fn reduce_only(&self) -> Option<bool> {
         None
     }
@@ -213,7 +217,7 @@ impl OrderEvent for OrderRejected {
     }
 
     fn reconciliation(&self) -> bool {
-        false
+        self.reconciliation
     }
 
     fn price(&self) -> Option<Price> {

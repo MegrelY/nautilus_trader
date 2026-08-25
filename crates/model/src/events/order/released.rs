@@ -201,6 +201,10 @@ impl OrderEvent for OrderReleased {
         None
     }
 
+    fn released_price(&self) -> Option<Price> {
+        Some(self.released_price)
+    }
+
     fn last_px(&self) -> Option<Price> {
         None
     }
