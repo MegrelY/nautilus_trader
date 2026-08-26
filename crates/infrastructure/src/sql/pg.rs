@@ -196,10 +196,17 @@ pub async fn connect_pg(options: PgConnectOptions) -> anyhow::Result<PgPool> {
 pub const fn embedded_postgres_schema() -> [&'static str; 4] {
     [
         include_str!("../../../../schema/sql/types.sql"),
-        include_str!("../../../../schema/sql/tables.sql"),
+        embedded_postgres_tables_schema(),
         include_str!("../../../../schema/sql/functions.sql"),
         include_str!("../../../../schema/sql/partitions.sql"),
     ]
+}
+
+/// Returns the idempotent PostgreSQL table definitions and in-place migrations
+/// bundled with this Nautilus revision.
+#[must_use]
+pub const fn embedded_postgres_tables_schema() -> &'static str {
+    include_str!("../../../../schema/sql/tables.sql")
 }
 
 /// Scans the current working directory for the `nautilus_trader` repository

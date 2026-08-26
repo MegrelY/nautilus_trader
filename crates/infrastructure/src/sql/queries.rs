@@ -952,10 +952,11 @@ impl DatabaseQueries {
             INSERT INTO "position_event" (
                 id, kind, trader_id, strategy_id, instrument_id, client_order_id, venue_order_id,
                 account_id, trade_id, currency, order_type, order_side, last_px, last_qty,
-                liquidity_side, position_id, commission, ts_event, ts_init, created_at, updated_at
+                liquidity_side, position_id, commission, reconciliation, ts_event, ts_init,
+                created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                $18, $19, $20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
         "#,
         )
@@ -976,6 +977,7 @@ impl DatabaseQueries {
         .bind(event.liquidity_side.to_string())
         .bind(position_id.to_string())
         .bind(event.commission.map(|commission| commission.to_string()))
+        .bind(event.reconciliation)
         .bind(event.ts_event.to_string())
         .bind(event.ts_init.to_string())
         .execute(&mut **transaction)

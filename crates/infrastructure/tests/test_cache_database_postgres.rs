@@ -29,7 +29,10 @@ mod serial_tests {
     use nautilus_core::{Params, UnixNanos};
     use nautilus_infrastructure::sql::{
         cache::{PostgresCacheDatabase, get_pg_cache_database},
-        pg::{connect_pg, get_postgres_connect_options, init_postgres},
+        pg::{
+            connect_pg, embedded_postgres_tables_schema, get_postgres_connect_options,
+            init_postgres,
+        },
         queries::DatabaseQueries,
     };
     use nautilus_model::{
@@ -561,7 +564,7 @@ mod serial_tests {
         let mut position = Position::new(&instrument, open_fill);
         pg_cache.add_position(&position).unwrap();
 
-        let OrderEventAny::Filled(increase_fill) = TestOrderEventStubs::filled(
+        let OrderEventAny::Filled(mut increase_fill) = TestOrderEventStubs::filled(
             &increase_order,
             &instrument,
             Some(TradeId::new("E-PG-POSITION-002")),
@@ -575,6 +578,7 @@ mod serial_tests {
         ) else {
             unreachable!();
         };
+        increase_fill.reconciliation = true;
         position.apply(&increase_fill);
         pg_cache.update_position(&position).unwrap();
 
@@ -613,14 +617,19 @@ mod serial_tests {
         )
         .await;
 
-        let loaded = pg_cache.load_position(&position.id).await.unwrap().unwrap();
-        let events = DatabaseQueries::load_position_events(&pg_cache.pool, &position.id)
+        let mut reader = get_test_pg_cache_database().await.unwrap();
+        let loaded = reader.load_position(&position.id).await.unwrap().unwrap();
+        let events = DatabaseQueries::load_position_events(&reader.pool, &position.id)
             .await
             .unwrap();
 
         assert_entirely_equal(loaded, position.clone());
         assert_eq!(events, position.events.clone());
+        assert!(!events[0].reconciliation);
+        assert!(events[1].reconciliation);
+        assert!(!events[2].reconciliation);
 
+        reader.close().unwrap();
         pg_cache.flush().unwrap();
         pg_cache.close().unwrap();
     }
@@ -1412,6 +1421,182 @@ mod serial_tests {
             "first DO block in tables.sql is no longer the order-column migration"
         );
         block
+    }
+
+    // Extracts the guarded position-event migration from the bundled schema,
+    // so both tests and downstream schema administrators execute the same SQL.
+    fn position_reconciliation_migration_sql() -> String {
+        let schema = embedded_postgres_tables_schema();
+        let marker = "-- Bring position fills written before reconciliation persistence forward.";
+        let marker_start = schema
+            .find(marker)
+            .expect("position reconciliation migration marker is absent");
+        let start = schema[marker_start..]
+            .find("DO $$")
+            .expect("position reconciliation migration block is absent")
+            + marker_start;
+        let end = schema[start..]
+            .find("END $$;")
+            .expect("position reconciliation migration block is unterminated")
+            + start
+            + "END $$;".len();
+        schema[start..end].to_string()
+    }
+
+    async fn insert_legacy_position_fill(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        suffix: &str,
+        reconciliation: bool,
+    ) {
+        let event_id = format!("E-LEGACY-POSITION-{suffix}");
+        let client_order_id = format!("O-LEGACY-POSITION-{suffix}");
+        let position_id = format!("P-LEGACY-POSITION-{suffix}");
+
+        sqlx::query(
+            r#"INSERT INTO "order_event"
+               (id, kind, strategy_id, client_order_id, reconciliation, ts_event, ts_init)
+               VALUES ($1, 'OrderFilled', 'S-LEGACY', $2, $3, '1', '1')"#,
+        )
+        .bind(&event_id)
+        .bind(&client_order_id)
+        .bind(reconciliation)
+        .execute(&mut **transaction)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"INSERT INTO "position_event"
+               (id, kind, strategy_id, client_order_id, venue_order_id, account_id, trade_id,
+                order_type, order_side, last_px, last_qty, liquidity_side, position_id,
+                ts_event, ts_init)
+               VALUES ($1, 'OrderFilled', 'S-LEGACY', $2, 'V-LEGACY', 'A-LEGACY',
+                $3, 'MARKET', 'BUY', '100', '1', 'TAKER', $4, '1', '1')"#,
+        )
+        .bind(&event_id)
+        .bind(&client_order_id)
+        .bind(format!("T-LEGACY-POSITION-{suffix}"))
+        .bind(position_id)
+        .execute(&mut **transaction)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_position_reconciliation_migration_backfills_and_is_idempotent() {
+        let options = get_postgres_connect_options(None, None, None, None, None);
+        let pg = connect_test_pg(options.into()).await.unwrap();
+        let mut transaction = pg.begin().await.unwrap();
+
+        sqlx::query(r#"TRUNCATE "position_event", "order_event""#)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(r#"ALTER TABLE "position_event" DROP COLUMN reconciliation"#)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        insert_legacy_position_fill(&mut transaction, "FALSE", false).await;
+        insert_legacy_position_fill(&mut transaction, "TRUE", true).await;
+
+        let migration = position_reconciliation_migration_sql();
+        sqlx::query(AssertSqlSafe(migration.clone()))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(AssertSqlSafe(migration))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        let values: Vec<(String, bool)> =
+            sqlx::query_as(r#"SELECT id, reconciliation FROM "position_event" ORDER BY id"#)
+                .fetch_all(&mut *transaction)
+                .await
+                .unwrap();
+        let metadata: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT data_type, is_nullable, column_default
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'position_event'
+               AND column_name = 'reconciliation'",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+
+        transaction.rollback().await.unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                ("E-LEGACY-POSITION-FALSE".to_string(), false),
+                ("E-LEGACY-POSITION-TRUE".to_string(), true),
+            ]
+        );
+        assert_eq!(metadata.0, "boolean");
+        assert_eq!(metadata.1, "NO");
+        assert!(metadata.2.is_some_and(|default| default == "false"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_position_reconciliation_migration_rejects_unmatched_rows_atomically() {
+        let options = get_postgres_connect_options(None, None, None, None, None);
+        let pg = connect_test_pg(options.into()).await.unwrap();
+        let mut transaction = pg.begin().await.unwrap();
+
+        sqlx::query(r#"TRUNCATE "position_event", "order_event""#)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(r#"ALTER TABLE "position_event" DROP COLUMN reconciliation"#)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO "position_event"
+               (id, kind, strategy_id, client_order_id, venue_order_id, account_id, trade_id,
+                order_type, order_side, last_px, last_qty, liquidity_side, position_id,
+                ts_event, ts_init)
+               VALUES ('E-UNMATCHED-POSITION', 'OrderFilled', 'S-LEGACY', 'O-LEGACY',
+                'V-LEGACY', 'A-LEGACY', 'T-LEGACY', 'MARKET', 'BUY', '100', '1',
+                'TAKER', 'P-LEGACY', '1', '1')"#,
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query("SAVEPOINT before_position_reconciliation_migration")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        let result = sqlx::query(AssertSqlSafe(position_reconciliation_migration_sql()))
+            .execute(&mut *transaction)
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot backfill 1 row")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT before_position_reconciliation_migration")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let column_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'position_event'
+                   AND column_name = 'reconciliation'
+             )",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+
+        transaction.rollback().await.unwrap();
+
+        assert!(!column_exists);
     }
 
     #[tokio::test(flavor = "multi_thread")]

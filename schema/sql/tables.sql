@@ -227,11 +227,45 @@ CREATE TABLE IF NOT EXISTS "position_event" (
     liquidity_side TEXT NOT NULL,
     position_id TEXT NOT NULL,
     commission TEXT,
+    reconciliation BOOLEAN NOT NULL DEFAULT FALSE,
     ts_event TEXT NOT NULL,
     ts_init TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Bring position fills written before reconciliation persistence forward. The
+-- order and position rows share the OrderFilled event ID, so the order row is
+-- the only valid backfill source. Refuse to guess when that source is absent.
+DO $$
+DECLARE
+    unresolved_count BIGINT;
+BEGIN
+    ALTER TABLE "position_event"
+        ADD COLUMN IF NOT EXISTS reconciliation BOOLEAN;
+
+    UPDATE "position_event" AS position_fill
+    SET reconciliation = order_fill.reconciliation
+    FROM "order_event" AS order_fill
+    WHERE position_fill.reconciliation IS NULL
+      AND order_fill.id = position_fill.id
+      AND order_fill.kind = 'OrderFilled';
+
+    SELECT COUNT(*)
+    INTO unresolved_count
+    FROM "position_event"
+    WHERE reconciliation IS NULL;
+
+    IF unresolved_count > 0 THEN
+        RAISE EXCEPTION
+            'position_event reconciliation migration cannot backfill % row(s) from matching OrderFilled events',
+            unresolved_count;
+    END IF;
+
+    ALTER TABLE "position_event"
+        ALTER COLUMN reconciliation SET DEFAULT FALSE,
+        ALTER COLUMN reconciliation SET NOT NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_position_event_position_id
     ON position_event(position_id, event_sequence);
