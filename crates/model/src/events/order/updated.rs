@@ -273,6 +273,10 @@ impl OrderEvent for OrderUpdated {
         None
     }
 
+    fn protection_price(&self) -> Option<Price> {
+        self.protection_price
+    }
+
     fn trigger_price(&self) -> Option<Price> {
         self.trigger_price
     }

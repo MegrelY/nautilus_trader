@@ -222,7 +222,7 @@ impl OrderEvent for OrderCancelRejected {
     }
 
     fn reconciliation(&self) -> bool {
-        false
+        self.reconciliation
     }
 
     fn price(&self) -> Option<Price> {

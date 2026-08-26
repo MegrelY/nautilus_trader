@@ -217,7 +217,7 @@ impl OrderEvent for OrderTriggered {
     }
 
     fn reconciliation(&self) -> bool {
-        false
+        self.reconciliation
     }
 
     fn price(&self) -> Option<Price> {

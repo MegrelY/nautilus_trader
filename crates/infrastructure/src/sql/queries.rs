@@ -631,11 +631,21 @@ impl DatabaseQueries {
             .bind(order_event.quantity().map(|x| x.to_string()))
             .bind(order_event.time_in_force().map(|x| x.to_string()))
             .bind(order_event.liquidity_side().map(|x| x.to_string()))
-            .bind(order_event.post_only())
+            // `post_only` is otherwise unused by OrderRejected, so the
+            // kind-discriminated row stores `due_post_only` here without a
+            // schema extension.
+            .bind(order_event.post_only().or_else(|| order_event.due_post_only()))
             .bind(order_event.reduce_only())
             .bind(order_event.quote_quantity())
             .bind(order_event.reconciliation())
-            .bind(order_event.price().map(|x| x.to_string()))
+            // `price` is otherwise unused by OrderReleased and preserves its
+            // required release price for restart decoding.
+            .bind(
+                order_event
+                    .price()
+                    .or_else(|| order_event.released_price())
+                    .map(|x| x.to_string()),
+            )
             .bind(order_event.last_px().map(|x| x.to_string()))
             .bind(order_event.last_qty().map(|x| x.to_string()))
             .bind(order_event.trigger_price().map(|x| x.to_string()))
@@ -659,7 +669,14 @@ impl DatabaseQueries {
             .bind(order_event.commission().map(|x| x.to_string()))
             .bind(order_event.ts_event().to_string())
             .bind(order_event.ts_init().to_string())
-            .bind(order_event.activation_price().map(|x| x.to_string()))
+            // `activation_price` is otherwise unused by OrderUpdated and
+            // preserves its optional execution-protection price.
+            .bind(
+                order_event
+                    .activation_price()
+                    .or_else(|| order_event.protection_price())
+                    .map(|x| x.to_string()),
+            )
             .execute(&mut *transaction)
             .await
             .map(|_| ())
