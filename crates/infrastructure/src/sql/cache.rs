@@ -200,6 +200,30 @@ mod tests {
         assert!(error.to_string().contains("injected failure"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_waits_for_the_writer_barrier() {
+        let (mut database, mut receiver) = disconnected_database(1);
+        database
+            .add("accepted-before-flush".to_string(), Bytes::new())
+            .expect("write should be accepted before flush");
+        let writer = tokio::spawn(async move {
+            let write = receiver.recv().await.expect("accepted write");
+            let DatabaseQuery::Add(key, _) = write else {
+                panic!("expected accepted write before flush barrier");
+            };
+            assert_eq!(key, "accepted-before-flush");
+
+            let barrier = receiver.recv().await.expect("flush barrier");
+            let DatabaseQuery::Flush(acknowledgement) = barrier else {
+                panic!("expected a flush barrier");
+            };
+            acknowledgement.send(()).expect("flush observer");
+        });
+
+        database.flush().expect("flush should observe the barrier");
+        writer.await.expect("writer task");
+    }
+
     fn disconnected_database(
         capacity: usize,
     ) -> (
@@ -267,9 +291,10 @@ pub enum PostgresCacheWriterHealth {
     clippy::large_enum_variant,
     reason = "variant sizes vary with feature unification; allow stays silent when the lint does not fire"
 )]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum DatabaseQuery {
     Close,
+    Flush(tokio::sync::oneshot::Sender<()>),
     Add(String, Vec<u8>),
     AddCurrency(Currency),
     AddInstrument(InstrumentAny),
@@ -481,14 +506,22 @@ async fn handle_query(
         return Ok(ControlFlow::Break(()));
     };
 
-    if matches!(msg, DatabaseQuery::Close) {
-        if !buffer.is_empty() {
-            drain_buffer(pool, buffer).await?;
+    match msg {
+        DatabaseQuery::Close => {
+            if !buffer.is_empty() {
+                drain_buffer(pool, buffer).await?;
+            }
+            return Ok(ControlFlow::Break(()));
         }
-        return Ok(ControlFlow::Break(()));
+        DatabaseQuery::Flush(acknowledgement) => {
+            if !buffer.is_empty() {
+                drain_buffer(pool, buffer).await?;
+            }
+            let _ = acknowledgement.send(());
+            return Ok(ControlFlow::Continue(()));
+        }
+        query => buffer.push_back(query),
     }
-
-    buffer.push_back(msg);
 
     if buffer_interval.is_zero() {
         drain_buffer(pool, buffer).await?;
@@ -572,9 +605,33 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
-        let pool = self.pool.clone();
+        match self.writer_health() {
+            PostgresCacheWriterHealth::Running => {}
+            PostgresCacheWriterHealth::Closing => {
+                anyhow::bail!("Postgres cache writer is closing; rejected flush")
+            }
+            PostgresCacheWriterHealth::Closed => {
+                anyhow::bail!("Postgres cache writer is closed; rejected flush")
+            }
+            PostgresCacheWriterHealth::Failed(error) => {
+                anyhow::bail!("Postgres cache writer failed before flush: {error}")
+            }
+        }
+
+        let sender = self.tx.clone();
         tokio::task::block_in_place(|| {
-            get_runtime().block_on(async { DatabaseQueries::truncate(&pool).await })
+            get_runtime().block_on(async move {
+                let (acknowledgement, observed) = tokio::sync::oneshot::channel();
+                sender
+                    .send(DatabaseQuery::Flush(acknowledgement))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("Postgres cache writer is unavailable; rejected flush")
+                    })?;
+                observed.await.map_err(|_| {
+                    anyhow::anyhow!("Postgres cache writer failed before flush completed")
+                })
+            })
         })
     }
 
@@ -1335,6 +1392,10 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) -> an
     for cmd in buffer.drain(..) {
         let result: anyhow::Result<()> = match cmd {
             DatabaseQuery::Close => Ok(()),
+            DatabaseQuery::Flush(acknowledgement) => {
+                let _ = acknowledgement.send(());
+                Ok(())
+            }
             DatabaseQuery::Add(key, value) => DatabaseQueries::add(pool, key, value).await,
             DatabaseQuery::AddCurrency(currency) => {
                 DatabaseQueries::add_currency(pool, currency).await

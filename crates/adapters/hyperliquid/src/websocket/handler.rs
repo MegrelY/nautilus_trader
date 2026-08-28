@@ -49,8 +49,8 @@ use super::{
     error::HyperliquidWsError,
     messages::{
         CandleData, ExecutionReport, HyperliquidWsMessage, HyperliquidWsRequest, NautilusWsMessage,
-        PostRequest, SubscriptionRequest, WsActiveAssetCtxData, WsAllDexsAssetCtxsData,
-        WsUserEventData,
+        PostRequest, SubscriptionRequest, SubscriptionResponseData, WsActiveAssetCtxData,
+        WsAllDexsAssetCtxsData, WsUserEventData,
     },
     parse::{
         parse_ws_asset_context, parse_ws_candle, parse_ws_fill_report, parse_ws_open_interest,
@@ -282,19 +282,23 @@ impl FeedHandler {
                         HandlerCommand::Subscribe { subscriptions } => {
                             for subscription in subscriptions {
                                 let key = subscription_to_key(&subscription);
+                                let channel = safe_subscription_channel(&key);
                                 self.subscriptions.mark_subscribe(&key);
 
                                 let request = HyperliquidWsRequest::Subscribe { subscription };
                                 match serde_json::to_string(&request) {
                                     Ok(payload) => {
-                                        log::debug!("Sending subscribe payload: {payload}");
+                                        log::debug!(
+                                            "Sending subscribe payload: channel={channel}, payload_len={}",
+                                            payload.len()
+                                        );
                                         if let Err(e) = self.send_with_retry(payload).await {
-                                            log::error!("Error subscribing to {key}: {e}");
+                                            log::error!("Error subscribing to {channel}: {e}");
                                             self.subscriptions.mark_failure(&key);
                                         }
                                     }
                                     Err(e) => {
-                                        log::error!("Error serializing subscription for {key}: {e}");
+                                        log::error!("Error serializing subscription for {channel}: {e}");
                                         self.subscriptions.mark_failure(&key);
                                     }
                                 }
@@ -303,18 +307,22 @@ impl FeedHandler {
                         HandlerCommand::Unsubscribe { subscriptions } => {
                             for subscription in subscriptions {
                                 let key = subscription_to_key(&subscription);
+                                let channel = safe_subscription_channel(&key);
                                 self.subscriptions.mark_unsubscribe(&key);
 
                                 let request = HyperliquidWsRequest::Unsubscribe { subscription };
                                 match serde_json::to_string(&request) {
                                     Ok(payload) => {
-                                        log::debug!("Sending unsubscribe payload: {payload}");
+                                        log::debug!(
+                                            "Sending unsubscribe payload: channel={channel}, payload_len={}",
+                                            payload.len()
+                                        );
                                         if let Err(e) = self.send_with_retry(payload).await {
-                                            log::error!("Error unsubscribing from {key}: {e}");
+                                            log::error!("Error unsubscribing from {channel}: {e}");
                                         }
                                     }
                                     Err(e) => {
-                                        log::error!("Error serializing unsubscription for {key}: {e}");
+                                        log::error!("Error serializing unsubscription for {channel}: {e}");
                                     }
                                 }
                             }
@@ -394,6 +402,7 @@ impl FeedHandler {
                         Message::Text(text) => {
                             if text == RECONNECTED {
                                 log::info!("Received RECONNECTED sentinel");
+                                self.bar_cache.clear();
                                 return Some(NautilusWsMessage::Reconnected);
                             }
 
@@ -401,6 +410,12 @@ impl FeedHandler {
                                 Ok(msg) => {
                                     if let HyperliquidWsMessage::Post { data } = msg {
                                         self.post_router.complete(data).await;
+                                        continue;
+                                    }
+
+                                    if let HyperliquidWsMessage::SubscriptionResponse { data } = &msg
+                                    {
+                                        self.observe_subscription_response(data);
                                         continue;
                                     }
 
@@ -434,7 +449,10 @@ impl FeedHandler {
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!("Error parsing WebSocket message: {e}, text: {text}");
+                                    log::error!(
+                                        "Error parsing WebSocket message: {e}, payload_len={}",
+                                        text.len()
+                                    );
                                 }
                             }
                         }
@@ -456,6 +474,21 @@ impl FeedHandler {
                     log::debug!("Handler shutting down: stream ended or command channel closed");
                     return None;
                 }
+            }
+        }
+    }
+
+    fn observe_subscription_response(&self, response: &SubscriptionResponseData) {
+        let key = subscription_to_key(&response.subscription);
+        let channel = safe_subscription_channel(&key);
+        match response.method.as_str() {
+            "subscribe" => self.subscriptions.confirm_subscribe(&key),
+            "unsubscribe" => self.subscriptions.confirm_unsubscribe(&key),
+            method => {
+                self.subscriptions.mark_failure(&key);
+                log::error!(
+                    "Unknown subscription response method: method={method}, channel={channel}"
+                );
             }
         }
     }
@@ -1266,6 +1299,10 @@ pub(crate) fn subscription_to_key(sub: &SubscriptionRequest) -> String {
     }
 }
 
+fn safe_subscription_channel(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(channel, _)| channel)
+}
+
 /// Determines whether a Hyperliquid WebSocket error should trigger a retry.
 pub(crate) fn should_retry_hyperliquid_error(error: &HyperliquidWsError) -> bool {
     match error {
@@ -1313,12 +1350,14 @@ mod tests {
         super::{
             client::{AssetContextDataType, CLOID_CACHE_CAPACITY, CloidCache},
             messages::{
-                NautilusWsMessage, PerpsAssetCtx, PostRequest, SharedAssetCtx, SpotAssetCtx,
-                WsActiveAssetCtxData, WsAllDexsAssetCtxsData, WsBookData, WsLevelData,
+                CandleData, NautilusWsMessage, PerpsAssetCtx, PostRequest, SharedAssetCtx,
+                SpotAssetCtx, SubscriptionRequest, SubscriptionResponseData, WsActiveAssetCtxData,
+                WsAllDexsAssetCtxsData, WsBookData, WsLevelData,
             },
             post::PostRouter,
         },
-        AssetContextCaches, FeedHandler, HandlerCommand,
+        AssetContextCaches, FeedHandler, HandlerCommand, safe_subscription_channel,
+        subscription_to_key,
     };
     use crate::{
         common::consts::HYPERLIQUID_VENUE,
@@ -1373,6 +1412,110 @@ mod tests {
             ],
             time: 1_700_000_000_000,
         }
+    }
+
+    fn empty_handler(subscriptions: SubscriptionState) -> FeedHandler {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cloid_cache: CloidCache = Arc::new(Mutex::new(FifoCacheMap::<
+            Ustr,
+            ClientOrderId,
+            CLOID_CACHE_CAPACITY,
+        >::new()));
+        FeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            None,
+            subscriptions,
+            cloid_cache,
+            PostRouter::new(),
+        )
+    }
+
+    #[test]
+    fn private_subscription_acknowledgements_update_confirmed_state() {
+        let subscriptions = SubscriptionState::new(':');
+        let handler = empty_handler(subscriptions.clone());
+        let subscription = SubscriptionRequest::OrderUpdates {
+            user: "0x0123456789abcdef".to_string(),
+        };
+        let key = subscription_to_key(&subscription);
+        subscriptions.mark_subscribe(&key);
+
+        handler.observe_subscription_response(&SubscriptionResponseData {
+            method: "subscribe".to_string(),
+            subscription: subscription.clone(),
+        });
+        assert_eq!(subscriptions.len(), 1);
+
+        subscriptions.mark_unsubscribe(&key);
+        handler.observe_subscription_response(&SubscriptionResponseData {
+            method: "unsubscribe".to_string(),
+            subscription,
+        });
+        assert_eq!(subscriptions.len(), 0);
+    }
+
+    #[test]
+    fn private_subscription_log_context_excludes_the_account_identifier() {
+        let key = "orderUpdates:0x0123456789abcdef";
+        let channel = safe_subscription_channel(key);
+        assert_eq!(channel, "orderUpdates");
+        assert!(!channel.contains("0x0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_discards_the_forming_candle_cache() {
+        let subscriptions = SubscriptionState::new(':');
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cloid_cache: CloidCache = Arc::new(Mutex::new(FifoCacheMap::<
+            Ustr,
+            ClientOrderId,
+            CLOID_CACHE_CAPACITY,
+        >::new()));
+        let mut handler = FeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            None,
+            subscriptions,
+            cloid_cache,
+            PostRouter::new(),
+        );
+        handler.bar_cache.insert(
+            "candle:BTC:1m".to_string(),
+            CandleData {
+                t: 1,
+                close_time: 2,
+                s: Ustr::from("BTC"),
+                i: Ustr::from("1m"),
+                o: dec!(1),
+                c: dec!(1),
+                h: dec!(1),
+                l: dec!(1),
+                v: dec!(1),
+                n: 1,
+            },
+        );
+        raw_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                nautilus_network::RECONNECTED.into(),
+            ))
+            .expect("reconnect sentinel");
+
+        assert!(matches!(
+            handler.next().await,
+            Some(NautilusWsMessage::Reconnected)
+        ));
+        assert!(handler.bar_cache.is_empty());
     }
 
     fn btc_active_spot_asset_ctx() -> WsActiveAssetCtxData {

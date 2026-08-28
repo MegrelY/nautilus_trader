@@ -567,7 +567,8 @@ impl HyperliquidRawHttpClient {
                 if extra > 0 {
                     self.rest_limiter.debit_extra(extra).await;
                     log::debug!(
-                        "Info debited extra weight: endpoint={request:?}, base_w={base_w}, extra={extra}"
+                        "Info debited extra weight: endpoint={}, base_w={base_w}, extra={extra}",
+                        request.request_type.as_str()
                     );
                 }
                 return Ok(val);
@@ -592,7 +593,8 @@ impl HyperliquidRawHttpClient {
                         Duration::from_millis,
                     );
                 log::warn!(
-                    "429 Too Many Requests; backing off: endpoint={request:?}, attempt={attempt}, wait_ms={:?}",
+                    "429 Too Many Requests; backing off: endpoint={}, attempt={attempt}, wait_ms={:?}",
+                    request.request_type.as_str(),
                     delay.as_millis()
                 );
                 attempt += 1;
@@ -612,7 +614,8 @@ impl HyperliquidRawHttpClient {
                     self.rate_limit_backoff_cap,
                 );
                 log::warn!(
-                    "Transient error; retrying: endpoint={request:?}, attempt={attempt}, status={:?}, wait_ms={:?}",
+                    "Transient error; retrying: endpoint={}, attempt={attempt}, status={:?}, wait_ms={:?}",
+                    request.request_type.as_str(),
                     response.status.as_u16(),
                     delay.as_millis()
                 );
