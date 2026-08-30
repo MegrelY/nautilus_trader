@@ -23,6 +23,7 @@ pub mod parse;
 pub mod post;
 
 pub(crate) mod book;
+pub(crate) mod private_snapshot;
 pub(crate) mod trades;
 
 pub use client::HyperliquidWebSocketClient;

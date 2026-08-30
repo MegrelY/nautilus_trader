@@ -761,6 +761,109 @@ async fn send_ws_post_error_response(socket: &mut WebSocket, id: u64, payload: &
         .is_ok()
 }
 
+async fn send_ws_private_snapshot(
+    socket: &mut WebSocket,
+    state: &TestServerState,
+    subscription: &Value,
+) -> bool {
+    let subscription_type = subscription.get("type").and_then(Value::as_str);
+    let user = subscription
+        .get("user")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let message = match subscription_type {
+        Some("openOrders") => {
+            let dex = subscription
+                .get("dex")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if state
+                .fail_frontend_open_orders_dexes
+                .lock()
+                .await
+                .contains(dex)
+            {
+                return true;
+            }
+            let dex_orders = state
+                .frontend_open_orders_by_dex
+                .lock()
+                .await
+                .get(dex)
+                .cloned();
+            let orders = if let Some(orders) = dex_orders {
+                orders
+            } else {
+                state
+                    .frontend_open_orders_response
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| json!([]))
+            };
+            json!({
+                "channel": "openOrders",
+                "data": {"dex": dex, "user": user, "orders": orders},
+            })
+        }
+        Some("allDexsClearinghouseState") => {
+            let mut dexes = vec![String::new()];
+            if let Some(entries) = state
+                .perp_dexs_response
+                .lock()
+                .await
+                .as_ref()
+                .and_then(Value::as_array)
+            {
+                for entry in entries {
+                    if let Some(name) = entry.get("name").and_then(Value::as_str)
+                        && !dexes.iter().any(|dex| dex == name)
+                    {
+                        dexes.push(name.to_string());
+                    }
+                }
+            }
+
+            let by_dex = state.perp_clearinghouse_by_dex.lock().await.clone();
+            let fallback = state.perp_clearinghouse_response.lock().await.clone();
+            let states = dexes
+                .into_iter()
+                .map(|dex| {
+                    let value = by_dex
+                        .get(&dex)
+                        .cloned()
+                        .or_else(|| fallback.clone())
+                        .unwrap_or_else(|| json!({"assetPositions": []}));
+                    (dex, value)
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "channel": "allDexsClearinghouseState",
+                "data": {"user": user, "clearinghouseStates": states},
+            })
+        }
+        Some("spotState") => {
+            let spot_state = state
+                .spot_clearinghouse_response
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| json!({"balances": []}));
+            json!({
+                "channel": "spotState",
+                "data": {"user": user, "spotState": spot_state},
+            })
+        }
+        _ => return true,
+    };
+
+    socket
+        .send(Message::Text(message.to_string().into()))
+        .await
+        .is_ok()
+}
+
 async fn handle_ws_socket(mut socket: WebSocket, state: TestServerState) {
     while let Some(message) = socket.next().await {
         let Ok(message) = message else { break };
@@ -782,7 +885,12 @@ async fn handle_ws_socket(mut socket: WebSocket, state: TestServerState) {
                             }
                         }
                         Some("subscribe") => {
-                            // Acknowledge subscription silently
+                            if let Some(subscription) = payload.get("subscription")
+                                && !send_ws_private_snapshot(&mut socket, &state, subscription)
+                                    .await
+                            {
+                                break;
+                            }
                         }
                         Some("unsubscribe") => {}
                         Some("post") if !handle_ws_post(&mut socket, &state, &payload).await => {
@@ -6502,10 +6610,11 @@ async fn test_generate_mass_status_aggregates_default_and_hip3_dexes() {
         json!({"assetPositions": [perp_position_value("xyz:ABC", "2.0")]}),
     );
 
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
     client.connect().await.unwrap();
+    state.info_request_types.lock().await.clear();
 
     let mass = client
         .generate_mass_status(None)
@@ -6520,6 +6629,15 @@ async fn test_generate_mass_status_aggregates_default_and_hip3_dexes() {
             .flatten()
             .any(|report| report.instrument_id.symbol.as_str() == "xyz:ABC-USD-PERP")
     );
+    let request_types = state.info_request_types.lock().await.clone();
+    assert!(request_types.iter().any(|request| request == "perpDexs"));
+    assert!(request_types.iter().any(|request| request == "userFills"));
+    assert!(!request_types.iter().any(|request| {
+        matches!(
+            request.as_str(),
+            "frontendOpenOrders" | "clearinghouseState" | "spotClearinghouseState"
+        )
+    }));
 
     client.disconnect().await.unwrap();
 }

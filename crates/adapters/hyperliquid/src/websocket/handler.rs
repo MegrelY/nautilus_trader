@@ -58,6 +58,7 @@ use super::{
         parse_ws_public_trade, parse_ws_quote_tick, parse_ws_trade_tick,
     },
     post::PostRouter,
+    private_snapshot::PrivateStateSnapshotCache,
     trades::TradeStreamUses,
 };
 use crate::data_types::{
@@ -165,6 +166,7 @@ pub(super) struct FeedHandler {
     account_id: Option<AccountId>,
     subscriptions: SubscriptionState,
     post_router: Arc<PostRouter>,
+    private_state_snapshots: PrivateStateSnapshotCache,
     retry_manager: RetryManager<HyperliquidWsError>,
     message_buffer: VecDeque<NautilusWsMessage>,
     instruments: AHashMap<Ustr, InstrumentAny>,
@@ -195,6 +197,7 @@ impl FeedHandler {
         subscriptions: SubscriptionState,
         cloid_cache: CloidCache,
         post_router: Arc<PostRouter>,
+        private_state_snapshots: PrivateStateSnapshotCache,
     ) -> Self {
         Self {
             clock: get_atomic_clock_realtime(),
@@ -206,6 +209,7 @@ impl FeedHandler {
             account_id,
             subscriptions,
             post_router,
+            private_state_snapshots,
             retry_manager: create_websocket_retry_manager(),
             message_buffer: VecDeque::new(),
             instruments: AHashMap::new(),
@@ -403,6 +407,7 @@ impl FeedHandler {
                             if text == RECONNECTED {
                                 log::info!("Received RECONNECTED sentinel");
                                 self.bar_cache.clear();
+                                self.private_state_snapshots.invalidate_generation();
                                 return Some(NautilusWsMessage::Reconnected);
                             }
 
@@ -418,6 +423,8 @@ impl FeedHandler {
                                         self.observe_subscription_response(data);
                                         continue;
                                     }
+
+                                    self.private_state_snapshots.observe(&msg);
 
                                     let ts_init = self.clock.get_time_ns();
                                     let all_mids_data_types =
@@ -1232,6 +1239,16 @@ pub(crate) fn subscription_to_key(sub: &SubscriptionRequest) -> String {
         SubscriptionRequest::AllDexsAssetCtxs => {
             HyperliquidWsChannel::AllDexsAssetCtxs.as_str().to_string()
         }
+        SubscriptionRequest::AllDexsClearinghouseState { user } => format!(
+            "{}:{user}",
+            HyperliquidWsChannel::AllDexsClearinghouseState.as_str()
+        ),
+        SubscriptionRequest::OpenOrders { user, dex } => {
+            format!("{}:{user}:{dex}", HyperliquidWsChannel::OpenOrders.as_str())
+        }
+        SubscriptionRequest::SpotState { user, .. } => {
+            format!("{}:{user}", HyperliquidWsChannel::SpotState.as_str())
+        }
         SubscriptionRequest::Notification { user } => {
             format!("{}:{user}", HyperliquidWsChannel::Notification.as_str())
         }
@@ -1355,6 +1372,7 @@ mod tests {
                 WsAllDexsAssetCtxsData, WsBookData, WsLevelData,
             },
             post::PostRouter,
+            private_snapshot::PrivateStateSnapshotCache,
         },
         AssetContextCaches, FeedHandler, HandlerCommand, safe_subscription_channel,
         subscription_to_key,
@@ -1433,6 +1451,7 @@ mod tests {
             subscriptions,
             cloid_cache,
             PostRouter::new(),
+            PrivateStateSnapshotCache::default(),
         )
     }
 
@@ -1489,6 +1508,7 @@ mod tests {
             subscriptions,
             cloid_cache,
             PostRouter::new(),
+            PrivateStateSnapshotCache::default(),
         );
         handler.bar_cache.insert(
             "candle:BTC:1m".to_string(),
@@ -1603,6 +1623,7 @@ mod tests {
             SubscriptionState::new(':'),
             cloid_cache,
             Arc::clone(&post_router),
+            PrivateStateSnapshotCache::default(),
         );
 
         let id = 99;

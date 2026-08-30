@@ -66,6 +66,7 @@ use crate::{
         enums::{
             HyperliquidBarInterval, HyperliquidEnvironment,
             HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidProductType,
+            HyperliquidTpSl,
         },
         parse::{
             bar_type_to_interval, cache_alias_for_symbol, clamp_price_to_precision,
@@ -178,6 +179,24 @@ fn private_value_identity(value: &Value) -> Option<String> {
                 .and_then(Value::as_str)
         })
         .map(ToString::to_string)
+}
+
+fn parse_private_open_order(value: &Value) -> serde_json::Result<WsBasicOrderData> {
+    let mut order: WsBasicOrderData = serde_json::from_value(value.clone())?;
+    order.trigger_px = order.trigger_px.filter(|price| !price.is_zero());
+
+    if let Some(order_type) = value.get("orderType").and_then(Value::as_str) {
+        order.tpsl = if order_type.starts_with("Take Profit") {
+            Some(HyperliquidTpSl::Tp)
+        } else if order_type.starts_with("Stop") {
+            Some(HyperliquidTpSl::Sl)
+        } else {
+            None
+        };
+        order.is_market = order.tpsl.as_ref().map(|_| order_type.ends_with("Market"));
+    }
+
+    Ok(order)
 }
 
 fn historical_report_is_more_advanced(
@@ -1760,10 +1779,10 @@ impl HyperliquidHttpClient {
             }
         }
         if wants_spot {
-            defs.extend(
-                parse_spot_instruments(spot_meta.as_ref().expect("spot metadata must be loaded"))
-                    .map_err(Error::decode)?,
-            );
+            let spot_meta = spot_meta.as_ref().ok_or_else(|| {
+                Error::decode("Spot metadata was not loaded for scoped instrument bootstrap")
+            })?;
+            defs.extend(parse_spot_instruments(spot_meta).map_err(Error::decode)?);
         }
         if wants_outcome {
             let outcome_meta = self.inner.get_outcome_meta().await?;
@@ -2546,7 +2565,70 @@ impl HyperliquidHttpClient {
             };
 
             for order_value in orders {
-                let order: WsBasicOrderData = match serde_json::from_value(order_value.clone()) {
+                let order = match parse_private_open_order(order_value) {
+                    Ok(order) => order,
+                    Err(error) => {
+                        let identity = private_value_identity(order_value);
+                        batch.push_gap(HyperliquidPrivateStateGap::new(
+                            HyperliquidPrivateStateSource::OpenOrders,
+                            HyperliquidPrivateStateGapKind::ParseFailure,
+                            (!dex.is_empty()).then_some(dex),
+                            identity.as_deref(),
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                let Some(instrument) = self.get_or_create_instrument(&order.coin, None) else {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::OpenOrders,
+                        HyperliquidPrivateStateGapKind::UnknownInstrument,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(order.coin.as_str()),
+                        "Instrument not cached",
+                    ));
+                    continue;
+                };
+                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                    continue;
+                }
+
+                match parse_order_status_report_from_basic(
+                    &order,
+                    &HyperliquidOrderStatusEnum::Open,
+                    &instrument,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(report) => batch.push_report(report),
+                    Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::OpenOrders,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(order.coin.as_str()),
+                        error.to_string(),
+                    )),
+                }
+            }
+        }
+
+        Ok(batch)
+    }
+
+    pub(crate) fn parse_order_status_report_snapshot(
+        &self,
+        snapshots: &[(String, Vec<Value>)],
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<HyperliquidPrivateStateBatch<OrderStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        let ts_init = self.clock.get_time_ns();
+
+        for (dex, orders) in snapshots {
+            for order_value in orders {
+                let order = match parse_private_open_order(order_value) {
                     Ok(order) => order,
                     Err(error) => {
                         let identity = private_value_identity(order_value);
@@ -3263,6 +3345,140 @@ impl HyperliquidHttpClient {
             let reports = batch.absorb(spot);
             for report in reports {
                 batch.push_report(report);
+            }
+        }
+
+        Ok(batch)
+    }
+
+    pub(crate) fn parse_position_status_report_snapshot(
+        &self,
+        clearinghouse_states: &[(String, Value)],
+        spot_state: Option<&Value>,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<HyperliquidPrivateStateBatch<PositionStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        let ts_init = self.clock.get_time_ns();
+
+        for (dex, response) in clearinghouse_states {
+            let Some(positions) = response.get("assetPositions").and_then(Value::as_array) else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::PerpPositions,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    (!dex.is_empty()).then_some(dex),
+                    None,
+                    "assetPositions not found in clearinghouse state",
+                ));
+                continue;
+            };
+
+            for position_value in positions {
+                let Some(coin) = position_value
+                    .get("position")
+                    .and_then(|position| position.get("coin"))
+                    .and_then(Value::as_str)
+                else {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        None,
+                        "coin not found in position",
+                    ));
+                    continue;
+                };
+                let coin = Ustr::from(coin);
+                let Some(instrument) = self.get_or_create_instrument(&coin, None) else {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::UnknownInstrument,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(coin.as_str()),
+                        "Instrument not cached",
+                    ));
+                    continue;
+                };
+                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                    continue;
+                }
+
+                match parse_position_status_report(position_value, &instrument, account_id, ts_init)
+                {
+                    Ok(report) => batch.push_report(report),
+                    Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(coin.as_str()),
+                        error.to_string(),
+                    )),
+                }
+            }
+        }
+
+        let Some(spot_state) = spot_state else {
+            return Ok(batch);
+        };
+        let Some(balances) = spot_state.get("balances").and_then(Value::as_array) else {
+            batch.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::SpotPositions,
+                HyperliquidPrivateStateGapKind::ParseFailure,
+                None,
+                None,
+                "balances not found in spot clearinghouse state",
+            ));
+            return Ok(batch);
+        };
+
+        for balance_value in balances {
+            let balance: SpotBalance = match serde_json::from_value(balance_value.clone()) {
+                Ok(balance) => balance,
+                Err(error) => {
+                    let identity = private_value_identity(balance_value);
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::SpotPositions,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        None,
+                        identity.as_deref(),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            if balance.total.is_zero() || balance.coin.as_str() == "USDC" {
+                continue;
+            }
+            let product_type = match HyperliquidProductType::from_symbol(balance.coin.as_str()) {
+                Ok(HyperliquidProductType::Outcome) => HyperliquidProductType::Outcome,
+                _ => HyperliquidProductType::Spot,
+            };
+            let Some(instrument) = self.get_or_create_instrument(&balance.coin, Some(product_type))
+            else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    None,
+                    Some(balance.coin.as_str()),
+                    "Instrument not cached",
+                ));
+                continue;
+            };
+            if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                continue;
+            }
+
+            match parse_spot_position_status_report(&balance, &instrument, account_id, ts_init) {
+                Ok(report) => batch.push_report(report),
+                Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    None,
+                    Some(balance.coin.as_str()),
+                    error.to_string(),
+                )),
             }
         }
 
@@ -4209,7 +4425,7 @@ mod tests {
     use serde_json::{Value, json};
     use ustr::Ustr;
 
-    use super::{HyperliquidHttpClient, resolve_perp_dex_name};
+    use super::{HyperliquidHttpClient, parse_private_open_order, resolve_perp_dex_name};
     use crate::{
         common::{
             consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
@@ -4223,6 +4439,31 @@ mod tests {
 
     const TEST_PRIVATE_KEY: &str =
         "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    #[rstest]
+    fn websocket_open_order_preserves_trigger_fields() {
+        let order = parse_private_open_order(&json!({
+            "coin": "BTC",
+            "side": "A",
+            "limitPx": "99.0",
+            "sz": "1.0",
+            "oid": 42,
+            "timestamp": 1_700_000_000_000u64,
+            "origSz": "2.0",
+            "cloid": "0x00000000000000000000000000000001",
+            "tif": null,
+            "reduceOnly": true,
+            "triggerPx": "100.0",
+            "orderType": "Stop Market",
+        }))
+        .unwrap();
+
+        assert_eq!(order.tpsl, Some(crate::common::enums::HyperliquidTpSl::Sl));
+        assert_eq!(order.is_market, Some(true));
+        assert_eq!(order.trigger_px, Some(dec!(100.0)));
+        assert_eq!(order.reduce_only, Some(true));
+        assert_eq!(order.orig_sz, dec!(2.0));
+    }
 
     fn perp_meta_with_assets(names: &[&str]) -> PerpMeta {
         PerpMeta {

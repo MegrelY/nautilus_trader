@@ -76,6 +76,16 @@ pub enum SubscriptionRequest {
     },
     /// Aggregate asset contexts across all perp dexes.
     AllDexsAssetCtxs,
+    /// Aggregate clearinghouse state across all perp DEXes for a user.
+    AllDexsClearinghouseState { user: String },
+    /// Complete open-order snapshot for one perp DEX (empty string is native).
+    OpenOrders { user: String, dex: String },
+    /// Complete spot and outcome balance snapshot for a user.
+    SpotState {
+        user: String,
+        #[serde(rename = "isPortfolioMargin", skip_serializing_if = "Option::is_none")]
+        is_portfolio_margin: Option<bool>,
+    },
     /// Notifications for a user.
     Notification { user: String },
     /// Web data for frontend.
@@ -342,6 +352,12 @@ pub enum HyperliquidWsMessage {
     AllMids { data: AllMidsData },
     /// Aggregate asset contexts across all perp dexes.
     AllDexsAssetCtxs { data: WsAllDexsAssetCtxsData },
+    /// Aggregate clearinghouse state across all perp DEXes for a user.
+    AllDexsClearinghouseState { data: WsAllDexsClearinghouseState },
+    /// Complete open-order snapshot for one perp DEX.
+    OpenOrders { data: WsOpenOrdersData },
+    /// Complete spot and outcome balance snapshot.
+    SpotState { data: WsSpotStateData },
     /// Notifications.
     Notification { data: NotificationData },
     /// Web data.
@@ -410,6 +426,40 @@ pub struct AllMidsData {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsAllDexsAssetCtxsData {
     pub ctxs: Vec<(String, Vec<PerpsAssetCtx>)>,
+}
+
+/// `allDexsClearinghouseState` data payload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum WsAllDexsClearinghouseStateData {
+    /// Current venue representation: ordered `(dex, state)` tuples.
+    Entries(Vec<(String, serde_json::Value)>),
+    /// Accepted for compatibility with the documented record representation.
+    Map(AHashMap<String, serde_json::Value>),
+}
+
+/// Aggregate private perpetual state for a user.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsAllDexsClearinghouseState {
+    pub user: String,
+    pub clearinghouse_states: WsAllDexsClearinghouseStateData,
+}
+
+/// Complete open-order snapshot for one DEX.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsOpenOrdersData {
+    pub dex: String,
+    pub user: String,
+    pub orders: Vec<serde_json::Value>,
+}
+
+/// Complete spot and outcome balance snapshot for a user.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSpotStateData {
+    pub user: String,
+    pub spot_state: serde_json::Value,
 }
 
 /// Notification data.
@@ -928,6 +978,26 @@ mod tests {
         let json = serde_json::to_string(&sub).unwrap();
         assert!(json.contains(r#""type":"l2Book""#));
         assert!(json.contains(r#""coin":"BTC""#));
+    }
+
+    #[rstest]
+    #[case(
+        SubscriptionRequest::AllDexsClearinghouseState { user: "0xabc".to_string() },
+        r#"{"type":"allDexsClearinghouseState","user":"0xabc"}"#
+    )]
+    #[case(
+        SubscriptionRequest::OpenOrders { user: "0xabc".to_string(), dex: String::new() },
+        r#"{"type":"openOrders","user":"0xabc","dex":""}"#
+    )]
+    #[case(
+        SubscriptionRequest::SpotState { user: "0xabc".to_string(), is_portfolio_margin: None },
+        r#"{"type":"spotState","user":"0xabc"}"#
+    )]
+    fn test_private_snapshot_subscription_serialization(
+        #[case] subscription: SubscriptionRequest,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(serde_json::to_string(&subscription).unwrap(), expected);
     }
 
     #[rstest]

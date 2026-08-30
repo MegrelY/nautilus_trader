@@ -83,6 +83,9 @@ use crate::{
             NautilusWsMessage, PostRequest, PostResponse, PostResponsePayload, SubscriptionRequest,
         },
         post::{PostIds, PostRouter},
+        private_snapshot::{
+            PRIVATE_STATE_SNAPSHOT_TIMEOUT, PrivateStateSnapshot, PrivateStateSnapshotCache,
+        },
         trades::{TradeStreamRegistry, TradeStreamUse},
     },
 };
@@ -142,6 +145,7 @@ pub struct HyperliquidWebSocketClient {
     post_ids: Arc<PostIds>,
     post_limiter: Arc<WeightedLimiter>,
     post_timeout: Duration,
+    private_state_snapshots: PrivateStateSnapshotCache,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     account_id: Option<AccountId>,
     transport_backend: TransportBackend,
@@ -171,6 +175,7 @@ impl Clone for HyperliquidWebSocketClient {
             post_ids: Arc::clone(&self.post_ids),
             post_limiter: Arc::clone(&self.post_limiter),
             post_timeout: self.post_timeout,
+            private_state_snapshots: self.private_state_snapshots.clone(),
             task_handle: None,
             account_id: self.account_id,
             transport_backend: self.transport_backend,
@@ -217,6 +222,7 @@ impl HyperliquidWebSocketClient {
             post_ids: Arc::new(PostIds::new(1)),
             post_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
             post_timeout: HTTP_TIMEOUT,
+            private_state_snapshots: PrivateStateSnapshotCache::default(),
             cmd_tx: {
                 // Placeholder channel until connect() creates the real handler and replays queued instruments
                 let (tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -240,6 +246,7 @@ impl HyperliquidWebSocketClient {
         // A fresh socket has no venue-side subscriptions; stale book stream
         // entries must not gate the venue subscribe for re-subscriptions
         self.book_streams.clear();
+        self.private_state_snapshots.reset();
 
         let (message_handler, raw_rx) = channel_message_handler();
         let cfg = WebSocketConfig {
@@ -314,6 +321,7 @@ impl HyperliquidWebSocketClient {
         let cmd_tx_for_reconnect = cmd_tx.clone();
         let cloid_cache = Arc::clone(&self.cloid_cache);
         let post_router = Arc::clone(&self.post_router);
+        let private_state_snapshots = self.private_state_snapshots.clone();
 
         let stream_handle = get_runtime().spawn(async move {
             let mut handler = FeedHandler::new(
@@ -325,6 +333,7 @@ impl HyperliquidWebSocketClient {
                 subscriptions.clone(),
                 cloid_cache,
                 post_router,
+                private_state_snapshots,
             );
 
             let resubscribe_all = || {
@@ -455,6 +464,7 @@ impl HyperliquidWebSocketClient {
         self.asset_context_subs = Arc::new(DashMap::new());
         self.all_dex_asset_ctxs_instrument_ids = Arc::new(AtomicMap::new());
         self.cloid_cache = Arc::new(Mutex::new(FifoCacheMap::new()));
+        self.private_state_snapshots = PrivateStateSnapshotCache::default();
         self.out_rx = None;
         self.connection_mode
             .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
@@ -1537,6 +1547,32 @@ impl HyperliquidWebSocketClient {
         Ok(())
     }
 
+    /// Waits for a generation-consistent complete private-state snapshot.
+    ///
+    /// Subscriptions are installed once and retained so the transport's normal
+    /// reconnect replay restores complete discovery without a REST fan-out.
+    pub(crate) async fn private_state_snapshot(
+        &self,
+        user: &str,
+        dexes: &[String],
+    ) -> PrivateStateSnapshot {
+        let subscriptions = self.private_state_snapshots.configure(user, dexes);
+        if !subscriptions.is_empty()
+            && let Err(error) = self
+                .cmd_tx
+                .read()
+                .await
+                .send(HandlerCommand::Subscribe { subscriptions })
+        {
+            log::error!("Failed to install private-state snapshot subscriptions: {error}");
+            return self.private_state_snapshots.snapshot();
+        }
+
+        self.private_state_snapshots
+            .wait(PRIVATE_STATE_SNAPSHOT_TIMEOUT)
+            .await
+    }
+
     /// Subscribe to user events (fills, funding, liquidations) for a specific user address.
     pub async fn subscribe_user_events(&self, user: &str) -> anyhow::Result<()> {
         let subscription = SubscriptionRequest::UserEvents {
@@ -2166,6 +2202,23 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
             dex: rest.map(|s| s.to_string()),
         }),
         HyperliquidWsChannel::AllDexsAssetCtxs => Ok(SubscriptionRequest::AllDexsAssetCtxs),
+        HyperliquidWsChannel::AllDexsClearinghouseState => {
+            Ok(SubscriptionRequest::AllDexsClearinghouseState {
+                user: rest.context("Missing user")?.to_string(),
+            })
+        }
+        HyperliquidWsChannel::OpenOrders => {
+            let rest = rest.context("Missing open orders params")?;
+            let (user, dex) = rest.split_once(':').context("Missing DEX")?;
+            Ok(SubscriptionRequest::OpenOrders {
+                user: user.to_string(),
+                dex: dex.to_string(),
+            })
+        }
+        HyperliquidWsChannel::SpotState => Ok(SubscriptionRequest::SpotState {
+            user: rest.context("Missing user")?.to_string(),
+            is_portfolio_margin: None,
+        }),
         HyperliquidWsChannel::Notification => Ok(SubscriptionRequest::Notification {
             user: rest.context("Missing user")?.to_string(),
         }),

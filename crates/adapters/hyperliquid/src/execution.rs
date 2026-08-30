@@ -345,7 +345,10 @@ use crate::{
         query::ExchangeAction,
     },
     outcome_settlement::{OutcomeSettlementTracker, build_settlement_fills},
-    private_state::{HyperliquidIncompleteMassStatus, HyperliquidPrivateStateBatch},
+    private_state::{
+        HyperliquidIncompleteMassStatus, HyperliquidPrivateStateBatch, HyperliquidPrivateStateGap,
+        HyperliquidPrivateStateGapKind, HyperliquidPrivateStateSource,
+    },
     websocket::{
         ExecutionReport, NautilusWsMessage,
         client::HyperliquidWebSocketClient,
@@ -2256,21 +2259,61 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let mut completeness = HyperliquidPrivateStateBatch::<()>::default();
         let dex_batch = self.http_client.request_private_perp_dexes().await;
         let dexes = completeness.absorb(dex_batch);
-        let (order_batch, fill_batch, position_batch) = tokio::join!(
-            self.http_client
-                .request_order_status_report_batch(&account_address, None, &dexes),
+        let (snapshot, fill_batch) = tokio::join!(
+            self.ws_client
+                .private_state_snapshot(&account_address, &dexes),
             self.http_client
                 .request_fill_report_batch(&account_address, None),
-            self.http_client.request_position_status_report_batch(
-                &account_address,
-                None,
-                &dexes,
-                true,
-            ),
         );
-        let mut order_reports = completeness.absorb(order_batch?);
+
+        for dex in &snapshot.missing_open_order_dexes {
+            completeness.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::OpenOrders,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                (!dex.is_empty()).then_some(dex),
+                None,
+                format!(
+                    "WebSocket snapshot generation {} did not receive this DEX before the deadline",
+                    snapshot.generation
+                ),
+            ));
+        }
+        for dex in &snapshot.missing_clearinghouse_dexes {
+            completeness.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::PerpPositions,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                (!dex.is_empty()).then_some(dex),
+                None,
+                format!(
+                    "Aggregate WebSocket snapshot generation {} did not cover this DEX",
+                    snapshot.generation
+                ),
+            ));
+        }
+        if snapshot.spot_state.is_none() {
+            completeness.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::SpotPositions,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                None,
+                None,
+                format!(
+                    "WebSocket snapshot generation {} did not receive spot state before the deadline",
+                    snapshot.generation
+                ),
+            ));
+        }
+
+        let order_batch = self
+            .http_client
+            .parse_order_status_report_snapshot(&snapshot.open_orders, None)?;
+        let position_batch = self.http_client.parse_position_status_report_snapshot(
+            &snapshot.clearinghouse_states,
+            snapshot.spot_state.as_ref(),
+            None,
+        )?;
+        let mut order_reports = completeness.absorb(order_batch);
         let mut fill_reports = completeness.absorb(fill_batch?);
-        let position_reports = completeness.absorb(position_batch?);
+        let position_reports = completeness.absorb(position_batch);
 
         // Apply lookback filter to fills only (positions are current state,
         // and open orders must always be included for correct reconciliation)
@@ -4075,7 +4118,7 @@ mod tests {
 
         let isolated = HyperliquidAssetInfo {
             only_isolated: Some(true),
-            ..active.clone()
+            ..active
         };
         assert_eq!(
             resolve_maximum_cross_leverage(&leverage_meta(isolated), Ustr::from("PUMP")),

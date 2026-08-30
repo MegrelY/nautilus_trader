@@ -45,6 +45,12 @@ pub enum HyperliquidWsChannel {
     AllMids,
     #[serde(rename = "allDexsAssetCtxs")]
     AllDexsAssetCtxs,
+    #[serde(rename = "allDexsClearinghouseState")]
+    AllDexsClearinghouseState,
+    #[serde(rename = "openOrders")]
+    OpenOrders,
+    #[serde(rename = "spotState")]
+    SpotState,
     #[serde(rename = "notification")]
     Notification,
     #[serde(rename = "orderUpdates")]
@@ -91,6 +97,9 @@ impl HyperliquidWsChannel {
             Self::Candle => "candle",
             Self::AllMids => "allMids",
             Self::AllDexsAssetCtxs => "allDexsAssetCtxs",
+            Self::AllDexsClearinghouseState => "allDexsClearinghouseState",
+            Self::OpenOrders => "openOrders",
+            Self::SpotState => "spotState",
             Self::Notification => "notification",
             Self::OrderUpdates => "orderUpdates",
             Self::UserEvents => "userEvents",
@@ -229,7 +238,7 @@ mod tests {
     #[rstest]
     fn test_enum_iter() {
         let channels: Vec<HyperliquidWsChannel> = HyperliquidWsChannel::iter().collect();
-        assert_eq!(channels.len(), 23);
+        assert_eq!(channels.len(), 26);
         assert!(channels.contains(&HyperliquidWsChannel::Trades));
         assert!(channels.contains(&HyperliquidWsChannel::L2Book));
         assert!(channels.contains(&HyperliquidWsChannel::UserFills));
