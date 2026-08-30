@@ -81,6 +81,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Default)]
 struct TestServerState {
     info_request_count: Arc<tokio::sync::Mutex<usize>>,
+    info_request_types: Arc<tokio::sync::Mutex<Vec<String>>>,
     last_request_type: Arc<tokio::sync::Mutex<Option<String>>>,
     subscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -211,6 +212,11 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         .to_string();
 
     *state.last_request_type.lock().await = Some(request_type.clone());
+    state
+        .info_request_types
+        .lock()
+        .await
+        .push(request_type.clone());
 
     match request_type.as_str() {
         "meta" => {
@@ -1383,6 +1389,20 @@ async fn test_data_client_subscribe_all_dex_asset_ctxs_custom_data() {
     client.connect().await.unwrap();
     drain_initial_events(&mut rx).await;
 
+    let bootstrap_request_types = state.info_request_types.lock().await.clone();
+    assert_eq!(
+        bootstrap_request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "allPerpMetas")
+            .count(),
+        1
+    );
+    assert!(
+        !bootstrap_request_types
+            .iter()
+            .any(|request_type| request_type == "perpDexs")
+    );
+
     let data_type = DataType::new("HyperliquidAllDexsAssetCtxs", None, None);
     client
         .subscribe(SubscribeCustomData::new(
@@ -1411,6 +1431,22 @@ async fn test_data_client_subscribe_all_dex_asset_ctxs_custom_data() {
     .await;
 
     wait_for_all_dex_asset_ctxs_event(&mut rx).await;
+
+    let subscribed_request_types = state.info_request_types.lock().await.clone();
+    assert_eq!(
+        subscribed_request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "allPerpMetas")
+            .count(),
+        2
+    );
+    assert_eq!(
+        subscribed_request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "perpDexs")
+            .count(),
+        1
+    );
 
     client
         .unsubscribe(&UnsubscribeCustomData::new(

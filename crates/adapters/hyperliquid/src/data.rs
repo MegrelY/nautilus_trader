@@ -336,24 +336,6 @@ impl HyperliquidDataClient {
             self.ws_client.cache_instrument(instrument.clone());
         }
 
-        match self
-            .http_client
-            .build_all_dex_asset_ctxs_instrument_ids()
-            .await
-        {
-            Ok(mapping) => {
-                let mapping = mapping
-                    .into_iter()
-                    .map(|(dex, instrument_ids)| (Ustr::from(dex.as_str()), instrument_ids))
-                    .collect();
-                self.ws_client
-                    .cache_all_dex_asset_ctxs_instrument_ids(mapping);
-            }
-            Err(e) => {
-                log::warn!("Failed to build Hyperliquid allDexsAssetCtxs mapping: {e}");
-            }
-        }
-
         log::debug!(
             "Bootstrapped {} instruments with {} coin mappings",
             self.instruments.len(),
@@ -701,9 +683,17 @@ impl DataClient for HyperliquidDataClient {
         }
 
         if data_type == "HyperliquidAllDexsAssetCtxs" {
+            let http = self.http_client.clone();
             let ws = self.ws_client.clone();
 
             self.spawn_task("subscribe_all_dexs_asset_ctxs", async move {
+                let mapping = http
+                    .build_all_dex_asset_ctxs_instrument_ids()
+                    .await?
+                    .into_iter()
+                    .map(|(dex, instrument_ids)| (Ustr::from(dex.as_str()), instrument_ids))
+                    .collect();
+                ws.cache_all_dex_asset_ctxs_instrument_ids(mapping);
                 ws.subscribe_all_dexs_asset_ctxs().await
             });
 

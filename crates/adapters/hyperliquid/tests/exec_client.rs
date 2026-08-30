@@ -85,6 +85,7 @@ use nautilus_model::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId, TraderId,
         VenueOrderId,
     },
+    instruments::InstrumentAny,
     orders::{LimitOrder, MarketOrder, Order, OrderAny, OrderList, StopMarketOrder},
     reports::OrderStatusReport,
     types::{AccountBalance, Currency, Money, Price, Quantity},
@@ -100,6 +101,7 @@ use ustr::Ustr;
 #[derive(Clone)]
 struct TestServerState {
     exchange_request_count: Arc<tokio::sync::Mutex<usize>>,
+    info_request_types: Arc<tokio::sync::Mutex<Vec<String>>>,
     last_exchange_action: Arc<tokio::sync::Mutex<Option<Value>>>,
     reject_next_order: Arc<std::sync::atomic::AtomicBool>,
     /// Returns a `status="ok"` envelope whose inner `statuses[0]` carries a
@@ -150,6 +152,7 @@ impl Default for TestServerState {
     fn default() -> Self {
         Self {
             exchange_request_count: Arc::new(tokio::sync::Mutex::new(0)),
+            info_request_types: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_exchange_action: Arc::new(tokio::sync::Mutex::new(None)),
             reject_next_order: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inner_order_error_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -210,6 +213,12 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         .get("type")
         .and_then(|t| t.as_str())
         .unwrap_or("");
+
+    state
+        .info_request_types
+        .lock()
+        .await
+        .push(request_type.to_string());
 
     match request_type {
         "meta" => {
@@ -2046,6 +2055,123 @@ async fn test_exec_client_creation() {
     assert_eq!(client.venue(), *HYPERLIQUID_VENUE);
     assert_eq!(client.oms_type(), OmsType::Netting);
     assert!(!client.is_connected());
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_exec_client_empty_shared_cache_requests_catalog_once() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+
+    client.connect().await.unwrap();
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert_eq!(
+        request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "spotMeta")
+            .count(),
+        1
+    );
+    assert_eq!(
+        request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "allPerpMetas")
+            .count(),
+        1
+    );
+    assert_eq!(
+        request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "outcomeMeta")
+            .count(),
+        1
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_exec_client_reuses_shared_instrument_catalog() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut provider =
+        HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 1, None).unwrap();
+    provider.set_base_info_url(format!("http://{addr}/info"));
+    let instruments = provider.request_instruments().await.unwrap();
+    state.info_request_types.lock().await.clear();
+
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    {
+        let mut cache = cache.borrow_mut();
+        for instrument in instruments {
+            cache.add_instrument(instrument).unwrap();
+        }
+    }
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+
+    client.connect().await.unwrap();
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert!(!request_types.iter().any(|request_type| matches!(
+        request_type.as_str(),
+        "spotMeta" | "allPerpMetas" | "outcomeMeta" | "meta"
+    )));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_exec_client_refreshes_shared_catalog_without_asset_indices() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut provider =
+        HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 1, None).unwrap();
+    provider.set_base_info_url(format!("http://{addr}/info"));
+    let mut instruments = provider.request_instruments().await.unwrap();
+    state.info_request_types.lock().await.clear();
+
+    for instrument in &mut instruments {
+        match instrument {
+            InstrumentAny::BinaryOption(instrument) => instrument.info = None,
+            InstrumentAny::CryptoPerpetual(instrument) => instrument.info = None,
+            InstrumentAny::CurrencyPair(instrument) => instrument.info = None,
+            _ => {}
+        }
+    }
+
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    {
+        let mut cache = cache.borrow_mut();
+        for instrument in instruments {
+            cache.add_instrument(instrument).unwrap();
+        }
+    }
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+
+    client.connect().await.unwrap();
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert_eq!(
+        request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "allPerpMetas")
+            .count(),
+        1
+    );
+    assert_eq!(
+        request_types
+            .iter()
+            .filter(|request_type| request_type.as_str() == "spotMeta")
+            .count(),
+        1
+    );
+
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]

@@ -95,11 +95,11 @@ use crate::{
             PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
         },
         parse::{
-            HyperliquidInstrumentDef, filter_recent_public_trades, instruments_from_defs_owned,
-            parse_fill_report, parse_order_status_report_from_basic, parse_outcome_instruments,
-            parse_perp_instruments_with_settlement, parse_position_status_report,
-            parse_recent_public_trade, parse_spot_instruments, parse_spot_position_status_report,
-            resolve_perp_settlement_currency,
+            HyperliquidInstrumentDef, filter_recent_public_trades, instrument_asset_index,
+            instruments_from_defs_owned, parse_fill_report, parse_order_status_report_from_basic,
+            parse_outcome_instruments, parse_perp_instruments_with_settlement,
+            parse_position_status_report, parse_recent_public_trade, parse_spot_instruments,
+            parse_spot_position_status_report, resolve_perp_settlement_currency,
         },
         query::{ExchangeAction, InfoRequest},
         rate_limits::{
@@ -1307,6 +1307,10 @@ impl HyperliquidHttpClient {
     pub fn cache_instrument(&self, instrument: &InstrumentAny) {
         let full_symbol = instrument.symbol().inner();
         let coin = instrument.raw_symbol().inner();
+
+        if let Some(asset_index) = instrument_asset_index(instrument) {
+            self.asset_indices.insert(full_symbol, asset_index);
+        }
 
         self.instruments.rcu(|m| {
             m.insert(full_symbol, instrument.clone());

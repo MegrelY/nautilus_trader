@@ -495,6 +495,7 @@ fn build_outcome_info(
 ) -> Params {
     let mut info = Params::new();
 
+    info.insert("asset_index".into(), json!(asset_id_raw));
     info.insert("outcome_index".into(), json!(market.outcome));
     info.insert("outcome_side".into(), json!(side));
     if let Some(name) = side_name {
@@ -762,6 +763,26 @@ fn is_outcome_side_token(symbol: &str) -> bool {
 // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses
 const HYPERLIQUID_MIN_ORDER_NOTIONAL: Decimal = Decimal::TEN;
 
+fn build_instrument_info(asset_index: u32) -> Params {
+    let mut info = Params::new();
+    info.insert("asset_index".into(), json!(asset_index));
+    info
+}
+
+/// Returns the Hyperliquid order-routing asset index carried by an instrument.
+#[must_use]
+pub(crate) fn instrument_asset_index(instrument: &InstrumentAny) -> Option<u32> {
+    let info = match instrument {
+        InstrumentAny::BinaryOption(instrument) => instrument.info.as_ref(),
+        InstrumentAny::CryptoPerpetual(instrument) => instrument.info.as_ref(),
+        InstrumentAny::CurrencyPair(instrument) => instrument.info.as_ref(),
+        _ => None,
+    }?;
+
+    info.get_u64("asset_index")
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 /// Converts a single Hyperliquid instrument definition into a Nautilus `InstrumentAny`.
 ///
 /// Returns `None` if the conversion fails (e.g., unsupported market type).
@@ -809,8 +830,8 @@ pub fn create_instrument_from_def(
                 None,
                 None,
                 None,
-                None,
-                None,
+                None, // tick_scheme
+                Some(build_instrument_info(def.asset_index)),
                 ts_init, // Identical to ts_init for now
                 ts_init,
             )))
@@ -852,8 +873,8 @@ pub fn create_instrument_from_def(
                 None,
                 None,
                 None,
-                None,
-                None,
+                None, // tick_scheme
+                Some(build_instrument_info(def.asset_index)),
                 ts_init, // Identical to ts_init for now
                 ts_init,
             )))
@@ -1496,6 +1517,12 @@ mod tests {
                 assert_eq!(min_notional.currency, Currency::USD());
                 assert_eq!(min_notional.as_decimal(), dec!(10));
                 assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
+                assert_eq!(
+                    perp.info
+                        .as_ref()
+                        .and_then(|info| info.get_u64("asset_index")),
+                    Some(u64::from(defs[0].asset_index))
+                );
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }
@@ -1724,6 +1751,12 @@ mod tests {
                 let min_notional = pair.min_notional.unwrap();
                 assert_eq!(min_notional.currency, Currency::USDC());
                 assert_eq!(min_notional.as_decimal(), dec!(10));
+                assert_eq!(
+                    pair.info
+                        .as_ref()
+                        .and_then(|info| info.get_u64("asset_index")),
+                    Some(u64::from(purr_usdc.asset_index))
+                );
             }
             other => panic!("Expected CurrencyPair, was {other:?}"),
         }
@@ -1981,6 +2014,18 @@ mod tests {
         let no_meta = no.outcome.as_ref().unwrap();
         assert_eq!(no_meta.outcome_side, 1);
         assert_eq!(no_meta.side_name.unwrap().as_str(), "No");
+
+        let instrument = create_instrument_from_def(yes, UnixNanos::default()).unwrap();
+        let InstrumentAny::BinaryOption(option) = instrument else {
+            panic!("Expected BinaryOption")
+        };
+        assert_eq!(
+            option
+                .info
+                .as_ref()
+                .and_then(|info| info.get_u64("asset_index")),
+            Some(u64::from(yes.asset_index))
+        );
     }
 
     #[rstest]

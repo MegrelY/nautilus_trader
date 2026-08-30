@@ -47,6 +47,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, any::OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
@@ -695,9 +696,50 @@ impl HyperliquidExecutionClient {
         register_order_identity_into(&self.ws_dispatch_state, order);
     }
 
+    fn cache_execution_instruments(&self, instruments: &[InstrumentAny]) {
+        for instrument in instruments {
+            self.http_client.cache_instrument(instrument);
+            self.ws_client.cache_instrument(instrument.clone());
+        }
+    }
+
+    fn instrument_asset_indices_initialized(&self, instruments: &[InstrumentAny]) -> bool {
+        instruments.iter().all(|instrument| {
+            self.http_client
+                .get_asset_index(instrument.symbol().as_str())
+                .is_some()
+        })
+    }
+
     async fn ensure_instruments_initialized_async(&self) -> anyhow::Result<()> {
         if self.core.instruments_initialized() {
             return Ok(());
+        }
+
+        let cached_instruments = {
+            let cache = self.core.cache();
+            cache
+                .instruments(&self.core.venue, None)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        if !cached_instruments.is_empty() {
+            self.cache_execution_instruments(&cached_instruments);
+
+            if self.instrument_asset_indices_initialized(&cached_instruments) {
+                log::debug!(
+                    "Initialized {} instruments from shared cache",
+                    cached_instruments.len()
+                );
+                self.core.set_instruments_initialized();
+                return Ok(());
+            }
+
+            log::debug!(
+                "Shared instrument cache lacks Hyperliquid asset indices; requesting current catalog"
+            );
         }
 
         let instruments = self
@@ -712,10 +754,7 @@ impl HyperliquidExecutionClient {
             );
         } else {
             log::debug!("Initialized {} instruments", instruments.len());
-
-            for instrument in &instruments {
-                self.http_client.cache_instrument(instrument);
-            }
+            self.cache_execution_instruments(&instruments);
         }
 
         self.core.set_instruments_initialized();
@@ -2292,16 +2331,6 @@ impl HyperliquidExecutionClient {
         let subscription_address = self.get_account_address()?;
 
         let mut ws_client = self.ws_client.clone();
-
-        let instruments = self
-            .http_client
-            .request_instruments()
-            .await
-            .unwrap_or_default();
-
-        for instrument in instruments {
-            ws_client.cache_instrument(instrument);
-        }
 
         // Connect and subscribe before spawning the event loop
         ws_client.connect().await?;
