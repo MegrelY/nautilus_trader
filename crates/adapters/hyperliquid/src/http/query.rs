@@ -125,6 +125,8 @@ pub struct OrderStatusParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenOrdersParams {
     pub user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dex: Option<String>,
 }
 
 /// Parameters for current user leverage and trading capacity for one asset.
@@ -138,6 +140,8 @@ pub struct ActiveAssetDataParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClearinghouseStateParams {
     pub user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dex: Option<String>,
 }
 
 /// Parameters for spot clearinghouse state request.
@@ -302,6 +306,7 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::OpenOrders,
             params: InfoRequestParams::OpenOrders(OpenOrdersParams {
                 user: user.to_string(),
+                dex: None,
             }),
         }
     }
@@ -312,6 +317,18 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::FrontendOpenOrders,
             params: InfoRequestParams::OpenOrders(OpenOrdersParams {
                 user: user.to_string(),
+                dex: None,
+            }),
+        }
+    }
+
+    /// Creates a request to get frontend open orders for one perpetual DEX.
+    pub fn frontend_open_orders_for_dex(user: &str, dex: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::FrontendOpenOrders,
+            params: InfoRequestParams::OpenOrders(OpenOrdersParams {
+                user: user.to_string(),
+                dex: Some(dex.to_string()),
             }),
         }
     }
@@ -333,6 +350,7 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::HistoricalOrders,
             params: InfoRequestParams::OpenOrders(OpenOrdersParams {
                 user: user.to_string(),
+                dex: None,
             }),
         }
     }
@@ -343,6 +361,18 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::ClearinghouseState,
             params: InfoRequestParams::ClearinghouseState(ClearinghouseStateParams {
                 user: user.to_string(),
+                dex: None,
+            }),
+        }
+    }
+
+    /// Creates a request to get clearinghouse state for one perpetual DEX.
+    pub fn clearinghouse_state_for_dex(user: &str, dex: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::ClearinghouseState,
+            params: InfoRequestParams::ClearinghouseState(ClearinghouseStateParams {
+                user: user.to_string(),
+                dex: Some(dex.to_string()),
             }),
         }
     }
@@ -363,6 +393,7 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::UserFees,
             params: InfoRequestParams::OpenOrders(OpenOrdersParams {
                 user: user.to_string(),
+                dex: None,
             }),
         }
     }
@@ -587,6 +618,38 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains(r#""type":"spotClearinghouseState""#));
         assert!(json.contains(r#""user":"0xabc""#));
+    }
+
+    #[rstest]
+    fn test_private_dex_request_serialization() {
+        let default_orders = InfoRequest::frontend_open_orders_for_dex("0xabc", "");
+        let hip3_orders = InfoRequest::frontend_open_orders_for_dex("0xabc", "xyz");
+        let hip3_positions = InfoRequest::clearinghouse_state_for_dex("0xabc", "xyz");
+
+        assert_eq!(
+            serde_json::to_value(default_orders).unwrap(),
+            serde_json::json!({
+                "type": "frontendOpenOrders",
+                "user": "0xabc",
+                "dex": "",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(hip3_orders).unwrap(),
+            serde_json::json!({
+                "type": "frontendOpenOrders",
+                "user": "0xabc",
+                "dex": "xyz",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(hip3_positions).unwrap(),
+            serde_json::json!({
+                "type": "clearinghouseState",
+                "user": "0xabc",
+                "dex": "xyz",
+            })
+        );
     }
 
     #[rstest]

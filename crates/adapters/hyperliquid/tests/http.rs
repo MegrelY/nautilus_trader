@@ -146,6 +146,7 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             let meta = load_json("http_meta_perp_sample.json");
             Json(json!([meta])).into_response()
         }
+        "perpDexs" => Json(json!([null])).into_response(),
         "spotMeta" => Json(json!({
             "universe": [],
             "tokens": []
@@ -649,18 +650,19 @@ async fn test_request_position_status_reports_skips_spot_fetch_for_perp_filter()
 
 #[rstest]
 #[tokio::test]
-async fn test_request_spot_position_status_reports_skips_when_instrument_missing() {
+async fn test_request_spot_position_status_reports_errors_when_instrument_missing() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
 
     let client = create_domain_client(&addr);
-    // No spot instruments are cached, so reports are skipped (non-fatal)
-    let reports = client
+    let error = client
         .request_spot_position_status_reports("0x1234567890123456789012345678901234567890", None)
         .await
-        .unwrap();
+        .expect_err("an unresolved non-zero holding must make the report incomplete");
 
-    assert!(reports.is_empty());
+    assert!(
+        matches!(error, Error::Decode(message) if message.contains("Incomplete spot position status reports"))
+    );
 }
 
 #[rstest]
@@ -1727,6 +1729,44 @@ async fn test_request_order_status_report_not_found() {
 
 #[rstest]
 #[tokio::test]
+async fn test_request_order_status_report_errors_for_unresolved_instrument() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([{
+        "coin": "UNKNOWN",
+        "side": "B",
+        "limitPx": "1.0",
+        "sz": "1.0",
+        "oid": 100001,
+        "timestamp": 1700000000000u64,
+        "origSz": "1.0"
+    }]));
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+
+    let error = client
+        .request_order_status_report("0xuser", 100001)
+        .await
+        .expect_err("an unresolved order instrument must not look absent");
+    assert!(matches!(error, Error::Decode(message) if message.contains("UNKNOWN")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_errors_for_malformed_open_list() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!({"not": "an array"}));
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+
+    let error = client
+        .request_order_status_report("0xuser", 100002)
+        .await
+        .expect_err("a malformed private source must not fall back to absence");
+    assert!(matches!(error, Error::Decode(message) if message.contains("frontend open orders")));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_request_order_status_report_by_client_order_id_matches_cloid() {
     let coid = ClientOrderId::new("O-20240101-000001");
     let cloid = Cloid::from_client_order_id(coid);
@@ -1790,4 +1830,46 @@ async fn test_request_order_status_report_by_client_order_id_no_match() {
         .unwrap();
 
     assert!(report.is_none(), "should not match different cloid");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_errors_for_unresolved_instrument() {
+    let coid = ClientOrderId::new("O-20240101-UNRESOLVED");
+    let cloid = Cloid::from_client_order_id(coid).to_hex();
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([{
+        "coin": "UNKNOWN",
+        "side": "B",
+        "limitPx": "1.0",
+        "sz": "1.0",
+        "oid": 100003,
+        "timestamp": 1700000000000u64,
+        "origSz": "1.0",
+        "cloid": cloid,
+    }]));
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+
+    let error = client
+        .request_order_status_report_by_client_order_id("0xuser", &coid)
+        .await
+        .expect_err("an unresolved order instrument must not look absent");
+    assert!(matches!(error, Error::Decode(message) if message.contains("UNKNOWN")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_errors_for_malformed_open_list() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!({"not": "an array"}));
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    let coid = ClientOrderId::new("O-20240101-MALFORMED");
+
+    let error = client
+        .request_order_status_report_by_client_order_id("0xuser", &coid)
+        .await
+        .expect_err("a malformed private source must not look absent");
+    assert!(matches!(error, Error::Decode(message) if message.contains("frontend open orders")));
 }

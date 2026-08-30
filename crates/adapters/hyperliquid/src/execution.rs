@@ -344,6 +344,7 @@ use crate::{
         query::ExchangeAction,
     },
     outcome_settlement::{OutcomeSettlementTracker, build_settlement_fills},
+    private_state::{HyperliquidIncompleteMassStatus, HyperliquidPrivateStateBatch},
     websocket::{
         ExecutionReport, NautilusWsMessage,
         client::HyperliquidWebSocketClient,
@@ -2246,25 +2247,25 @@ impl ExecutionClient for HyperliquidExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
-
-        let order_cmd = GenerateOrderStatusReports::new(
-            UUID4::new(),
-            ts_init,
-            true, // open_only
-            None,
-            None,
-            None,
-            None,
-            None,
+        let account_address = self.get_account_address()?;
+        let mut completeness = HyperliquidPrivateStateBatch::<()>::default();
+        let dex_batch = self.http_client.request_private_perp_dexes().await;
+        let dexes = completeness.absorb(dex_batch);
+        let (order_batch, fill_batch, position_batch) = tokio::join!(
+            self.http_client
+                .request_order_status_report_batch(&account_address, None, &dexes),
+            self.http_client
+                .request_fill_report_batch(&account_address, None),
+            self.http_client.request_position_status_report_batch(
+                &account_address,
+                None,
+                &dexes,
+                true,
+            ),
         );
-        let fill_cmd =
-            GenerateFillReports::new(UUID4::new(), ts_init, None, None, None, None, None, None);
-        let position_cmd =
-            GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
-
-        let mut order_reports = self.generate_order_status_reports(&order_cmd).await?;
-        let mut fill_reports = self.generate_fill_reports(fill_cmd).await?;
-        let position_reports = self.generate_position_status_reports(&position_cmd).await?;
+        let mut order_reports = completeness.absorb(order_batch?);
+        let mut fill_reports = completeness.absorb(fill_batch?);
+        let position_reports = completeness.absorb(position_batch?);
 
         // Apply lookback filter to fills only (positions are current state,
         // and open orders must always be included for correct reconciliation)
@@ -2278,7 +2279,6 @@ impl ExecutionClient for HyperliquidExecutionClient {
         }
 
         if !fill_reports.is_empty() {
-            let account_address = self.get_account_address()?;
             let filled_order_ids: ahash::AHashSet<_> = fill_reports
                 .iter()
                 .map(|report| report.venue_order_id)
@@ -2287,11 +2287,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 .iter()
                 .map(|report| report.venue_order_id)
                 .collect();
-            let mut historical_reports = self
+            let historical_batch = self
                 .http_client
-                .request_historical_order_status_reports(&account_address, None)
+                .request_historical_order_status_report_batch(&account_address, None)
                 .await
                 .context("failed to generate historical order status reports")?;
+            let mut historical_reports = completeness.absorb(historical_batch);
             historical_reports.retain(|report| {
                 filled_order_ids.contains(&report.venue_order_id)
                     && !open_order_ids.contains(&report.venue_order_id)
@@ -2316,6 +2317,15 @@ impl ExecutionClient for HyperliquidExecutionClient {
             mass_status.fill_reports().len(),
             mass_status.position_reports().len(),
         );
+
+        if !completeness.is_complete() {
+            let (_, gaps, omitted_gap_count) = completeness.into_parts();
+            return Err(anyhow::Error::new(HyperliquidIncompleteMassStatus::new(
+                mass_status,
+                gaps,
+                omitted_gap_count,
+            )));
+        }
 
         Ok(Some(mass_status))
     }

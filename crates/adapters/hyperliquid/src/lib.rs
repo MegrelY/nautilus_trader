@@ -55,6 +55,7 @@ pub mod execution;
 pub mod factories;
 pub mod http;
 pub mod outcome_settlement;
+pub mod private_state;
 pub mod signing;
 pub mod websocket;
 
@@ -78,5 +79,9 @@ pub use crate::{
         HyperliquidExecutionClientFactory, HyperliquidLeveragePreflightExecutionClientFactory,
     },
     http::client::HyperliquidHttpClient,
+    private_state::{
+        HyperliquidIncompleteMassStatus, HyperliquidPrivateStateGap,
+        HyperliquidPrivateStateGapKind, HyperliquidPrivateStateSource,
+    },
     websocket::client::HyperliquidWebSocketClient,
 };

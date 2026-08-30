@@ -29,6 +29,7 @@ use std::{
 
 use ahash::AHashMap;
 use anyhow::Context;
+use futures_util::future::join_all;
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, MUTEX_POISONED, UUID4, UnixNanos,
@@ -89,10 +90,11 @@ use crate::{
             HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
             HyperliquidExecPlaceOrderRequest, HyperliquidExecSplitOutcomeParams,
             HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams,
-            HyperliquidExecUserOutcomeOp, HyperliquidFills, HyperliquidFundingHistoryEntry,
-            HyperliquidL2Book, HyperliquidMeta, HyperliquidOrderStatus,
-            HyperliquidOrderStatusEntry, HyperliquidRecentTrade, OutcomeMeta, PerpDex, PerpMeta,
-            PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
+            HyperliquidExecUserOutcomeOp, HyperliquidFill, HyperliquidFills,
+            HyperliquidFundingHistoryEntry, HyperliquidL2Book, HyperliquidMeta,
+            HyperliquidOrderStatus, HyperliquidOrderStatusEntry, HyperliquidRecentTrade,
+            OutcomeMeta, PerpDex, PerpMeta, PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotBalance,
+            SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
         },
         parse::{
             HyperliquidInstrumentDef, filter_recent_public_trades, instrument_asset_index,
@@ -106,6 +108,10 @@ use crate::{
             RateLimitSnapshot, WeightedLimiter, backoff_full_jitter, exchange_weight,
             exec_action_weight, info_base_weight, info_extra_weight,
         },
+    },
+    private_state::{
+        HyperliquidPrivateStateBatch, HyperliquidPrivateStateGap, HyperliquidPrivateStateGapKind,
+        HyperliquidPrivateStateSource,
     },
     signing::{
         HyperliquidActionType, HyperliquidEip712Signer, NonceManager, SignRequest, types::SignerId,
@@ -138,6 +144,40 @@ fn deduplicate_historical_order_reports(reports: Vec<OrderStatusReport>) -> Vec<
     }
 
     best_by_venue_order_id.into_values().collect()
+}
+
+fn require_complete_private_reports<T>(
+    operation: &str,
+    batch: HyperliquidPrivateStateBatch<T>,
+) -> Result<Vec<T>> {
+    let (reports, gaps, omitted) = batch.into_parts();
+    if gaps.is_empty() && omitted == 0 {
+        Ok(reports)
+    } else {
+        Err(Error::decode(format!(
+            "Incomplete {operation}: {} recorded gap(s), {omitted} omitted",
+            gaps.len()
+        )))
+    }
+}
+
+fn private_value_identity(value: &Value) -> Option<String> {
+    value
+        .get("coin")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("position")
+                .and_then(|position| position.get("coin"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("order")
+                .and_then(|order| order.get("coin"))
+                .and_then(Value::as_str)
+        })
+        .map(ToString::to_string)
 }
 
 fn historical_report_is_more_advanced(
@@ -453,6 +493,11 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
+    async fn info_user_fills_raw(&self, user: &str) -> Result<Value> {
+        let request = InfoRequest::user_fills(user);
+        self.send_info_request(&request).await
+    }
+
     /// Get order status for a user.
     pub async fn info_order_status(&self, user: &str, oid: u64) -> Result<HyperliquidOrderStatus> {
         let request = InfoRequest::order_status(user, oid);
@@ -469,6 +514,11 @@ impl HyperliquidRawHttpClient {
     /// Get frontend open orders (includes more detail) for a user.
     pub async fn info_frontend_open_orders(&self, user: &str) -> Result<Value> {
         let request = InfoRequest::frontend_open_orders(user);
+        self.send_info_request(&request).await
+    }
+
+    async fn info_frontend_open_orders_for_dex(&self, user: &str, dex: &str) -> Result<Value> {
+        let request = InfoRequest::frontend_open_orders_for_dex(user, dex);
         self.send_info_request(&request).await
     }
 
@@ -493,9 +543,19 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
+    async fn info_historical_orders_raw(&self, user: &str) -> Result<Value> {
+        let request = InfoRequest::historical_orders(user);
+        self.send_info_request(&request).await
+    }
+
     /// Get clearinghouse state (balances, positions, margin) for a user.
     pub async fn info_clearinghouse_state(&self, user: &str) -> Result<Value> {
         let request = InfoRequest::clearinghouse_state(user);
+        self.send_info_request(&request).await
+    }
+
+    async fn info_clearinghouse_state_for_dex(&self, user: &str, dex: &str) -> Result<Value> {
+        let request = InfoRequest::clearinghouse_state_for_dex(user, dex);
         self.send_info_request(&request).await
     }
 
@@ -2227,6 +2287,168 @@ impl HyperliquidHttpClient {
         self.inner.post_action_exec(&action).await
     }
 
+    pub(crate) async fn request_private_perp_dexes(&self) -> HyperliquidPrivateStateBatch<String> {
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        batch.push_report(String::new());
+
+        match self.inner.load_perp_dexs().await {
+            Ok(dexes) => {
+                for (index, dex) in dexes.into_iter().enumerate().skip(1) {
+                    match dex {
+                        Some(dex) if !dex.name.is_empty() => batch.push_report(dex.name),
+                        _ => batch.push_gap(HyperliquidPrivateStateGap::new(
+                            HyperliquidPrivateStateSource::DexEnumeration,
+                            HyperliquidPrivateStateGapKind::ParseFailure,
+                            None,
+                            Some(&format!("dex-index-{index}")),
+                            "Missing perpetual DEX descriptor",
+                        )),
+                    }
+                }
+            }
+            Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::DexEnumeration,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                None,
+                None,
+                error.to_string(),
+            )),
+        }
+
+        batch
+    }
+
+    async fn private_dexes_for_filter(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<HyperliquidPrivateStateBatch<String>> {
+        let Some(instrument_id) = instrument_id else {
+            return Ok(self.request_private_perp_dexes().await);
+        };
+
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        let product_type = HyperliquidProductType::from_symbol(instrument_id.symbol.as_str())
+            .map_err(|error| Error::bad_request(error.to_string()))?;
+        if matches!(
+            product_type,
+            HyperliquidProductType::Spot | HyperliquidProductType::Outcome
+        ) {
+            batch.push_report(String::new());
+            return Ok(batch);
+        }
+
+        let instrument = self
+            .instruments
+            .load()
+            .get(&instrument_id.symbol.inner())
+            .cloned()
+            .ok_or_else(|| Error::bad_request(format!("Instrument not cached: {instrument_id}")))?;
+        let raw_symbol = instrument.raw_symbol();
+        let dex = raw_symbol
+            .as_str()
+            .split_once(':')
+            .map_or("", |(dex, _)| dex);
+        batch.push_report(dex.to_string());
+        Ok(batch)
+    }
+
+    pub(crate) async fn request_order_status_report_batch(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+        dexes: &[String],
+    ) -> Result<HyperliquidPrivateStateBatch<OrderStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let responses = join_all(dexes.iter().map(|dex| async move {
+            (
+                dex.as_str(),
+                self.inner
+                    .info_frontend_open_orders_for_dex(user, dex)
+                    .await,
+            )
+        }))
+        .await;
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        let ts_init = self.clock.get_time_ns();
+
+        for (dex, response) in responses {
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::OpenOrders,
+                        HyperliquidPrivateStateGapKind::SourceFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        None,
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let Some(orders) = response.as_array() else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::OpenOrders,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    (!dex.is_empty()).then_some(dex),
+                    None,
+                    "Expected an order array",
+                ));
+                continue;
+            };
+
+            for order_value in orders {
+                let order: WsBasicOrderData = match serde_json::from_value(order_value.clone()) {
+                    Ok(order) => order,
+                    Err(error) => {
+                        let identity = private_value_identity(order_value);
+                        batch.push_gap(HyperliquidPrivateStateGap::new(
+                            HyperliquidPrivateStateSource::OpenOrders,
+                            HyperliquidPrivateStateGapKind::ParseFailure,
+                            (!dex.is_empty()).then_some(dex),
+                            identity.as_deref(),
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                let Some(instrument) = self.get_or_create_instrument(&order.coin, None) else {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::OpenOrders,
+                        HyperliquidPrivateStateGapKind::UnknownInstrument,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(order.coin.as_str()),
+                        "Instrument not cached",
+                    ));
+                    continue;
+                };
+                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                    continue;
+                }
+
+                match parse_order_status_report_from_basic(
+                    &order,
+                    &HyperliquidOrderStatusEnum::Open,
+                    &instrument,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(report) => batch.push_report(report),
+                    Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::OpenOrders,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(order.coin.as_str()),
+                        error.to_string(),
+                    )),
+                }
+            }
+        }
+
+        Ok(batch)
+    }
+
     /// Request order status reports for a user.
     ///
     /// Fetches open orders via `info_frontend_open_orders` and parses them into OrderStatusReports.
@@ -2243,83 +2465,76 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<OrderStatusReport>> {
-        let account_id = self
-            .account_id
-            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let response = self.info_frontend_open_orders(user).await?;
-
-        // Parse the JSON response into a vector of orders
-        let orders: Vec<serde_json::Value> = serde_json::from_value(response)
-            .map_err(|e| Error::bad_request(format!("Failed to parse orders: {e}")))?;
-
-        let mut reports = Vec::new();
-        let ts_init = self.clock.get_time_ns();
-
-        for order_value in orders {
-            // Parse the order data
-            let order: WsBasicOrderData = match serde_json::from_value(order_value.clone()) {
-                Ok(o) => o,
-                Err(e) => {
-                    log::warn!("Failed to parse order: {e}");
-                    continue;
-                }
-            };
-
-            // Get instrument from cache or create synthetic for vault tokens
-            let instrument = match self.get_or_create_instrument(&order.coin, None) {
-                Some(inst) => inst,
-                None => continue, // Skip if instrument not found
-            };
-
-            // Filter by instrument_id if specified
-            if let Some(filter_id) = instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            // Determine status from order data - orders from frontend_open_orders are open
-            let status = HyperliquidOrderStatusEnum::Open;
-
-            // Parse to OrderStatusReport
-            match parse_order_status_report_from_basic(
-                &order,
-                &status,
-                &instrument,
-                account_id,
-                ts_init,
-            ) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse order status report: {e}"),
-            }
-        }
-
-        Ok(reports)
+        let dex_batch = self.private_dexes_for_filter(instrument_id).await?;
+        let dexes = require_complete_private_reports("perpetual DEX enumeration", dex_batch)?;
+        let batch = self
+            .request_order_status_report_batch(user, instrument_id, &dexes)
+            .await?;
+        require_complete_private_reports("order status reports", batch)
     }
 
-    /// Request historical order status reports for a user.
-    ///
-    /// The venue bounds this endpoint to its 2,000 most recent historical
-    /// orders. Mass-status reconciliation narrows these reports to venue order
-    /// IDs represented by the retained fill window.
-    pub async fn request_historical_order_status_reports(
+    pub(crate) async fn request_historical_order_status_report_batch(
         &self,
         user: &str,
         instrument_id: Option<InstrumentId>,
-    ) -> Result<Vec<OrderStatusReport>> {
+    ) -> Result<HyperliquidPrivateStateBatch<OrderStatusReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let entries = self.info_historical_orders(user).await?;
-        let mut reports = Vec::new();
+        let response = match self.inner.info_historical_orders_raw(user).await {
+            Ok(response) => response,
+            Err(error) => {
+                let mut batch = HyperliquidPrivateStateBatch::default();
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::HistoricalOrders,
+                    HyperliquidPrivateStateGapKind::SourceFailure,
+                    None,
+                    None,
+                    error.to_string(),
+                ));
+                return Ok(batch);
+            }
+        };
+        let Some(entries) = response.as_array() else {
+            let mut batch = HyperliquidPrivateStateBatch::default();
+            batch.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::HistoricalOrders,
+                HyperliquidPrivateStateGapKind::ParseFailure,
+                None,
+                None,
+                "Expected a historical order array",
+            ));
+            return Ok(batch);
+        };
+        let mut batch = HyperliquidPrivateStateBatch::default();
         let ts_init = self.clock.get_time_ns();
 
-        for entry in entries {
-            let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
-                Some(instrument) => instrument,
-                None => continue,
+        for entry_value in entries {
+            let entry: HyperliquidOrderStatusEntry =
+                match serde_json::from_value(entry_value.clone()) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let identity = private_value_identity(entry_value);
+                        batch.push_gap(HyperliquidPrivateStateGap::new(
+                            HyperliquidPrivateStateSource::HistoricalOrders,
+                            HyperliquidPrivateStateGapKind::ParseFailure,
+                            None,
+                            identity.as_deref(),
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+            let Some(instrument) = self.get_or_create_instrument(&entry.order.coin, None) else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::HistoricalOrders,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    None,
+                    Some(entry.order.coin.as_str()),
+                    "Instrument not cached",
+                ));
+                continue;
             };
-
             if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
                 continue;
             }
@@ -2373,13 +2588,40 @@ impl HyperliquidHttpClient {
                 Ok(mut report) => {
                     report.order_type = historical_order_type;
                     report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
-                    reports.push(report);
+                    batch.push_report(report);
                 }
-                Err(e) => log::error!("Failed to parse historical order status report: {e}"),
+                Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::HistoricalOrders,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    None,
+                    Some(order.coin.as_str()),
+                    error.to_string(),
+                )),
             }
         }
 
-        Ok(deduplicate_historical_order_reports(reports))
+        let (reports, gaps, omitted) = batch.into_parts();
+        Ok(HyperliquidPrivateStateBatch::from_parts(
+            deduplicate_historical_order_reports(reports),
+            gaps,
+            omitted,
+        ))
+    }
+
+    /// Request historical order status reports for a user.
+    ///
+    /// The venue bounds this endpoint to its 2,000 most recent historical
+    /// orders. Mass-status reconciliation narrows these reports to venue order
+    /// IDs represented by the retained fill window.
+    pub async fn request_historical_order_status_reports(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<Vec<OrderStatusReport>> {
+        let batch = self
+            .request_historical_order_status_report_batch(user, instrument_id)
+            .await?;
+        require_complete_private_reports("historical order status reports", batch)
     }
 
     /// Request a single order status report by venue order ID.
@@ -2409,9 +2651,10 @@ impl HyperliquidHttpClient {
         let orders: Vec<WsBasicOrderData> = match self.info_frontend_open_orders(user).await {
             Ok(response) => match serde_json::from_value(response) {
                 Ok(v) => v,
-                Err(e) => {
-                    log::warn!("Failed to parse frontend open orders response: {e}");
-                    Vec::new()
+                Err(error) => {
+                    return Err(Error::decode(format!(
+                        "Failed to parse frontend open orders response: {error}"
+                    )));
                 }
             },
             Err(e) => {
@@ -2423,10 +2666,14 @@ impl HyperliquidHttpClient {
         };
 
         if let Some(order) = orders.into_iter().find(|o| o.oid == oid) {
-            let instrument = match self.get_or_create_instrument(&order.coin, None) {
-                Some(inst) => inst,
-                None => return Ok(None),
-            };
+            let instrument = self
+                .get_or_create_instrument(&order.coin, None)
+                .ok_or_else(|| {
+                    Error::decode(format!(
+                        "Instrument not cached for order coin {}",
+                        order.coin
+                    ))
+                })?;
 
             let status = if order.trigger_activated == Some(true) {
                 HyperliquidOrderStatusEnum::Triggered
@@ -2442,10 +2689,9 @@ impl HyperliquidHttpClient {
                 ts_init,
             ) {
                 Ok(report) => Ok(Some(report)),
-                Err(e) => {
-                    log::error!("Failed to parse order status report for oid {oid}: {e}");
-                    Ok(None)
-                }
+                Err(error) => Err(Error::decode(format!(
+                    "Failed to parse order status report for oid {oid}: {error}"
+                ))),
             };
         }
 
@@ -2456,10 +2702,14 @@ impl HyperliquidHttpClient {
             None => return Ok(None),
         };
 
-        let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
-            Some(inst) => inst,
-            None => return Ok(None),
-        };
+        let instrument = self
+            .get_or_create_instrument(&entry.order.coin, None)
+            .ok_or_else(|| {
+                Error::decode(format!(
+                    "Instrument not cached for order coin {}",
+                    entry.order.coin
+                ))
+            })?;
 
         // The info_order_status endpoint returns limited HyperliquidOrderInfo
         // without trigger fields (trigger_px, tpsl, is_market, trailing_stop).
@@ -2498,10 +2748,9 @@ impl HyperliquidHttpClient {
                 }
                 Ok(Some(report))
             }
-            Err(e) => {
-                log::error!("Failed to parse order status report for oid {oid}: {e}");
-                Ok(None)
-            }
+            Err(error) => Err(Error::decode(format!(
+                "Failed to parse order status report for oid {oid}: {error}"
+            ))),
         }
     }
 
@@ -2533,9 +2782,10 @@ impl HyperliquidHttpClient {
         let response = self.info_frontend_open_orders(user).await?;
         let orders: Vec<WsBasicOrderData> = match serde_json::from_value(response) {
             Ok(v) => v,
-            Err(e) => {
-                log::warn!("Failed to parse frontend open orders response: {e}");
-                return Ok(None);
+            Err(error) => {
+                return Err(Error::decode(format!(
+                    "Failed to parse frontend open orders response: {error}"
+                )));
             }
         };
 
@@ -2548,10 +2798,14 @@ impl HyperliquidHttpClient {
             None => return Ok(None),
         };
 
-        let instrument = match self.get_or_create_instrument(&order.coin, None) {
-            Some(inst) => inst,
-            None => return Ok(None),
-        };
+        let instrument = self
+            .get_or_create_instrument(&order.coin, None)
+            .ok_or_else(|| {
+                Error::decode(format!(
+                    "Instrument not cached for order coin {}",
+                    order.coin
+                ))
+            })?;
 
         let status = if order.trigger_activated == Some(true) {
             HyperliquidOrderStatusEnum::Triggered
@@ -2570,11 +2824,90 @@ impl HyperliquidHttpClient {
                 report.client_order_id = Some(*client_order_id);
                 Ok(Some(report))
             }
-            Err(e) => {
-                log::error!("Failed to parse order status report for cloid {cloid_hex}: {e}");
-                Ok(None)
+            Err(error) => Err(Error::decode(format!(
+                "Failed to parse order status report for cloid {cloid_hex}: {error}"
+            ))),
+        }
+    }
+
+    pub(crate) async fn request_fill_report_batch(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<HyperliquidPrivateStateBatch<FillReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let response = match self.inner.info_user_fills_raw(user).await {
+            Ok(response) => response,
+            Err(error) => {
+                let mut batch = HyperliquidPrivateStateBatch::default();
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::Fills,
+                    HyperliquidPrivateStateGapKind::SourceFailure,
+                    None,
+                    None,
+                    error.to_string(),
+                ));
+                return Ok(batch);
+            }
+        };
+        let Some(fills) = response.as_array() else {
+            let mut batch = HyperliquidPrivateStateBatch::default();
+            batch.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::Fills,
+                HyperliquidPrivateStateGapKind::ParseFailure,
+                None,
+                None,
+                "Expected a fill array",
+            ));
+            return Ok(batch);
+        };
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        let ts_init = self.clock.get_time_ns();
+
+        for fill_value in fills {
+            let fill: HyperliquidFill = match serde_json::from_value(fill_value.clone()) {
+                Ok(fill) => fill,
+                Err(error) => {
+                    let identity = private_value_identity(fill_value);
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::Fills,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        None,
+                        identity.as_deref(),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let Some(instrument) = self.get_or_create_instrument(&fill.coin, None) else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::Fills,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    None,
+                    Some(fill.coin.as_str()),
+                    "Instrument not cached",
+                ));
+                continue;
+            };
+            if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                continue;
+            }
+
+            match parse_fill_report(&fill, &instrument, account_id, ts_init) {
+                Ok(report) => batch.push_report(report),
+                Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::Fills,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    None,
+                    Some(fill.coin.as_str()),
+                    error.to_string(),
+                )),
             }
         }
+
+        Ok(batch)
     }
 
     /// Request fill reports for a user.
@@ -2595,36 +2928,198 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<FillReport>> {
+        let batch = self.request_fill_report_batch(user, instrument_id).await?;
+        require_complete_private_reports("fill reports", batch)
+    }
+
+    async fn request_spot_position_status_report_batch(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<HyperliquidPrivateStateBatch<PositionStatusReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let fills_response = self.info_user_fills(user).await?;
-
-        let mut reports = Vec::new();
+        let response = match self.info_spot_clearinghouse_state(user).await {
+            Ok(response) => response,
+            Err(error) => {
+                let mut batch = HyperliquidPrivateStateBatch::default();
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::SourceFailure,
+                    None,
+                    None,
+                    error.to_string(),
+                ));
+                return Ok(batch);
+            }
+        };
+        let Some(balances) = response.get("balances").and_then(Value::as_array) else {
+            let mut batch = HyperliquidPrivateStateBatch::default();
+            batch.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::SpotPositions,
+                HyperliquidPrivateStateGapKind::ParseFailure,
+                None,
+                None,
+                "balances not found in spot clearinghouse state",
+            ));
+            return Ok(batch);
+        };
+        let mut batch = HyperliquidPrivateStateBatch::default();
         let ts_init = self.clock.get_time_ns();
 
-        for fill in fills_response {
-            // Get instrument from cache or create synthetic for vault tokens
-            let instrument = match self.get_or_create_instrument(&fill.coin, None) {
-                Some(inst) => inst,
-                None => continue, // Skip if instrument not found
+        for balance_value in balances {
+            let balance: SpotBalance = match serde_json::from_value(balance_value.clone()) {
+                Ok(balance) => balance,
+                Err(error) => {
+                    let identity = private_value_identity(balance_value);
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::SpotPositions,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        None,
+                        identity.as_deref(),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
             };
-
-            // Filter by instrument_id if specified
-            if let Some(filter_id) = instrument_id
-                && instrument.id() != filter_id
-            {
+            if balance.total.is_zero() || balance.coin.as_str() == "USDC" {
+                continue;
+            }
+            let product_type = match HyperliquidProductType::from_symbol(balance.coin.as_str()) {
+                Ok(HyperliquidProductType::Outcome) => HyperliquidProductType::Outcome,
+                _ => HyperliquidProductType::Spot,
+            };
+            let Some(instrument) = self.get_or_create_instrument(&balance.coin, Some(product_type))
+            else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    None,
+                    Some(balance.coin.as_str()),
+                    "Instrument not cached",
+                ));
+                continue;
+            };
+            if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
                 continue;
             }
 
-            // Parse to FillReport
-            match parse_fill_report(&fill, &instrument, account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse fill report: {e}"),
+            match parse_spot_position_status_report(&balance, &instrument, account_id, ts_init) {
+                Ok(report) => batch.push_report(report),
+                Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    None,
+                    Some(balance.coin.as_str()),
+                    error.to_string(),
+                )),
             }
         }
 
-        Ok(reports)
+        Ok(batch)
+    }
+
+    pub(crate) async fn request_position_status_report_batch(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+        dexes: &[String],
+        fetch_spot: bool,
+    ) -> Result<HyperliquidPrivateStateBatch<PositionStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let responses = join_all(dexes.iter().map(|dex| async move {
+            (
+                dex.as_str(),
+                self.inner.info_clearinghouse_state_for_dex(user, dex).await,
+            )
+        }))
+        .await;
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        let ts_init = self.clock.get_time_ns();
+
+        for (dex, response) in responses {
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::SourceFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        None,
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let Some(positions) = response.get("assetPositions").and_then(Value::as_array) else {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::PerpPositions,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    (!dex.is_empty()).then_some(dex),
+                    None,
+                    "assetPositions not found in clearinghouse state",
+                ));
+                continue;
+            };
+
+            for position_value in positions {
+                let Some(coin) = position_value
+                    .get("position")
+                    .and_then(|position| position.get("coin"))
+                    .and_then(Value::as_str)
+                else {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        None,
+                        "coin not found in position",
+                    ));
+                    continue;
+                };
+                let coin = Ustr::from(coin);
+                let Some(instrument) = self.get_or_create_instrument(&coin, None) else {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::UnknownInstrument,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(coin.as_str()),
+                        "Instrument not cached",
+                    ));
+                    continue;
+                };
+                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                    continue;
+                }
+
+                match parse_position_status_report(position_value, &instrument, account_id, ts_init)
+                {
+                    Ok(report) => batch.push_report(report),
+                    Err(error) => batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::PerpPositions,
+                        HyperliquidPrivateStateGapKind::ParseFailure,
+                        (!dex.is_empty()).then_some(dex),
+                        Some(coin.as_str()),
+                        error.to_string(),
+                    )),
+                }
+            }
+        }
+
+        if fetch_spot {
+            let spot = self
+                .request_spot_position_status_report_batch(user, instrument_id)
+                .await?;
+            let reports = batch.absorb(spot);
+            for report in reports {
+                batch.push_report(report);
+            }
+        }
+
+        Ok(batch)
     }
 
     /// Request position status reports for a user.
@@ -2641,8 +3136,8 @@ impl HyperliquidHttpClient {
     /// is routed like a spot filter (perp leg skipped).
     ///
     /// For vault tokens (starting with "vntls:") that are not in the cache,
-    /// synthetic instruments will be created automatically. Spot balances whose
-    /// base token has no cached instrument are skipped with a debug log.
+    /// synthetic instruments will be created automatically. An unresolved
+    /// non-zero spot balance makes the targeted report request fail.
     ///
     /// # Errors
     ///
@@ -2655,10 +3150,6 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<PositionStatusReport>> {
-        let account_id = self
-            .account_id
-            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-
         let filter_product = instrument_id
             .and_then(|id| HyperliquidProductType::from_symbol(id.symbol.as_str()).ok());
 
@@ -2668,65 +3159,16 @@ impl HyperliquidHttpClient {
         );
         let fetch_spot = filter_product != Some(HyperliquidProductType::Perp);
 
-        let mut reports = Vec::new();
-        let ts_init = self.clock.get_time_ns();
-
-        if !fetch_perp {
-            let spot_reports = self
-                .request_spot_position_status_reports(user, instrument_id)
-                .await?;
-            reports.extend(spot_reports);
-            return Ok(reports);
-        }
-
-        let state_response = self.info_clearinghouse_state(user).await?;
-
-        // Extract asset positions from the clearinghouse state
-        let asset_positions: Vec<serde_json::Value> = state_response
-            .get("assetPositions")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::bad_request("assetPositions not found in clearinghouse state"))?
-            .clone();
-
-        for position_value in asset_positions {
-            // Extract coin from position data
-            let coin = position_value
-                .get("position")
-                .and_then(|p| p.get("coin"))
-                .and_then(|c| c.as_str())
-                .ok_or_else(|| Error::bad_request("coin not found in position"))?;
-
-            // Get instrument from cache - convert &str to Ustr for lookup
-            let coin_ustr = Ustr::from(coin);
-            let instrument = match self.get_or_create_instrument(&coin_ustr, None) {
-                Some(inst) => inst,
-                None => continue, // Skip if instrument not found
-            };
-
-            // Filter by instrument_id if specified
-            if let Some(filter_id) = instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            // Parse to PositionStatusReport
-            match parse_position_status_report(&position_value, &instrument, account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse position status report: {e}"),
-            }
-        }
-
-        // Spot positions are part of the report truth; propagate fetch errors
-        // rather than silently omitting spot holdings from reconciliation.
-        if fetch_spot {
-            let spot_reports = self
-                .request_spot_position_status_reports(user, instrument_id)
-                .await?;
-            reports.extend(spot_reports);
-        }
-
-        Ok(reports)
+        let dexes = if fetch_perp {
+            let batch = self.private_dexes_for_filter(instrument_id).await?;
+            require_complete_private_reports("perpetual DEX enumeration", batch)?
+        } else {
+            Vec::new()
+        };
+        let batch = self
+            .request_position_status_report_batch(user, instrument_id, &dexes, fetch_spot)
+            .await?;
+        require_complete_private_reports("position status reports", batch)
     }
 
     /// Request account state (balances and margins) for a user.
@@ -2818,7 +3260,7 @@ impl HyperliquidHttpClient {
     /// those balances are resolved against the matching Outcome instrument so
     /// outcome holdings surface as positions through the standard reconcile
     /// path. Balances whose base token has no matching instrument in the
-    /// cache are skipped with a debug log (callers should ensure
+    /// cache make the report incomplete (callers should ensure
     /// [`request_instruments`](Self::request_instruments) has run first).
     ///
     /// # Errors
@@ -2829,59 +3271,10 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<PositionStatusReport>> {
-        let account_id = self
-            .account_id
-            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let response = self.info_spot_clearinghouse_state(user).await?;
-
-        let state: SpotClearinghouseState = serde_json::from_value(response).map_err(|e| {
-            log::error!("Failed to parse spot clearinghouse state: {e}");
-            Error::bad_request(format!("Failed to parse spot clearinghouse state: {e}"))
-        })?;
-
-        let ts_init = self.clock.get_time_ns();
-        let mut reports = Vec::with_capacity(state.balances.len());
-
-        for balance in &state.balances {
-            if balance.total.is_zero() {
-                continue;
-            }
-
-            // USDC is the universal quote for Hyperliquid spot: it funds every
-            // pair and has no `USDC-*-SPOT` instrument. Skip it so the loop
-            // does not trigger a misleading cache-miss WARN. Revisit if
-            // Hyperliquid ever introduces a USDC-base spot pair.
-            if balance.coin.as_str() == "USDC" {
-                continue;
-            }
-
-            let product_type = match HyperliquidProductType::from_symbol(balance.coin.as_str()) {
-                Ok(HyperliquidProductType::Outcome) => HyperliquidProductType::Outcome,
-                _ => HyperliquidProductType::Spot,
-            };
-
-            let instrument = match self.get_or_create_instrument(&balance.coin, Some(product_type))
-            {
-                Some(inst) => inst,
-                None => continue,
-            };
-
-            if let Some(filter_id) = instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            match parse_spot_position_status_report(balance, &instrument, account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!(
-                    "Failed to parse spot position status report for {}: {e}",
-                    balance.coin,
-                ),
-            }
-        }
-
-        Ok(reports)
+        let batch = self
+            .request_spot_position_status_report_batch(user, instrument_id)
+            .await?;
+        require_complete_private_reports("spot position status reports", batch)
     }
 
     /// Request historical bars for an instrument.

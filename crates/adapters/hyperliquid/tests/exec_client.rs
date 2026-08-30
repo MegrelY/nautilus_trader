@@ -20,7 +20,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
     rc::Rc,
@@ -59,7 +59,8 @@ use nautilus_common::{
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_hyperliquid::{
     HyperliquidBatchModifyOutcome, HyperliquidBatchModifyResponse, HyperliquidHttpClient,
-    HyperliquidOrderListOutcome, HyperliquidOrderListResponse, HyperliquidWebSocketClient,
+    HyperliquidIncompleteMassStatus, HyperliquidOrderListOutcome, HyperliquidOrderListResponse,
+    HyperliquidPrivateStateGapKind, HyperliquidPrivateStateSource, HyperliquidWebSocketClient,
     common::{
         consts::{HYPERLIQUID_CLIENT_ID, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
         enums::HyperliquidEnvironment,
@@ -102,6 +103,8 @@ use ustr::Ustr;
 struct TestServerState {
     exchange_request_count: Arc<tokio::sync::Mutex<usize>>,
     info_request_types: Arc<tokio::sync::Mutex<Vec<String>>>,
+    all_perp_metas_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    perp_dexs_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     last_exchange_action: Arc<tokio::sync::Mutex<Option<Value>>>,
     reject_next_order: Arc<std::sync::atomic::AtomicBool>,
     /// Returns a `status="ok"` envelope whose inner `statuses[0]` carries a
@@ -125,6 +128,8 @@ struct TestServerState {
     fail_frontend_open_orders_count: Arc<AtomicUsize>,
     /// Optional override for `frontendOpenOrders` info responses.
     frontend_open_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    frontend_open_orders_by_dex: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    fail_frontend_open_orders_dexes: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Optional override for `orderStatus` info responses.
     order_status_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Optional override for `spotClearinghouseState` info responses;
@@ -132,6 +137,7 @@ struct TestServerState {
     spot_clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Optional override for `clearinghouseState` (perp) info responses.
     perp_clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    perp_clearinghouse_by_dex: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     /// Captures the `user` field from the most recent `clearinghouseState`
     /// request so tests can verify the address sent to the venue.
     last_clearinghouse_user: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -153,6 +159,8 @@ impl Default for TestServerState {
         Self {
             exchange_request_count: Arc::new(tokio::sync::Mutex::new(0)),
             info_request_types: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            all_perp_metas_response: Arc::new(tokio::sync::Mutex::new(None)),
+            perp_dexs_response: Arc::new(tokio::sync::Mutex::new(None)),
             last_exchange_action: Arc::new(tokio::sync::Mutex::new(None)),
             reject_next_order: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inner_order_error_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -162,9 +170,12 @@ impl Default for TestServerState {
             fail_next_exchange: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_frontend_open_orders_count: Arc::new(AtomicUsize::new(0)),
             frontend_open_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
+            frontend_open_orders_by_dex: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            fail_frontend_open_orders_dexes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             perp_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
+            perp_clearinghouse_by_dex: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_clearinghouse_user: Arc::new(tokio::sync::Mutex::new(None)),
             user_fills_response: Arc::new(tokio::sync::Mutex::new(None)),
             historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -226,8 +237,20 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             Json(meta).into_response()
         }
         "allPerpMetas" => {
+            if let Some(body) = state.all_perp_metas_response.lock().await.clone() {
+                return Json(body).into_response();
+            }
             let meta = load_json("http_meta_perp_sample.json");
             Json(json!([meta])).into_response()
+        }
+        "perpDexs" => {
+            let body = state
+                .perp_dexs_response
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| json!([null]));
+            Json(body).into_response()
         }
         "metaAndAssetCtxs" => {
             let meta = load_json("http_meta_perp_sample.json");
@@ -237,6 +260,22 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         "spotMetaAndAssetCtxs" => Json(json!([{"universe": [], "tokens": []}, []])).into_response(),
         "openOrders" => Json(json!([])).into_response(),
         "frontendOpenOrders" => {
+            let dex = request_body
+                .get("dex")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if state
+                .fail_frontend_open_orders_dexes
+                .lock()
+                .await
+                .contains(dex)
+            {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "DEX unavailable"})),
+                )
+                    .into_response();
+            }
             if state
                 .fail_frontend_open_orders_count
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -251,7 +290,15 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
                     .into_response();
             }
 
-            if let Some(body) = state.frontend_open_orders_response.lock().await.clone() {
+            if let Some(body) = state
+                .frontend_open_orders_by_dex
+                .lock()
+                .await
+                .get(dex)
+                .cloned()
+            {
+                Json(body).into_response()
+            } else if let Some(body) = state.frontend_open_orders_response.lock().await.clone() {
                 Json(body).into_response()
             } else {
                 Json(json!([])).into_response()
@@ -288,6 +335,19 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
                 *state.last_clearinghouse_user.lock().await = Some(user.to_string());
             }
 
+            let dex = request_body
+                .get("dex")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if let Some(body) = state
+                .perp_clearinghouse_by_dex
+                .lock()
+                .await
+                .get(dex)
+                .cloned()
+            {
+                return Json(body).into_response();
+            }
             if let Some(body) = state.perp_clearinghouse_response.lock().await.clone() {
                 return Json(body).into_response();
             }
@@ -6365,6 +6425,278 @@ async fn test_generate_fill_reports_filters_time_range() {
     );
     let reports = client.generate_fill_reports(cmd_both).await.unwrap();
     assert_eq!(reports.len(), 1);
+
+    client.disconnect().await.unwrap();
+}
+
+fn open_order_value(coin: &str, oid: u64) -> Value {
+    json!({
+        "coin": coin,
+        "side": "B",
+        "limitPx": "100.0",
+        "sz": "1.0",
+        "oid": oid,
+        "timestamp": 1_700_000_000_000u64,
+        "origSz": "1.0",
+    })
+}
+
+fn perp_meta_value(coin: &str) -> Value {
+    json!({
+        "universe": [{
+            "name": coin,
+            "szDecimals": 3,
+            "maxLeverage": 20,
+        }]
+    })
+}
+
+fn perp_position_value(coin: &str, size: &str) -> Value {
+    json!({
+        "type": "oneWay",
+        "position": {
+            "coin": coin,
+            "cumFunding": {
+                "allTime": "0",
+                "sinceOpen": "0",
+                "sinceChange": "0",
+            },
+            "entryPx": "100.0",
+            "leverage": {"type": "cross", "value": 10},
+            "liquidationPx": null,
+            "marginUsed": "10.0",
+            "maxLeverage": 20,
+            "positionValue": "100.0",
+            "returnOnEquity": "0",
+            "szi": size,
+            "unrealizedPnl": "0",
+        },
+    })
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_aggregates_default_and_hip3_dexes() {
+    let state = TestServerState::default();
+    *state.all_perp_metas_response.lock().await = Some(json!([
+        perp_meta_value("BTC"),
+        perp_meta_value("xyz:ABC"),
+        perp_meta_value("abc:DEF"),
+    ]));
+    *state.perp_dexs_response.lock().await = Some(json!([null, {"name": "xyz"}, {"name": "abc"}]));
+    state.frontend_open_orders_by_dex.lock().await.extend([
+        (String::new(), json!([open_order_value("BTC", 1)])),
+        ("xyz".to_string(), json!([open_order_value("xyz:ABC", 2)])),
+        ("abc".to_string(), json!([open_order_value("abc:DEF", 3)])),
+    ]);
+    state.perp_clearinghouse_by_dex.lock().await.insert(
+        "xyz".to_string(),
+        json!({"assetPositions": [perp_position_value("xyz:ABC", "2.0")]}),
+    );
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let mass = client
+        .generate_mass_status(None)
+        .await
+        .unwrap()
+        .expect("complete mass status");
+    assert_eq!(mass.order_reports().len(), 3);
+    assert_eq!(mass.position_reports().len(), 1);
+    assert!(
+        mass.position_reports()
+            .values()
+            .flatten()
+            .any(|report| report.instrument_id.symbol.as_str() == "xyz:ABC-USD-PERP")
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_marks_unloaded_native_perp_position_incomplete() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([open_order_value("BTC", 31)]));
+    *state.perp_clearinghouse_response.lock().await = Some(json!({
+        "assetPositions": [perp_position_value("UNLOADED", "1.0")],
+    }));
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+    let incomplete = error
+        .downcast_ref::<HyperliquidIncompleteMassStatus>()
+        .expect("typed incomplete mass status");
+    assert_eq!(incomplete.mass_status().order_reports().len(), 1);
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::PerpPositions
+            && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
+            && gap.identity() == Some("UNLOADED")
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_marks_unloaded_spot_holding_incomplete() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([open_order_value("BTC", 32)]));
+    *state.spot_clearinghouse_response.lock().await = Some(json!({
+        "balances": [{
+            "coin": "UNLOADED_SPOT",
+            "token": 987,
+            "total": "5.0",
+            "hold": "0",
+            "entryNtl": "25.0",
+        }],
+    }));
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+    let incomplete = error
+        .downcast_ref::<HyperliquidIncompleteMassStatus>()
+        .expect("typed incomplete mass status");
+    assert_eq!(incomplete.mass_status().order_reports().len(), 1);
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::SpotPositions
+            && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
+            && gap.identity() == Some("UNLOADED_SPOT")
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_marks_unloaded_outcome_holding_incomplete() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([open_order_value("BTC", 33)]));
+    *state.spot_clearinghouse_response.lock().await = Some(json!({
+        "balances": [{
+            "coin": "+999999",
+            "total": "7.0",
+            "hold": "0",
+            "entryNtl": "14.0",
+        }],
+    }));
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+    let incomplete = error
+        .downcast_ref::<HyperliquidIncompleteMassStatus>()
+        .expect("typed incomplete mass status");
+    assert_eq!(incomplete.mass_status().order_reports().len(), 1);
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::SpotPositions
+            && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
+            && gap.identity() == Some("+999999")
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_preserves_known_reports_when_one_dex_fails() {
+    let state = TestServerState::default();
+    *state.perp_dexs_response.lock().await = Some(json!([null, {"name": "xyz"}]));
+    *state.frontend_open_orders_response.lock().await = Some(json!([open_order_value("BTC", 11)]));
+    state
+        .fail_frontend_open_orders_dexes
+        .lock()
+        .await
+        .insert("xyz".to_string());
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+    let incomplete = error
+        .downcast_ref::<HyperliquidIncompleteMassStatus>()
+        .expect("typed incomplete mass status");
+    assert_eq!(incomplete.mass_status().order_reports().len(), 1);
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::OpenOrders
+            && gap.kind() == HyperliquidPrivateStateGapKind::SourceFailure
+            && gap.dex() == Some("xyz")
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_preserves_default_when_dex_enumeration_fails() {
+    let state = TestServerState::default();
+    *state.perp_dexs_response.lock().await = Some(json!({"invalid": "response"}));
+    *state.frontend_open_orders_response.lock().await = Some(json!([open_order_value("BTC", 12)]));
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+    let incomplete = error
+        .downcast_ref::<HyperliquidIncompleteMassStatus>()
+        .expect("typed incomplete mass status");
+    assert_eq!(incomplete.mass_status().order_reports().len(), 1);
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::DexEnumeration
+            && gap.kind() == HyperliquidPrivateStateGapKind::SourceFailure
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_preserves_known_reports_with_record_gaps() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([
+        open_order_value("BTC", 21),
+        open_order_value("UNKNOWN", 22),
+        {"coin": "BTC", "oid": 23},
+    ]));
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+    let incomplete = error
+        .downcast_ref::<HyperliquidIncompleteMassStatus>()
+        .expect("typed incomplete mass status");
+    assert_eq!(incomplete.mass_status().order_reports().len(), 1);
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::OpenOrders
+            && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
+            && gap.identity() == Some("UNKNOWN")
+    }));
+    assert!(incomplete.gaps().iter().any(|gap| {
+        gap.source() == HyperliquidPrivateStateSource::OpenOrders
+            && gap.kind() == HyperliquidPrivateStateGapKind::ParseFailure
+            && gap.identity() == Some("BTC")
+    }));
 
     client.disconnect().await.unwrap();
 }
