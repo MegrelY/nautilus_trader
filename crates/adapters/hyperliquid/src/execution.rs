@@ -356,6 +356,7 @@ use crate::{
             DispatchOutcome, OrderIdentity, WsDispatchState, dispatch_order_event,
             dispatch_order_fill, promote_replacement_from_query,
         },
+        private_snapshot::{PrivateStateSnapshot, PrivateStateSnapshotScope},
     },
 };
 
@@ -948,6 +949,22 @@ impl HyperliquidExecutionClient {
         Ok(())
     }
 
+    async fn collect_private_state_snapshot(
+        &self,
+        account_address: &str,
+        scope: PrivateStateSnapshotScope,
+    ) -> (PrivateStateSnapshot, HyperliquidPrivateStateBatch<()>) {
+        let mut completeness = HyperliquidPrivateStateBatch::default();
+        let dex_batch = self.http_client.request_private_perp_dexes().await;
+        let dexes = completeness.absorb(dex_batch);
+        let snapshot = self
+            .ws_client
+            .private_state_snapshot(account_address, &dexes, scope)
+            .await;
+        record_private_snapshot_gaps(&mut completeness, &snapshot, scope);
+        (snapshot, completeness)
+    }
+
     fn abort_pending_tasks(&self) {
         self.pending_tasks.abort_all();
     }
@@ -1060,6 +1077,76 @@ fn verified_maximum_cross_leverage(
         && observed.coin.as_str() == coin
         && observed.leverage.leverage_type == HyperliquidLeverageType::Cross
         && observed.leverage.value == maximum_leverage
+}
+
+fn record_private_snapshot_gaps(
+    completeness: &mut HyperliquidPrivateStateBatch<()>,
+    snapshot: &PrivateStateSnapshot,
+    scope: PrivateStateSnapshotScope,
+) {
+    if matches!(
+        scope,
+        PrivateStateSnapshotScope::All | PrivateStateSnapshotScope::OpenOrders
+    ) {
+        for dex in &snapshot.missing_open_order_dexes {
+            completeness.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::OpenOrders,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                (!dex.is_empty()).then_some(dex),
+                None,
+                format!(
+                    "WebSocket snapshot generation {} did not receive this DEX before the deadline",
+                    snapshot.generation
+                ),
+            ));
+        }
+    }
+
+    if matches!(
+        scope,
+        PrivateStateSnapshotScope::All | PrivateStateSnapshotScope::Positions
+    ) {
+        for dex in &snapshot.missing_clearinghouse_dexes {
+            completeness.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::PerpPositions,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                (!dex.is_empty()).then_some(dex),
+                None,
+                format!(
+                    "Aggregate WebSocket snapshot generation {} did not cover this DEX",
+                    snapshot.generation
+                ),
+            ));
+        }
+        if snapshot.spot_state.is_none() {
+            completeness.push_gap(HyperliquidPrivateStateGap::new(
+                HyperliquidPrivateStateSource::SpotPositions,
+                HyperliquidPrivateStateGapKind::SourceFailure,
+                None,
+                None,
+                format!(
+                    "WebSocket snapshot generation {} did not receive spot state before the deadline",
+                    snapshot.generation
+                ),
+            ));
+        }
+    }
+}
+
+fn require_complete_snapshot_reports<T>(
+    operation: &str,
+    reports: Vec<T>,
+    completeness: HyperliquidPrivateStateBatch<()>,
+) -> anyhow::Result<Vec<T>> {
+    let (_, gaps, omitted) = completeness.into_parts();
+    if gaps.is_empty() && omitted == 0 {
+        Ok(reports)
+    } else {
+        anyhow::bail!(
+            "Incomplete {operation}: {} recorded gap(s), {omitted} omitted",
+            gaps.len()
+        )
+    }
 }
 
 #[async_trait(?Send)]
@@ -2188,11 +2275,26 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         let account_address = self.get_account_address()?;
 
-        let reports = self
-            .http_client
-            .request_order_status_reports(&account_address, cmd.instrument_id)
-            .await
-            .context("failed to generate order status reports")?;
+        let reports = if cmd.instrument_id.is_some() {
+            // A targeted query is already bounded to one DEX by the HTTP client.
+            self.http_client
+                .request_order_status_reports(&account_address, cmd.instrument_id)
+                .await
+                .context("failed to generate targeted order status reports")?
+        } else {
+            let (snapshot, mut completeness) = self
+                .collect_private_state_snapshot(
+                    &account_address,
+                    PrivateStateSnapshotScope::OpenOrders,
+                )
+                .await;
+            let batch = self
+                .http_client
+                .parse_order_status_report_snapshot(&snapshot.open_orders, None)
+                .context("failed to parse order status snapshot")?;
+            let reports = completeness.absorb(batch);
+            require_complete_snapshot_reports("order status reports", reports, completeness)?
+        };
 
         let reports = filter_order_status_reports_for_command(reports, cmd);
 
@@ -2239,12 +2341,30 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         let account_address = self.get_account_address()?;
 
-        // request_position_status_reports already merges spot holdings
-        let reports = self
-            .http_client
-            .request_position_status_reports(&account_address, cmd.instrument_id)
-            .await
-            .context("failed to generate position status reports")?;
+        let reports = if cmd.instrument_id.is_some() {
+            // A targeted query is already bounded to one product/DEX by the HTTP client.
+            self.http_client
+                .request_position_status_reports(&account_address, cmd.instrument_id)
+                .await
+                .context("failed to generate targeted position status reports")?
+        } else {
+            let (snapshot, mut completeness) = self
+                .collect_private_state_snapshot(
+                    &account_address,
+                    PrivateStateSnapshotScope::Positions,
+                )
+                .await;
+            let batch = self
+                .http_client
+                .parse_position_status_report_snapshot(
+                    &snapshot.clearinghouse_states,
+                    snapshot.spot_state.as_ref(),
+                    None,
+                )
+                .context("failed to parse position status snapshot")?;
+            let reports = completeness.absorb(batch);
+            require_complete_snapshot_reports("position status reports", reports, completeness)?
+        };
 
         log::debug!("Generated {} position status reports", reports.len());
         Ok(reports)
@@ -2256,52 +2376,11 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
         let account_address = self.get_account_address()?;
-        let mut completeness = HyperliquidPrivateStateBatch::<()>::default();
-        let dex_batch = self.http_client.request_private_perp_dexes().await;
-        let dexes = completeness.absorb(dex_batch);
-        let (snapshot, fill_batch) = tokio::join!(
-            self.ws_client
-                .private_state_snapshot(&account_address, &dexes),
+        let ((snapshot, mut completeness), fill_batch) = tokio::join!(
+            self.collect_private_state_snapshot(&account_address, PrivateStateSnapshotScope::All,),
             self.http_client
                 .request_fill_report_batch(&account_address, None),
         );
-
-        for dex in &snapshot.missing_open_order_dexes {
-            completeness.push_gap(HyperliquidPrivateStateGap::new(
-                HyperliquidPrivateStateSource::OpenOrders,
-                HyperliquidPrivateStateGapKind::SourceFailure,
-                (!dex.is_empty()).then_some(dex),
-                None,
-                format!(
-                    "WebSocket snapshot generation {} did not receive this DEX before the deadline",
-                    snapshot.generation
-                ),
-            ));
-        }
-        for dex in &snapshot.missing_clearinghouse_dexes {
-            completeness.push_gap(HyperliquidPrivateStateGap::new(
-                HyperliquidPrivateStateSource::PerpPositions,
-                HyperliquidPrivateStateGapKind::SourceFailure,
-                (!dex.is_empty()).then_some(dex),
-                None,
-                format!(
-                    "Aggregate WebSocket snapshot generation {} did not cover this DEX",
-                    snapshot.generation
-                ),
-            ));
-        }
-        if snapshot.spot_state.is_none() {
-            completeness.push_gap(HyperliquidPrivateStateGap::new(
-                HyperliquidPrivateStateSource::SpotPositions,
-                HyperliquidPrivateStateGapKind::SourceFailure,
-                None,
-                None,
-                format!(
-                    "WebSocket snapshot generation {} did not receive spot state before the deadline",
-                    snapshot.generation
-                ),
-            ));
-        }
 
         let order_batch = self
             .http_client

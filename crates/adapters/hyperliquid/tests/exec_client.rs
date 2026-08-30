@@ -51,7 +51,8 @@ use nautilus_common::{
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
             GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList,
         },
     },
     testing::wait_until_async,
@@ -6354,9 +6355,8 @@ async fn test_query_account_perp_endpoint_failure_emits_no_state() {
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_generate_order_status_reports_filters_open_only_and_time_range() {
-    // Mock a frontendOpenOrders payload with 3 orders so the path's open_only
-    // filter has work to do; assert open_only=true keeps every entry the
-    // venue returns (frontendOpenOrders only ever returns open orders).
+    // Mock an openOrders snapshot with 3 native orders and an empty HIP-3 DEX
+    // so filtering and multi-DEX collection are proved without REST fan-out.
     let state = TestServerState::default();
     *state.frontend_open_orders_response.lock().await = Some(json!([
         {
@@ -6372,17 +6372,24 @@ async fn test_generate_order_status_reports_filters_open_only_and_time_range() {
             "oid": 100003u64, "timestamp": 1700000020000u64, "origSz": "0.003",
         },
     ]));
+    *state.perp_dexs_response.lock().await = Some(json!([null, {"name": "xyz"}]));
+    state
+        .frontend_open_orders_by_dex
+        .lock()
+        .await
+        .insert("xyz".to_string(), json!([]));
 
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
     client.connect().await.unwrap();
+    state.info_request_types.lock().await.clear();
 
     let cmd_all = GenerateOrderStatusReports::new(
         UUID4::new(),
         UnixNanos::default(),
         true,
-        Some(InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT)),
+        None,
         None,
         None,
         None,
@@ -6402,7 +6409,7 @@ async fn test_generate_order_status_reports_filters_open_only_and_time_range() {
         UUID4::new(),
         UnixNanos::default(),
         true,
-        Some(InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT)),
+        None,
         Some(cutoff),
         None,
         None,
@@ -6421,7 +6428,7 @@ async fn test_generate_order_status_reports_filters_open_only_and_time_range() {
         UUID4::new(),
         UnixNanos::default(),
         true,
-        Some(InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT)),
+        None,
         None,
         Some(end),
         None,
@@ -6438,7 +6445,7 @@ async fn test_generate_order_status_reports_filters_open_only_and_time_range() {
         UUID4::new(),
         UnixNanos::default(),
         true,
-        Some(InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT)),
+        None,
         Some(cutoff),
         Some(end),
         None,
@@ -6450,6 +6457,108 @@ async fn test_generate_order_status_reports_filters_open_only_and_time_range() {
         .unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].venue_order_id, VenueOrderId::from("100002"));
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert!(request_types.iter().any(|request| request == "perpDexs"));
+    assert!(!request_types.iter().any(|request| {
+        matches!(
+            request.as_str(),
+            "frontendOpenOrders" | "clearinghouseState" | "spotClearinghouseState"
+        )
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_position_status_reports_uses_websocket_snapshot_without_rest_fanout() {
+    let state = TestServerState::default();
+    *state.perp_clearinghouse_response.lock().await = Some(json!({
+        "assetPositions": [perp_position_value("BTC", "1.0")],
+    }));
+    *state.spot_clearinghouse_response.lock().await = Some(json!({"balances": []}));
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+    state.info_request_types.lock().await.clear();
+
+    let command = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let reports = client
+        .generate_position_status_reports(&command)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id.symbol.as_str(), "BTC-USD-PERP");
+    let request_types = state.info_request_types.lock().await.clone();
+    assert!(request_types.iter().any(|request| request == "perpDexs"));
+    assert!(!request_types.iter().any(|request| {
+        matches!(
+            request.as_str(),
+            "frontendOpenOrders" | "clearinghouseState" | "spotClearinghouseState"
+        )
+    }));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_order_status_reports_fails_closed_on_incomplete_websocket_snapshot() {
+    let state = TestServerState::default();
+    *state.perp_dexs_response.lock().await = Some(json!([null, {"name": "xyz"}]));
+    *state.frontend_open_orders_response.lock().await =
+        Some(json!([open_order_value("BTC", 100001)]));
+    state
+        .fail_frontend_open_orders_dexes
+        .lock()
+        .await
+        .insert("xyz".to_string());
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+    state.info_request_types.lock().await.clear();
+
+    let command = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let error = client
+        .generate_order_status_reports(&command)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Incomplete order status reports")
+    );
+    let request_types = state.info_request_types.lock().await.clone();
+    assert!(!request_types.iter().any(|request| {
+        matches!(
+            request.as_str(),
+            "frontendOpenOrders" | "clearinghouseState" | "spotClearinghouseState"
+        )
+    }));
 
     client.disconnect().await.unwrap();
 }
@@ -6482,10 +6591,11 @@ async fn test_generate_fill_reports_filters_time_range() {
         },
     ]));
 
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
     client.connect().await.unwrap();
+    state.info_request_types.lock().await.clear();
 
     let cutoff = UnixNanos::from(1_700_000_005_000_000_000u64);
     let end = UnixNanos::from(1_700_000_015_000_000_000u64);
@@ -6541,6 +6651,9 @@ async fn test_generate_fill_reports_filters_time_range() {
     );
     let reports = client.generate_fill_reports(cmd_both).await.unwrap();
     assert_eq!(reports.len(), 1);
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert_eq!(request_types, ["userFills"; 4]);
 
     client.disconnect().await.unwrap();
 }

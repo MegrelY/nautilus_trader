@@ -27,6 +27,13 @@ use super::messages::{HyperliquidWsMessage, SubscriptionRequest, WsAllDexsCleari
 
 pub(super) const PRIVATE_STATE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivateStateSnapshotScope {
+    All,
+    OpenOrders,
+    Positions,
+}
+
 #[derive(Debug, Clone)]
 struct SnapshotRequest {
     user: String,
@@ -55,11 +62,17 @@ pub(crate) struct PrivateStateSnapshot {
 
 impl PrivateStateSnapshot {
     #[must_use]
-    pub(crate) fn is_complete(&self) -> bool {
-        self.clearinghouse_snapshot_received
+    pub(crate) fn is_complete(&self, scope: PrivateStateSnapshotScope) -> bool {
+        let open_orders_complete = self.missing_open_order_dexes.is_empty();
+        let positions_complete = self.clearinghouse_snapshot_received
             && self.spot_state.is_some()
-            && self.missing_open_order_dexes.is_empty()
-            && self.missing_clearinghouse_dexes.is_empty()
+            && self.missing_clearinghouse_dexes.is_empty();
+
+        match scope {
+            PrivateStateSnapshotScope::All => open_orders_complete && positions_complete,
+            PrivateStateSnapshotScope::OpenOrders => open_orders_complete,
+            PrivateStateSnapshotScope::Positions => positions_complete,
+        }
     }
 }
 
@@ -188,12 +201,16 @@ impl PrivateStateSnapshotCache {
         self.inner.notify.notify_waiters();
     }
 
-    pub(crate) async fn wait(&self, timeout: Duration) -> PrivateStateSnapshot {
+    pub(crate) async fn wait(
+        &self,
+        timeout: Duration,
+        scope: PrivateStateSnapshotScope,
+    ) -> PrivateStateSnapshot {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.inner.notify.notified();
             let snapshot = self.snapshot();
-            if snapshot.is_complete() {
+            if snapshot.is_complete(scope) {
                 return snapshot;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -299,7 +316,7 @@ mod tests {
         });
 
         let partial = cache.snapshot();
-        assert!(!partial.is_complete());
+        assert!(!partial.is_complete(PrivateStateSnapshotScope::All));
         assert_eq!(partial.missing_open_order_dexes, ["xyz"]);
 
         cache.observe(&HyperliquidWsMessage::OpenOrders {
@@ -309,7 +326,35 @@ mod tests {
                 orders: vec![],
             },
         });
-        assert!(cache.wait(Duration::from_millis(10)).await.is_complete());
+        assert!(
+            cache
+                .wait(Duration::from_millis(10), PrivateStateSnapshotScope::All)
+                .await
+                .is_complete(PrivateStateSnapshotScope::All)
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn scoped_wait_does_not_depend_on_unrelated_sources() {
+        let cache = PrivateStateSnapshotCache::default();
+        cache.configure("0xabc", &[String::new()]);
+        cache.observe(&HyperliquidWsMessage::OpenOrders {
+            data: WsOpenOrdersData {
+                dex: String::new(),
+                user: "0xabc".to_string(),
+                orders: vec![],
+            },
+        });
+
+        let snapshot = cache
+            .wait(
+                Duration::from_millis(10),
+                PrivateStateSnapshotScope::OpenOrders,
+            )
+            .await;
+        assert!(snapshot.is_complete(PrivateStateSnapshotScope::OpenOrders));
+        assert!(!snapshot.is_complete(PrivateStateSnapshotScope::Positions));
     }
 
     #[rstest]

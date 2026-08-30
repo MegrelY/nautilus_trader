@@ -85,6 +85,7 @@ use crate::{
         post::{PostIds, PostRouter},
         private_snapshot::{
             PRIVATE_STATE_SNAPSHOT_TIMEOUT, PrivateStateSnapshot, PrivateStateSnapshotCache,
+            PrivateStateSnapshotScope,
         },
         trades::{TradeStreamRegistry, TradeStreamUse},
     },
@@ -1555,6 +1556,7 @@ impl HyperliquidWebSocketClient {
         &self,
         user: &str,
         dexes: &[String],
+        scope: PrivateStateSnapshotScope,
     ) -> PrivateStateSnapshot {
         let subscriptions = self.private_state_snapshots.configure(user, dexes);
         if !subscriptions.is_empty()
@@ -1569,7 +1571,7 @@ impl HyperliquidWebSocketClient {
         }
 
         self.private_state_snapshots
-            .wait(PRIVATE_STATE_SNAPSHOT_TIMEOUT)
+            .wait(PRIVATE_STATE_SNAPSHOT_TIMEOUT, scope)
             .await
     }
 
