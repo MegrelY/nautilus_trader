@@ -15,6 +15,7 @@
 
 //! Python bindings for Hyperliquid configuration.
 
+use nautilus_model::identifiers::InstrumentId;
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
@@ -41,6 +42,7 @@ impl HyperliquidDataClientConfig {
         base_url_ws = None,
         base_url_http = None,
         proxy_url = None,
+        bootstrap_instrument_ids = None,
         http_timeout_secs = None,
         ws_timeout_secs = None,
         update_instruments_interval_mins = None,
@@ -59,6 +61,7 @@ impl HyperliquidDataClientConfig {
         base_url_ws: Option<String>,
         base_url_http: Option<String>,
         proxy_url: Option<String>,
+        bootstrap_instrument_ids: Option<Vec<InstrumentId>>,
         http_timeout_secs: Option<u64>,
         ws_timeout_secs: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
@@ -76,6 +79,7 @@ impl HyperliquidDataClientConfig {
             base_url_ws,
             base_url_http,
             proxy_url,
+            bootstrap_instrument_ids: bootstrap_instrument_ids.unwrap_or_default(),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),

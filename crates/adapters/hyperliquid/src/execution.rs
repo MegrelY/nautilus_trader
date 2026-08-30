@@ -315,6 +315,7 @@ use ustr::Ustr;
 
 use crate::{
     account::resolve_execution_account_address,
+    catalog_handoff::{CatalogHandoff, CatalogHandoffKey, take_catalog_handoff},
     common::{
         consts::{
             HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL, HYPERLIQUID_BUILDER_FEE_NOT_APPROVED,
@@ -340,7 +341,7 @@ use crate::{
             HyperliquidExecPlaceOrderRequest, HyperliquidExecTpSl, HyperliquidMeta,
             SpotClearinghouseState,
         },
-        parse::derive_outcome_settlements,
+        parse::{derive_outcome_settlements, instrument_asset_index},
         query::ExchangeAction,
     },
     outcome_settlement::{OutcomeSettlementTracker, build_settlement_fills},
@@ -363,6 +364,7 @@ pub struct HyperliquidExecutionClient {
     emitter: ExecutionEventEmitter,
     http_client: HyperliquidHttpClient,
     ws_client: HyperliquidWebSocketClient,
+    catalog_initialized: AtomicBool,
     pending_tasks: TaskHandles,
     ws_stream_handle: Option<JoinHandle<()>>,
     settlement_poll_handle: Option<JoinHandle<()>>,
@@ -638,6 +640,7 @@ impl HyperliquidExecutionClient {
             emitter,
             http_client,
             ws_client,
+            catalog_initialized: AtomicBool::new(false),
             pending_tasks: TaskHandles::default(),
             ws_stream_handle: None,
             settlement_poll_handle: None,
@@ -704,42 +707,43 @@ impl HyperliquidExecutionClient {
         }
     }
 
-    fn instrument_asset_indices_initialized(&self, instruments: &[InstrumentAny]) -> bool {
-        instruments.iter().all(|instrument| {
-            self.http_client
-                .get_asset_index(instrument.symbol().as_str())
-                .is_some()
-        })
+    fn catalog_handoff_complete(handoff: &CatalogHandoff) -> bool {
+        !handoff.instruments.is_empty()
+            && handoff
+                .instruments
+                .iter()
+                .all(|instrument| instrument_asset_index(instrument).is_some())
+            && handoff.requested_instrument_ids.iter().all(|requested| {
+                handoff
+                    .instruments
+                    .iter()
+                    .any(|instrument| instrument.id() == *requested)
+            })
     }
 
     async fn ensure_instruments_initialized_async(&self) -> anyhow::Result<()> {
-        if self.core.instruments_initialized() {
+        if self.catalog_initialized.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        let cached_instruments = {
-            let cache = self.core.cache();
-            cache
-                .instruments(&self.core.venue, None)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-
-        if !cached_instruments.is_empty() {
-            self.cache_execution_instruments(&cached_instruments);
-
-            if self.instrument_asset_indices_initialized(&cached_instruments) {
+        let handoff_key = CatalogHandoffKey::new(
+            self.config.environment,
+            self.config.http_url(),
+            self.config.proxy_url.clone(),
+        );
+        if let Some(handoff) = take_catalog_handoff(&handoff_key) {
+            if Self::catalog_handoff_complete(&handoff) {
+                self.cache_execution_instruments(&handoff.instruments);
                 log::debug!(
-                    "Initialized {} instruments from shared cache",
-                    cached_instruments.len()
+                    "Initialized {} instruments from direct data-client handoff",
+                    handoff.instruments.len()
                 );
                 self.core.set_instruments_initialized();
+                self.catalog_initialized.store(true, Ordering::Release);
                 return Ok(());
             }
-
-            log::debug!(
-                "Shared instrument cache lacks Hyperliquid asset indices; requesting current catalog"
+            log::warn!(
+                "Discarding incomplete data-client catalog handoff; requesting current catalog"
             );
         }
 
@@ -759,6 +763,7 @@ impl HyperliquidExecutionClient {
         }
 
         self.core.set_instruments_initialized();
+        self.catalog_initialized.store(true, Ordering::Release);
         Ok(())
     }
 

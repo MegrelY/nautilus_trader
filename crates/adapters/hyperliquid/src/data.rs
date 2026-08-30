@@ -66,6 +66,7 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
+    catalog_handoff::{CatalogHandoff, CatalogHandoffKey, publish_catalog_handoff},
     common::{
         consts::HYPERLIQUID_VENUE,
         credential::{Secrets, credential_env_vars},
@@ -315,7 +316,7 @@ impl HyperliquidDataClient {
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
         let instruments = self
             .http_client
-            .request_instruments()
+            .request_instruments_scoped(&self.config.bootstrap_instrument_ids)
             .await
             .context("failed to fetch instruments during bootstrap")?;
 
@@ -335,6 +336,18 @@ impl HyperliquidDataClient {
             self.http_client.cache_instrument(instrument);
             self.ws_client.cache_instrument(instrument.clone());
         }
+
+        publish_catalog_handoff(
+            CatalogHandoffKey::new(
+                self.config.environment,
+                self.config.http_url(),
+                self.config.proxy_url.clone(),
+            ),
+            CatalogHandoff {
+                requested_instrument_ids: self.config.bootstrap_instrument_ids.clone(),
+                instruments: instruments.clone(),
+            },
+        );
 
         log::debug!(
             "Bootstrapped {} instruments with {} coin mappings",

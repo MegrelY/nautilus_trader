@@ -47,6 +47,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod account;
+mod catalog_handoff;
 pub mod common;
 pub mod config;
 pub mod data;

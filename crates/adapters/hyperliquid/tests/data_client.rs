@@ -242,6 +242,15 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         }
         "spotMeta" => Json(spot_meta_fixture()).into_response(),
         "spotMetaAndAssetCtxs" => Json(json!([spot_meta_fixture(), []])).into_response(),
+        "outcomeMeta" => Json(json!({
+            "outcomes": [{
+                "outcome": 123,
+                "name": "Scoped outcome",
+                "description": "class:priceBinary|underlying:HYPE|expiry:20260310-1100|targetPrice:34.5|period:3m",
+                "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+            }],
+        }))
+        .into_response(),
         "fundingHistory" => Json(load_json("http_funding_history.json")).into_response(),
         "l2Book" => {
             let book = load_json("http_l2_book_btc.json");
@@ -920,6 +929,121 @@ async fn test_data_client_emits_instruments_on_connect() {
 
 #[rstest]
 #[tokio::test]
+async fn test_data_client_native_perp_scope_uses_only_native_meta() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let expected = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    let config = HyperliquidDataClientConfig {
+        bootstrap_instrument_ids: vec![expected],
+        ..create_data_client_config(addr)
+    };
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+
+    assert_eq!(
+        *state.info_request_types.lock().await,
+        vec!["meta".to_string()]
+    );
+    let emitted = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            DataEvent::Instrument(instrument) => Some(instrument.id()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(emitted, vec![expected]);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_outcome_scope_fetches_only_outcome_metadata() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let expected = InstrumentId::from("123-YES-OUTCOME.HYPERLIQUID");
+    let config = HyperliquidDataClientConfig {
+        bootstrap_instrument_ids: vec![expected],
+        ..create_data_client_config(addr)
+    };
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+
+    assert_eq!(
+        *state.info_request_types.lock().await,
+        vec!["outcomeMeta".to_string()]
+    );
+    let emitted = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            DataEvent::Instrument(instrument) => Some(instrument.id()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(emitted, vec![expected]);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_hip3_scope_uses_all_perp_and_required_collateral_metadata() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let expected = InstrumentId::from("xyz:TSLA-USD-PERP.HYPERLIQUID");
+    let config = HyperliquidDataClientConfig {
+        bootstrap_instrument_ids: vec![expected],
+        ..create_data_client_config(addr)
+    };
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert_eq!(
+        request_types,
+        vec!["allPerpMetas".to_string(), "spotMeta".to_string()]
+    );
+    let emitted = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            DataEvent::Instrument(instrument) => Some(instrument.id()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(emitted, vec![expected]);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_empty_scope_preserves_full_catalog_bootstrap() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let config = create_data_client_config(addr);
+    assert!(config.bootstrap_instrument_ids.is_empty());
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+
+    let request_types = state.info_request_types.lock().await.clone();
+    assert!(request_types.iter().any(|request| request == "spotMeta"));
+    assert!(
+        request_types
+            .iter()
+            .any(|request| request == "allPerpMetas")
+    );
+    assert!(request_types.iter().any(|request| request == "outcomeMeta"));
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_data_client_emits_hip3_instruments() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
@@ -934,6 +1058,7 @@ async fn test_data_client_emits_hip3_instruments() {
     let mut hip3_symbols = Vec::new();
     let mut hip3_settlements = Vec::new();
     let mut spot_symbols = Vec::new();
+    let mut outcome_symbols = Vec::new();
 
     while let Ok(event) = rx.try_recv() {
         if let DataEvent::Instrument(instrument) = event {
@@ -946,6 +1071,8 @@ async fn test_data_client_emits_hip3_instruments() {
                 hip3_symbols.push(symbol);
             } else if symbol.ends_with("-SPOT") {
                 spot_symbols.push(symbol);
+            } else if symbol.ends_with("-OUTCOME") {
+                outcome_symbols.push(symbol);
             } else {
                 standard_perp_symbols.push(symbol);
             }
@@ -953,10 +1080,11 @@ async fn test_data_client_emits_hip3_instruments() {
     }
 
     // Mock returns 3 standard perps (BTC, ETH, ATOM), 3 HIP-3 (xyz:XYZ100, xyz:TSLA, xyz:NVDA),
-    // and 1 spot (PURR-USDC-SPOT).
+    // 1 spot (PURR-USDC-SPOT), and 2 outcome sides.
     assert_eq!(standard_perp_symbols.len(), 3);
     assert_eq!(hip3_symbols.len(), 3);
     assert_eq!(spot_symbols.len(), 1);
+    assert_eq!(outcome_symbols.len(), 2);
     assert!(hip3_symbols.contains(&"xyz:XYZ100-USD-PERP".to_string()));
     assert!(hip3_symbols.contains(&"xyz:TSLA-USD-PERP".to_string()));
     assert!(hip3_symbols.contains(&"xyz:NVDA-USD-PERP".to_string()));

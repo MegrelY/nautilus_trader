@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use futures_util::future::join_all;
 use nautilus_common::cache::InstrumentLookupError;
@@ -1646,14 +1646,155 @@ impl HyperliquidHttpClient {
             }
         }
 
-        // Drop defs whose Nautilus-internal symbol collides with one already
-        // accepted. This guards the HIP-3 case where two distinct venue names
-        // (e.g. `dex:FOO*` and `dex:FOO?`) sanitize onto the same internal
-        // symbol; without this filter the second def would silently overwrite
-        // the first in `asset_indices`, which would route orders to the wrong
-        // asset. First-write-wins matches the spot canonical-pair ordering.
-        let mut seen_symbols = ahash::AHashSet::with_capacity(defs.len());
-        let mut deduped: Vec<HyperliquidInstrumentDef> = Vec::with_capacity(defs.len());
+        Ok(self.finalize_instrument_defs(defs))
+    }
+
+    /// Fetches only the public product families required for `instrument_ids`.
+    ///
+    /// An empty list preserves the full-catalog behavior of
+    /// [`request_instrument_defs`](Self::request_instrument_defs).
+    pub async fn request_instrument_defs_scoped(
+        &self,
+        instrument_ids: &[InstrumentId],
+    ) -> Result<Vec<HyperliquidInstrumentDef>> {
+        if instrument_ids.is_empty() {
+            return self.request_instrument_defs().await;
+        }
+
+        let requested: AHashSet<_> = instrument_ids.iter().copied().collect();
+        let mut wants_native_perp = false;
+        let mut wants_hip3_perp = false;
+        let mut wants_spot = false;
+        let mut wants_outcome = false;
+
+        for instrument_id in &requested {
+            if instrument_id.venue != *HYPERLIQUID_VENUE {
+                return Err(Error::bad_request(format!(
+                    "Bootstrap instrument belongs to another venue: {instrument_id}"
+                )));
+            }
+            match HyperliquidProductType::from_symbol(instrument_id.symbol.as_str()) {
+                Ok(HyperliquidProductType::Perp) => {
+                    if is_hip3_instrument_id(*instrument_id) {
+                        wants_hip3_perp = true;
+                    } else {
+                        wants_native_perp = true;
+                    }
+                }
+                Ok(HyperliquidProductType::Spot) => wants_spot = true,
+                Ok(HyperliquidProductType::Outcome) => wants_outcome = true,
+                Err(error) => {
+                    return Err(Error::bad_request(format!(
+                        "Unsupported bootstrap instrument {instrument_id}: {error}"
+                    )));
+                }
+            }
+        }
+
+        let native_meta = if wants_native_perp {
+            Some(self.inner.load_perp_meta().await?)
+        } else {
+            None
+        };
+        let all_perp_metas = if wants_hip3_perp {
+            Some(self.inner.load_all_perp_metas().await?)
+        } else {
+            None
+        };
+        let relevant_hip3_indices = all_perp_metas
+            .as_deref()
+            .map(|metas| {
+                metas
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter_map(|(dex_index, meta)| {
+                        let has_requested_instrument = parse_perp_instruments_with_settlement(
+                            meta,
+                            perp_dex_asset_index_base(dex_index),
+                            "USDC",
+                        )
+                        .iter()
+                        .any(|def| requested.contains(&instrument_id_for_def(def)));
+                        has_requested_instrument.then_some(dex_index)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let requires_spot_for_collateral = native_meta
+            .as_ref()
+            .is_some_and(perp_meta_requires_spot_metadata)
+            || all_perp_metas.as_deref().is_some_and(|metas| {
+                relevant_hip3_indices.iter().any(|&dex_index| {
+                    metas
+                        .get(dex_index)
+                        .is_some_and(perp_meta_requires_spot_metadata)
+                })
+            });
+        let spot_meta = if wants_spot || requires_spot_for_collateral {
+            Some(self.inner.get_spot_meta().await?)
+        } else {
+            None
+        };
+
+        let mut defs = Vec::new();
+        if let Some(meta) = native_meta.as_ref() {
+            let settlement = resolve_perp_settlement_currency(meta, spot_meta.as_ref())
+                .map_err(Error::decode)?;
+            defs.extend(parse_perp_instruments_with_settlement(
+                meta,
+                0,
+                settlement.as_str(),
+            ));
+        }
+        if let Some(metas) = all_perp_metas.as_deref() {
+            for dex_index in relevant_hip3_indices {
+                let meta = &metas[dex_index];
+                let settlement = resolve_perp_settlement_currency(meta, spot_meta.as_ref())
+                    .map_err(Error::decode)?;
+                defs.extend(parse_perp_instruments_with_settlement(
+                    meta,
+                    perp_dex_asset_index_base(dex_index),
+                    settlement.as_str(),
+                ));
+            }
+        }
+        if wants_spot {
+            defs.extend(
+                parse_spot_instruments(spot_meta.as_ref().expect("spot metadata must be loaded"))
+                    .map_err(Error::decode)?,
+            );
+        }
+        if wants_outcome {
+            let outcome_meta = self.inner.get_outcome_meta().await?;
+            defs.extend(parse_outcome_instruments(&outcome_meta).map_err(Error::decode)?);
+        }
+
+        defs.retain(|def| requested.contains(&instrument_id_for_def(def)));
+        let found: AHashSet<_> = defs.iter().map(instrument_id_for_def).collect();
+        let missing = instrument_ids
+            .iter()
+            .filter(|instrument_id| !found.contains(instrument_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(Error::decode(format!(
+                "Requested bootstrap instruments not found: {}",
+                missing.join(", ")
+            )));
+        }
+
+        Ok(self.finalize_instrument_defs(defs))
+    }
+
+    fn finalize_instrument_defs(
+        &self,
+        defs: Vec<HyperliquidInstrumentDef>,
+    ) -> Vec<HyperliquidInstrumentDef> {
+        // First-write-wins guards sanitized HIP-3 symbol collisions and keeps
+        // canonical spot aliases ahead of non-canonical pairs.
+        let mut seen_symbols = AHashSet::with_capacity(defs.len());
+        let mut deduped = Vec::with_capacity(defs.len());
         for def in defs {
             if seen_symbols.insert(def.symbol) {
                 deduped.push(def);
@@ -1665,11 +1806,9 @@ impl HyperliquidHttpClient {
                 );
             }
         }
-        let defs = deduped;
 
-        // Populate asset indices for all instruments (including filtered HIP-3)
         self.asset_indices.rcu(|m| {
-            for def in &defs {
+            for def in &deduped {
                 m.insert(def.symbol, def.asset_index);
             }
         });
@@ -1677,8 +1816,7 @@ impl HyperliquidHttpClient {
             "Populated asset indices map (count={})",
             self.asset_indices.len()
         );
-
-        Ok(defs)
+        deduped
     }
 
     /// Converts instrument definitions into Nautilus instruments.
@@ -1690,6 +1828,15 @@ impl HyperliquidHttpClient {
     /// Fetch and parse all available instrument definitions from Hyperliquid.
     pub async fn request_instruments(&self) -> Result<Vec<InstrumentAny>> {
         let defs = self.request_instrument_defs().await?;
+        Ok(self.convert_defs(defs))
+    }
+
+    /// Fetches only the instruments required for a configured data bootstrap.
+    pub async fn request_instruments_scoped(
+        &self,
+        instrument_ids: &[InstrumentId],
+    ) -> Result<Vec<InstrumentAny>> {
+        let defs = self.request_instrument_defs_scoped(instrument_ids).await?;
         Ok(self.convert_defs(defs))
     }
 
@@ -4020,6 +4167,22 @@ fn perp_dex_asset_index_base(dex_index: usize) -> u32 {
     } else {
         100_000 + dex_index as u32 * 10_000
     }
+}
+
+fn instrument_id_for_def(def: &HyperliquidInstrumentDef) -> InstrumentId {
+    InstrumentId::new(Symbol::new(def.symbol.as_str()), *HYPERLIQUID_VENUE)
+}
+
+fn is_hip3_instrument_id(instrument_id: InstrumentId) -> bool {
+    instrument_id
+        .symbol
+        .as_str()
+        .strip_suffix("-USD-PERP")
+        .is_some_and(|base| base.contains(':'))
+}
+
+fn perp_meta_requires_spot_metadata(meta: &PerpMeta) -> bool {
+    meta.collateral_token.is_some_and(|token| token != 0)
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@
 
 //! Configuration structures for the Hyperliquid adapter.
 
+use nautilus_model::identifiers::InstrumentId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +54,11 @@ pub struct HyperliquidDataClientConfig {
     pub base_url_http: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<String>,
+    /// Exact instruments required during startup.
+    ///
+    /// An empty list preserves the full-catalog bootstrap behavior.
+    #[builder(default)]
+    pub bootstrap_instrument_ids: Vec<InstrumentId>,
     /// The target environment (mainnet or testnet).
     #[builder(default)]
     pub environment: HyperliquidEnvironment,
@@ -100,6 +106,7 @@ nautilus_core::impl_pyo3_config_getters!(HyperliquidDataClientConfig {
     environment: HyperliquidEnvironment,
     base_url_ws: Option<String>,
     base_url_http: Option<String>,
+    bootstrap_instrument_ids: Vec<InstrumentId>,
     http_timeout_secs: u64,
     ws_timeout_secs: u64,
     update_instruments_interval_mins: u64,
@@ -295,6 +302,15 @@ mod tests {
     fn test_exec_config_default_account_address_is_none() {
         let config = HyperliquidExecClientConfig::default();
         assert!(config.account_address.is_none());
+    }
+
+    #[rstest]
+    fn test_data_config_default_bootstrap_scope_is_empty() {
+        assert!(
+            HyperliquidDataClientConfig::default()
+                .bootstrap_instrument_ids
+                .is_empty()
+        );
     }
 
     #[rstest]
