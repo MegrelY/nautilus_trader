@@ -63,6 +63,7 @@ struct TestServerState {
     frontend_open_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     order_status_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    spot_clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     spot_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -75,6 +76,7 @@ impl Default for TestServerState {
             frontend_open_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
             clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
+            spot_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -88,6 +90,20 @@ fn load_json(filename: &str) -> Value {
     let content = std::fs::read_to_string(data_path().join(filename))
         .unwrap_or_else(|_| panic!("failed to read {filename}"));
     serde_json::from_str(&content).expect("invalid json")
+}
+
+fn spot_state_for(coins: &[&str]) -> Value {
+    let mut state = load_json("http_spot_clearinghouse_state.json");
+    state["balances"]
+        .as_array_mut()
+        .expect("spot fixture balances")
+        .retain(|balance| {
+            balance
+                .get("coin")
+                .and_then(Value::as_str)
+                .is_some_and(|coin| coins.contains(&coin))
+        });
+    state
 }
 
 async fn wait_for_server(addr: SocketAddr, path: &str) {
@@ -220,7 +236,10 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
                 )
                     .into_response();
             }
-            let spot = load_json("http_spot_clearinghouse_state.json");
+            let custom = state.spot_clearinghouse_response.lock().await;
+            let spot = custom
+                .clone()
+                .unwrap_or_else(|| load_json("http_spot_clearinghouse_state.json"));
             Json(spot).into_response()
         }
         "candleSnapshot" => Json(json!([
@@ -676,6 +695,7 @@ async fn test_request_spot_position_status_reports_emits_for_cached_instrument()
     };
 
     let state = TestServerState::default();
+    *state.spot_clearinghouse_response.lock().await = Some(spot_state_for(&["USDC", "PURR"]));
     let addr = start_mock_server(state).await;
 
     let client = create_domain_client(&addr);
@@ -748,6 +768,7 @@ async fn test_request_spot_position_status_reports_skips_usdc() {
     };
 
     let state = TestServerState::default();
+    *state.spot_clearinghouse_response.lock().await = Some(spot_state_for(&["USDC", "PURR"]));
     let addr = start_mock_server(state).await;
 
     let client = create_domain_client(&addr);
@@ -809,6 +830,7 @@ async fn test_request_spot_position_status_reports_filters_by_instrument_id() {
     };
 
     let state = TestServerState::default();
+    *state.spot_clearinghouse_response.lock().await = Some(spot_state_for(&["PURR", "HYPE"]));
     let addr = start_mock_server(state).await;
 
     let client = create_domain_client(&addr);
@@ -923,6 +945,7 @@ async fn test_request_position_status_reports_skips_perp_fetch_for_spot_filter()
     };
 
     let state = TestServerState::default();
+    *state.spot_clearinghouse_response.lock().await = Some(spot_state_for(&["PURR"]));
     let addr = start_mock_server(state.clone()).await;
 
     let client = create_domain_client(&addr);
@@ -996,6 +1019,7 @@ async fn test_request_spot_position_status_reports_resolves_outcome_side_token()
     };
 
     let state = TestServerState::default();
+    *state.spot_clearinghouse_response.lock().await = Some(spot_state_for(&["+10"]));
     let addr = start_mock_server(state).await;
 
     let client = create_domain_client(&addr);
@@ -1062,6 +1086,7 @@ async fn test_request_position_status_reports_skips_perp_fetch_for_outcome_filte
     };
 
     let state = TestServerState::default();
+    *state.spot_clearinghouse_response.lock().await = Some(spot_state_for(&["+10"]));
     let addr = start_mock_server(state.clone()).await;
 
     let client = create_domain_client(&addr);

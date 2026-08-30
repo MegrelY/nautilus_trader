@@ -564,13 +564,7 @@ fn default_modify_response(action: &Value) -> Value {
         .and_then(Value::as_array)
         .map_or(1, Vec::len);
     let statuses = (0..status_count)
-        .map(|index| {
-            json!({
-                "resting": {
-                    "oid": 12346 + index as u64
-                }
-            })
-        })
+        .map(|_| json!("success"))
         .collect::<Vec<_>>();
 
     json!({
@@ -1056,7 +1050,7 @@ async fn test_modify_order_success() {
     assert_eq!(response.get("status").unwrap().as_str().unwrap(), "ok");
 
     let data = &response["response"]["data"];
-    assert!(data["statuses"][0]["resting"]["oid"].is_u64());
+    assert_eq!(data["statuses"][0], json!("success"));
 }
 
 #[rstest]
@@ -3199,7 +3193,7 @@ async fn test_batch_modify_orders_clears_only_definitive_child_rejection() {
             "type": "modify",
             "data": {
                 "statuses": [
-                    {"resting": {"oid": 43011}},
+                    "success",
                     {"error": "Order rejected: invalid trigger"}
                 ]
             }
