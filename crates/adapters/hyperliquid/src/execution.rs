@@ -356,6 +356,7 @@ use crate::{
             DispatchOutcome, OrderIdentity, WsDispatchState, dispatch_order_event,
             dispatch_order_fill, promote_replacement_from_query,
         },
+        handler::websocket_backpressure_active,
         private_snapshot::{PrivateStateSnapshot, PrivateStateSnapshotScope},
     },
 };
@@ -1242,6 +1243,14 @@ impl ExecutionClient for HyperliquidExecutionClient {
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
+        if websocket_backpressure_active() && !order.is_reduce_only() {
+            self.emitter.emit_order_denied(
+                &order,
+                "Hyperliquid WebSocket queues are recovering from backpressure",
+            );
+            return Ok(());
+        }
+
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
             return Ok(());
@@ -1394,6 +1403,21 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
 
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+
+        if websocket_backpressure_active() && orders.iter().any(|order| !order.is_reduce_only()) {
+            for order in &orders {
+                self.emitter.emit_order_denied(
+                    order,
+                    "Hyperliquid WebSocket queues are recovering from backpressure",
+                );
+            }
+            publish_order_list_outcome(HyperliquidOrderListOutcome {
+                command_id: cmd.command_id,
+                instrument_id: cmd.instrument_id,
+                response: HyperliquidOrderListResponse::NotSubmitted,
+            });
+            return Ok(());
+        }
 
         let mut valid_orders = Vec::new();
         let mut hyperliquid_orders = Vec::new();
@@ -2677,7 +2701,7 @@ impl HyperliquidExecutionClient {
                         }
                         // Reconnected is handled by WS client internally
                         // (resubscribe_all) and never forwarded here
-                        NautilusWsMessage::Reconnected => {}
+                        NautilusWsMessage::Reconnected | NautilusWsMessage::Backpressure => {}
                         NautilusWsMessage::Error(e) => {
                             log::warn!("WebSocket error: {e}");
                         }

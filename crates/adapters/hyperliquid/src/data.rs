@@ -380,6 +380,7 @@ impl HyperliquidDataClient {
             log::debug!("Hyperliquid WebSocket consumption loop started");
             let mut connection_generation = 0_u64;
             let mut stream_closed = false;
+            let mut backpressure_discontinuity_active = false;
 
             loop {
                 tokio::select! {
@@ -469,16 +470,43 @@ impl HyperliquidDataClient {
                                 }
                                 NautilusWsMessage::Reconnected => {
                                     log::info!("WebSocket reconnected");
-                                    connection_generation = connection_generation.saturating_add(1);
-                                    let ts_init = clock.get_time_ns();
-                                    if let Err(e) = data_sender.send(connection_discontinuity_event(
-                                        connection_generation,
-                                        HyperliquidDiscontinuityKind::Reconnected,
-                                        ts_init,
-                                    )) {
-                                        log::error!(
-                                            "Failed to send WebSocket reconnect discontinuity: {e}"
-                                        );
+                                    if backpressure_discontinuity_active {
+                                        backpressure_discontinuity_active = false;
+                                    } else {
+                                        connection_generation =
+                                            connection_generation.saturating_add(1);
+                                        let ts_init = clock.get_time_ns();
+                                        if let Err(e) = data_sender.send(
+                                            connection_discontinuity_event(
+                                                connection_generation,
+                                                HyperliquidDiscontinuityKind::Reconnected,
+                                                ts_init,
+                                            ),
+                                        ) {
+                                            log::error!(
+                                                "Failed to send WebSocket reconnect discontinuity: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                NautilusWsMessage::Backpressure => {
+                                    log::warn!("WebSocket queue high-water discontinuity");
+                                    if !backpressure_discontinuity_active {
+                                        backpressure_discontinuity_active = true;
+                                        connection_generation =
+                                            connection_generation.saturating_add(1);
+                                        let ts_init = clock.get_time_ns();
+                                        if let Err(e) = data_sender.send(
+                                            connection_discontinuity_event(
+                                                connection_generation,
+                                                HyperliquidDiscontinuityKind::StreamClosed,
+                                                ts_init,
+                                            ),
+                                        ) {
+                                            log::error!(
+                                                "Failed to send WebSocket backpressure discontinuity: {e}"
+                                            );
+                                        }
                                     }
                                 }
                                 NautilusWsMessage::Error(e) => {
@@ -493,16 +521,23 @@ impl HyperliquidDataClient {
                             log::debug!("WebSocket next_event returned None, stream closed");
                             if !stream_closed && !cancellation_token.is_cancelled() {
                                 stream_closed = true;
-                                connection_generation = connection_generation.saturating_add(1);
-                                let ts_init = clock.get_time_ns();
-                                if let Err(e) = data_sender.send(connection_discontinuity_event(
-                                    connection_generation,
-                                    HyperliquidDiscontinuityKind::StreamClosed,
-                                    ts_init,
-                                )) {
-                                    log::error!(
-                                        "Failed to send WebSocket closure discontinuity: {e}"
-                                    );
+                                if backpressure_discontinuity_active {
+                                    backpressure_discontinuity_active = false;
+                                } else {
+                                    connection_generation =
+                                        connection_generation.saturating_add(1);
+                                    let ts_init = clock.get_time_ns();
+                                    if let Err(e) = data_sender.send(
+                                        connection_discontinuity_event(
+                                            connection_generation,
+                                            HyperliquidDiscontinuityKind::StreamClosed,
+                                            ts_init,
+                                        ),
+                                    ) {
+                                        log::error!(
+                                            "Failed to send WebSocket closure discontinuity: {e}"
+                                        );
+                                    }
                                 }
                             }
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

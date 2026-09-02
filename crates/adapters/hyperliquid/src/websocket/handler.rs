@@ -19,7 +19,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -36,6 +36,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     RECONNECTED,
+    mode::ConnectionMode,
     retry::{RetryManager, create_websocket_retry_manager},
     websocket::{SubscriptionState, WebSocketClient},
 };
@@ -80,6 +81,10 @@ pub enum HandlerCommand {
     Disconnect,
     /// Subscribe to the given subscriptions.
     Subscribe {
+        subscriptions: Vec<SubscriptionRequest>,
+    },
+    /// Replay desired subscriptions once after a transport reconnect.
+    ReplaySubscriptions {
         subscriptions: Vec<SubscriptionRequest>,
     },
     /// Unsubscribe from the given subscriptions.
@@ -162,7 +167,7 @@ pub(super) struct FeedHandler {
     client: Option<WebSocketClient>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
-    out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
+    out_tx: tokio::sync::mpsc::Sender<NautilusWsMessage>,
     account_id: Option<AccountId>,
     subscriptions: SubscriptionState,
     post_router: Arc<PostRouter>,
@@ -180,6 +185,14 @@ pub(super) struct FeedHandler {
     processed_trade_ids: FifoCache<u64, 10_000>,
     processed_public_trade_ids: FifoCache<(Ustr, u64), 10_000>,
     asset_context_caches: AssetContextCaches,
+    backpressure_reconnect_requested: bool,
+}
+
+pub(super) const WEBSOCKET_QUEUE_CAPACITY: usize = 8_192;
+static WEBSOCKET_BACKPRESSURE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn websocket_backpressure_active() -> bool {
+    WEBSOCKET_BACKPRESSURE_HANDLERS.load(Ordering::Acquire) != 0
 }
 
 impl FeedHandler {
@@ -192,7 +205,7 @@ impl FeedHandler {
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
         raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
-        out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
+        out_tx: tokio::sync::mpsc::Sender<NautilusWsMessage>,
         account_id: Option<AccountId>,
         subscriptions: SubscriptionState,
         cloid_cache: CloidCache,
@@ -223,13 +236,18 @@ impl FeedHandler {
             processed_trade_ids: FifoCache::new(),
             processed_public_trade_ids: FifoCache::new(),
             asset_context_caches: AssetContextCaches::default(),
+            backpressure_reconnect_requested: false,
         }
     }
 
     /// Send a message to the output channel.
-    pub(super) fn send(&self, msg: NautilusWsMessage) -> Result<(), String> {
+    pub(super) async fn send(&mut self, msg: NautilusWsMessage) -> Result<(), String> {
+        if self.out_tx.capacity() == 0 {
+            self.request_backpressure_reconnect();
+        }
         self.out_tx
             .send(msg)
+            .await
             .map_err(|e| format!("Failed to send message: {e}"))
     }
 
@@ -261,7 +279,79 @@ impl FeedHandler {
         }
     }
 
+    fn request_backpressure_reconnect(&mut self) {
+        if self.backpressure_reconnect_requested {
+            return;
+        }
+        self.backpressure_reconnect_requested = true;
+        WEBSOCKET_BACKPRESSURE_HANDLERS.fetch_add(1, Ordering::AcqRel);
+        let cmd_depth = self.cmd_rx.len();
+        let raw_depth = self.raw_rx.len();
+        let out_depth = WEBSOCKET_QUEUE_CAPACITY.saturating_sub(self.out_tx.capacity());
+        let buffered_depth = self.message_buffer.len();
+        if let Some(client) = &self.client {
+            let connection_mode = client.connection_mode_atomic();
+            let _ = ConnectionMode::request_reconnect(&connection_mode);
+        }
+        log::warn!(
+            "Hyperliquid WebSocket queue high-water requested reconnect: cmd_depth={cmd_depth}, raw_depth={raw_depth}, out_depth={out_depth}, buffered_depth={buffered_depth}"
+        );
+    }
+
+    fn clear_backpressure(&mut self) {
+        if !self.backpressure_reconnect_requested {
+            return;
+        }
+        self.backpressure_reconnect_requested = false;
+        let active = WEBSOCKET_BACKPRESSURE_HANDLERS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(active > 0, "WebSocket backpressure counter underflow");
+    }
+
+    async fn send_subscription(&self, subscription: SubscriptionRequest, replay: bool) {
+        let key = subscription_to_key(&subscription);
+        let channel = safe_subscription_channel(&key);
+        if !self.prepare_subscription_send(&key, replay) {
+            log::debug!("Skipping duplicate subscribe request: channel={channel}");
+            return;
+        }
+
+        let request = HyperliquidWsRequest::Subscribe { subscription };
+        match serde_json::to_string(&request) {
+            Ok(payload) => {
+                log::debug!(
+                    "Sending subscribe payload: channel={channel}, payload_len={}",
+                    payload.len()
+                );
+                if let Err(e) = self.send_with_retry(payload).await {
+                    log::error!("Error subscribing to {channel}: {e}");
+                    self.subscriptions.mark_failure(&key);
+                }
+            }
+            Err(e) => {
+                log::error!("Error serializing subscription for {channel}: {e}");
+                self.subscriptions.mark_failure(&key);
+            }
+        }
+    }
+
+    fn prepare_subscription_send(&self, key: &str, replay: bool) -> bool {
+        if replay {
+            self.subscriptions.mark_failure(key);
+            true
+        } else {
+            self.subscriptions.try_mark_subscribe(key)
+        }
+    }
+
     pub(super) async fn next(&mut self) -> Option<NautilusWsMessage> {
+        if !self.backpressure_reconnect_requested
+            && (self.cmd_rx.len() >= WEBSOCKET_QUEUE_CAPACITY
+                || self.raw_rx.len() >= WEBSOCKET_QUEUE_CAPACITY
+                || self.message_buffer.len() >= WEBSOCKET_QUEUE_CAPACITY)
+        {
+            self.request_backpressure_reconnect();
+            return Some(NautilusWsMessage::Backpressure);
+        }
         if let Some(msg) = self.message_buffer.pop_front() {
             return Some(msg);
         }
@@ -285,27 +375,12 @@ impl FeedHandler {
                         }
                         HandlerCommand::Subscribe { subscriptions } => {
                             for subscription in subscriptions {
-                                let key = subscription_to_key(&subscription);
-                                let channel = safe_subscription_channel(&key);
-                                self.subscriptions.mark_subscribe(&key);
-
-                                let request = HyperliquidWsRequest::Subscribe { subscription };
-                                match serde_json::to_string(&request) {
-                                    Ok(payload) => {
-                                        log::debug!(
-                                            "Sending subscribe payload: channel={channel}, payload_len={}",
-                                            payload.len()
-                                        );
-                                        if let Err(e) = self.send_with_retry(payload).await {
-                                            log::error!("Error subscribing to {channel}: {e}");
-                                            self.subscriptions.mark_failure(&key);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Error serializing subscription for {channel}: {e}");
-                                        self.subscriptions.mark_failure(&key);
-                                    }
-                                }
+                                self.send_subscription(subscription, false).await;
+                            }
+                        }
+                        HandlerCommand::ReplaySubscriptions { subscriptions } => {
+                            for subscription in subscriptions {
+                                self.send_subscription(subscription, true).await;
                             }
                         }
                         HandlerCommand::Unsubscribe { subscriptions } => {
@@ -406,6 +481,7 @@ impl FeedHandler {
                         Message::Text(text) => {
                             if text == RECONNECTED {
                                 log::info!("Received RECONNECTED sentinel");
+                                self.clear_backpressure();
                                 self.bar_cache.clear();
                                 self.private_state_snapshots.invalidate_generation();
                                 return Some(NautilusWsMessage::Reconnected);
@@ -1227,6 +1303,12 @@ impl FeedHandler {
     }
 }
 
+impl Drop for FeedHandler {
+    fn drop(&mut self) {
+        self.clear_backpressure();
+    }
+}
+
 pub(crate) fn subscription_to_key(sub: &SubscriptionRequest) -> String {
     match sub {
         SubscriptionRequest::AllMids { dex } => {
@@ -1374,8 +1456,8 @@ mod tests {
             post::PostRouter,
             private_snapshot::PrivateStateSnapshotCache,
         },
-        AssetContextCaches, FeedHandler, HandlerCommand, safe_subscription_channel,
-        subscription_to_key,
+        AssetContextCaches, FeedHandler, HandlerCommand, WEBSOCKET_QUEUE_CAPACITY,
+        safe_subscription_channel, subscription_to_key, websocket_backpressure_active,
     };
     use crate::{
         common::consts::HYPERLIQUID_VENUE,
@@ -1436,7 +1518,7 @@ mod tests {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(WEBSOCKET_QUEUE_CAPACITY);
         let cloid_cache: CloidCache = Arc::new(Mutex::new(FifoCacheMap::<
             Ustr,
             ClientOrderId,
@@ -1487,13 +1569,30 @@ mod tests {
         assert!(!channel.contains("0x0123456789abcdef"));
     }
 
+    #[test]
+    fn ordinary_duplicate_is_inert_but_reconnect_replay_is_explicit() {
+        let subscriptions = SubscriptionState::new(':');
+        let handler = empty_handler(subscriptions.clone());
+        let subscription = SubscriptionRequest::OrderUpdates {
+            user: "0x0123456789abcdef".to_string(),
+        };
+        let key = subscription_to_key(&subscription);
+        subscriptions.mark_subscribe(&key);
+        subscriptions.confirm_subscribe(&key);
+
+        assert!(!handler.prepare_subscription_send(&key, false));
+        assert!(handler.prepare_subscription_send(&key, true));
+        assert_eq!(subscriptions.len(), 0);
+        assert_eq!(subscriptions.pending_subscribe_topics(), vec![key]);
+    }
+
     #[tokio::test]
     async fn reconnect_discards_the_forming_candle_cache() {
         let subscriptions = SubscriptionState::new(':');
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(WEBSOCKET_QUEUE_CAPACITY);
         let cloid_cache: CloidCache = Arc::new(Mutex::new(FifoCacheMap::<
             Ustr,
             ClientOrderId,
@@ -1536,6 +1635,46 @@ mod tests {
             Some(NautilusWsMessage::Reconnected)
         ));
         assert!(handler.bar_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_queue_high_water_requests_reconnect_without_dropping_messages() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(WEBSOCKET_QUEUE_CAPACITY);
+        for _ in 0..WEBSOCKET_QUEUE_CAPACITY {
+            raw_tx
+                .send(tokio_tungstenite::tungstenite::Message::Ping(
+                    Vec::new().into(),
+                ))
+                .expect("raw queue should remain open");
+        }
+        let cloid_cache: CloidCache = Arc::new(Mutex::new(FifoCacheMap::<
+            Ustr,
+            ClientOrderId,
+            CLOID_CACHE_CAPACITY,
+        >::new()));
+        let mut handler = FeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            None,
+            SubscriptionState::new(':'),
+            cloid_cache,
+            PostRouter::new(),
+            PrivateStateSnapshotCache::default(),
+        );
+
+        assert!(matches!(
+            handler.next().await,
+            Some(NautilusWsMessage::Backpressure)
+        ));
+        assert!(websocket_backpressure_active());
+        assert_eq!(handler.raw_rx.len(), WEBSOCKET_QUEUE_CAPACITY);
+        drop(handler);
+        assert!(!websocket_backpressure_active());
     }
 
     fn btc_active_spot_asset_ctx() -> WsActiveAssetCtxData {
@@ -1607,7 +1746,7 @@ mod tests {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(WEBSOCKET_QUEUE_CAPACITY);
         let post_router = PostRouter::new();
         let cloid_cache: CloidCache = Arc::new(Mutex::new(FifoCacheMap::<
             Ustr,

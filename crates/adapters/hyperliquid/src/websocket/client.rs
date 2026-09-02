@@ -78,7 +78,7 @@ use crate::{
     websocket::{
         book::{BookStreamOptions, BookStreamRegistry, BookStreamRelease, BookStreamUse},
         enums::HyperliquidWsChannel,
-        handler::{FeedHandler, HandlerCommand},
+        handler::{FeedHandler, HandlerCommand, WEBSOCKET_QUEUE_CAPACITY},
         messages::{
             NautilusWsMessage, PostRequest, PostResponse, PostResponsePayload, SubscriptionRequest,
         },
@@ -130,7 +130,7 @@ pub struct HyperliquidWebSocketClient {
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     signal: Arc<AtomicBool>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
-    out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<NautilusWsMessage>>,
+    out_rx: Option<tokio::sync::mpsc::Receiver<NautilusWsMessage>>,
     auth_tracker: AuthTracker,
     subscriptions: SubscriptionState,
     book_streams: BookStreamRegistry,
@@ -270,7 +270,8 @@ impl HyperliquidWebSocketClient {
 
         // Create channels for handler communication
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::channel::<NautilusWsMessage>(WEBSOCKET_QUEUE_CAPACITY);
 
         // Update cmd_tx before connection_mode to avoid race where is_active() returns
         // true but subscriptions still go to the old placeholder channel
@@ -349,8 +350,9 @@ impl HyperliquidWebSocketClient {
                     topics.len()
                 );
 
-                for topic in topics {
-                    match subscription_from_topic(&topic) {
+                let replay = topics
+                    .into_iter()
+                    .filter_map(|topic| match subscription_from_topic(&topic) {
                         Ok(mut subscription) => {
                             // Topic text cannot carry l2Book precision options;
                             // replay the shape the stream was opened with
@@ -365,18 +367,20 @@ impl HyperliquidWebSocketClient {
                                 *mantissa = options.mantissa;
                             }
 
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
-                                subscriptions: vec![subscription],
-                            }) {
-                                log::error!("Failed to send resubscribe command: {e}");
-                            }
+                            Some(subscription)
                         }
                         Err(e) => {
                             log::error!(
                                 "Failed to reconstruct subscription from topic: topic={topic}, {e}"
                             );
+                            None
                         }
-                    }
+                    })
+                    .collect::<Vec<_>>();
+                if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::ReplaySubscriptions {
+                    subscriptions: replay,
+                }) {
+                    log::error!("Failed to send resubscribe command: {e}");
                 }
             };
 
@@ -387,7 +391,7 @@ impl HyperliquidWebSocketClient {
                         // The discontinuity must enter the same ordered output
                         // channel before resubscription can produce any new
                         // strategy-facing market data.
-                        if handler.send(message).is_err() {
+                        if handler.send(message).await.is_err() {
                             if handler.is_stopped() {
                                 log::debug!("Failed to send reconnect event (receiver dropped)");
                             } else {
@@ -398,7 +402,7 @@ impl HyperliquidWebSocketClient {
                         resubscribe_all();
                     }
                     Some(msg) => {
-                        if handler.send(msg).is_err() {
+                        if handler.send(msg).await.is_err() {
                             if handler.is_stopped() {
                                 log::debug!("Failed to send message (receiver dropped)");
                             } else {
@@ -1931,7 +1935,12 @@ impl HyperliquidWebSocketClient {
 
         let mut entry = self.asset_context_subs.entry(coin).or_default();
         let is_first_subscription = entry.is_empty();
-        entry.insert(data_type);
+        if !entry.insert(data_type) {
+            log::debug!(
+                "Skipping duplicate ActiveAssetCtx consumer for coin '{coin}', data_type={data_type:?}"
+            );
+            return Ok(());
+        }
         let data_types = entry.clone();
         drop(entry);
 
@@ -1958,7 +1967,7 @@ impl HyperliquidWebSocketClient {
                 .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
         } else {
             log::debug!(
-                "Already subscribed to ActiveAssetCtx for coin '{coin}', adding {data_type:?} to tracked types"
+                "Reusing ActiveAssetCtx for coin '{coin}', adding {data_type:?} to tracked types"
             );
         }
 

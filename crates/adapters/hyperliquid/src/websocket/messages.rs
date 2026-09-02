@@ -1284,6 +1284,8 @@ pub enum NautilusWsMessage {
     Error(String),
     /// WebSocket reconnected.
     Reconnected,
+    /// Adapter queues crossed their high-water mark and initiated reconnect.
+    Backpressure,
 }
 
 /// Execution report wrapper for order status and fill reports.
