@@ -71,6 +71,9 @@ pub struct HyperliquidLeveragePreflightRequest {
     pub account_id: AccountId,
     pub instrument_id: InstrumentId,
     pub raw_symbol: Ustr,
+    /// Exact venue catalog index when the instrument was admitted lazily and
+    /// is not yet present in the execution client's compact routing cache.
+    pub expected_asset_index: Option<u32>,
     pub mode: HyperliquidLeveragePreflightMode,
 }
 
@@ -430,6 +433,7 @@ impl HyperliquidExecutionClient {
         slippage_bps: u32,
     ) -> anyhow::Result<HyperliquidExecPlaceOrderRequest> {
         validate_order_for_hyperliquid(order)?;
+        self.ensure_execution_instrument_cached(order.instrument_id());
 
         let symbol = order.instrument_id().symbol.inner();
         let asset = self
@@ -712,6 +716,29 @@ impl HyperliquidExecutionClient {
         }
     }
 
+    /// Promotes one instrument already admitted to the node cache into the
+    /// adapter's compact routing caches. This keeps the initial catalog scoped
+    /// while allowing a lazily materialized execution owner to submit safely.
+    fn ensure_execution_instrument_cached(&self, instrument_id: InstrumentId) -> bool {
+        let symbol = instrument_id.symbol.inner();
+        if self
+            .http_client
+            .get_asset_index_for_symbol(symbol)
+            .is_some()
+        {
+            return true;
+        }
+
+        let instrument = self.core.cache().instrument(&instrument_id).cloned();
+        if let Some(instrument) = instrument {
+            self.cache_execution_instruments(std::slice::from_ref(&instrument));
+        }
+
+        self.http_client
+            .get_asset_index_for_symbol(symbol)
+            .is_some()
+    }
+
     fn catalog_handoff_complete(handoff: &CatalogHandoff) -> bool {
         !handoff.instruments.is_empty()
             && handoff
@@ -989,8 +1016,9 @@ async fn execute_leverage_preflight(
     if request.instrument_id.venue != *HYPERLIQUID_VENUE {
         return HyperliquidLeveragePreflightResponse::Failed(Failure::VenueMismatch);
     }
-    let Some(cached_asset_index) =
-        http_client.get_asset_index(request.instrument_id.symbol.as_str())
+    let Some(expected_asset_index) = http_client
+        .get_asset_index(request.instrument_id.symbol.as_str())
+        .or(request.expected_asset_index)
     else {
         return HyperliquidLeveragePreflightResponse::Failed(Failure::InstrumentUnavailable);
     };
@@ -1002,7 +1030,7 @@ async fn execute_leverage_preflight(
             Ok(resolved) => resolved,
             Err(failure) => return HyperliquidLeveragePreflightResponse::Failed(failure),
         };
-    if cached_asset_index != fresh_asset_index {
+    if expected_asset_index != fresh_asset_index {
         return HyperliquidLeveragePreflightResponse::Failed(Failure::InstrumentIdentityMismatch);
     }
     if request.mode == HyperliquidLeveragePreflightMode::ApplyAndVerify {
@@ -1264,6 +1292,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         let http_client = self.http_client.clone();
         let symbol = order.instrument_id().symbol.inner();
+        self.ensure_execution_instrument_cached(order.instrument_id());
 
         // Validate asset index exists before marking as submitted
         let asset = match http_client.get_asset_index_for_symbol(symbol) {
@@ -1759,6 +1788,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let instrument_id = cmd.instrument_id;
         let venue_order_id = cmd.venue_order_id;
         let symbol = cmd.instrument_id.symbol.inner();
+        self.ensure_execution_instrument_cached(instrument_id);
         let ws_client = self.ws_client.clone();
         let fast = can_fast_cancel_order(
             self.core
@@ -1880,6 +1910,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 fast: can_fast_cancel_order(Some(o.order_type())),
             })
             .collect();
+        drop(open_orders);
+        drop(cache);
+        self.ensure_execution_instrument_cached(instrument_id);
 
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
@@ -1949,6 +1982,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 ),
             })
             .collect();
+        drop(cache);
+        for entry in &entries {
+            self.ensure_execution_instrument_cached(entry.instrument_id);
+        }
 
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
@@ -2817,6 +2854,7 @@ fn prepare_modify(
         .order(&client_order_id)
         .map(|order| order.clone())
         .ok_or_else(|| rejection("order not found in cache".to_string()))?;
+    client.ensure_execution_instrument_cached(order.instrument_id());
     let symbol = cmd.instrument_id.symbol.inner();
     let modify_target = match client
         .http_client
@@ -4195,6 +4233,7 @@ mod tests {
             account_id: AccountId::from("HYPERLIQUID-TESTNET-001"),
             instrument_id: InstrumentId::from("PUMP-USD-PERP.HYPERLIQUID"),
             raw_symbol: Ustr::from("PUMP"),
+            expected_asset_index: None,
             mode: super::HyperliquidLeveragePreflightMode::ApplyAndVerify,
         }
     }
@@ -4341,6 +4380,45 @@ mod tests {
         );
         assert!(state.exchange_requests.lock().await.is_empty());
         assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn leverage_preflight_accepts_exact_catalog_index_for_lazy_instrument() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        let address = start_leverage_test_server(state.clone()).await;
+        let mut client = HyperliquidHttpClient::with_credentials(
+            Some(format!("0x{}", "deadbeef".repeat(8))),
+            None,
+            Some(LEVERAGE_TEST_ACCOUNT_ADDRESS),
+            HyperliquidEnvironment::Testnet,
+            5,
+            None,
+        )
+        .unwrap();
+        client.set_base_info_url(format!("http://{address}/info"));
+        client.set_base_exchange_url(format!("http://{address}/exchange"));
+        let mut request = leverage_request();
+        request.expected_asset_index = Some(0);
+
+        let response = execute_leverage_preflight(
+            &client,
+            &AtomicBool::new(true),
+            request.account_id,
+            request,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            super::HyperliquidLeveragePreflightResponse::Proven {
+                maximum_leverage: 10,
+                observed_leverage: 10,
+                ..
+            }
+        ));
+        assert_eq!(state.exchange_requests.lock().await.len(), 1);
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

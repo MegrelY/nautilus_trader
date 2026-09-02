@@ -2312,6 +2312,70 @@ async fn test_exec_client_consumes_data_catalog_handoff_without_catalog_http_req
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_exec_client_promotes_lazily_admitted_node_instrument_before_submit() {
+    let state = TestServerState::default();
+    let exchange_count = state.exchange_request_count.clone();
+    let addr = start_mock_server(state).await;
+
+    let mut provider =
+        HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 1, None).unwrap();
+    provider.set_base_info_url(format!("http://{addr}/info"));
+    let eth = provider
+        .request_instruments()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|instrument| instrument.id() == InstrumentId::from("ETH-USD-PERP.HYPERLIQUID"))
+        .expect("ETH instrument");
+
+    let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(data_tx);
+    let mut data_client = HyperliquidDataClient::new(
+        *HYPERLIQUID_CLIENT_ID,
+        HyperliquidDataClientConfig {
+            base_url_http: Some(format!("http://{addr}/info")),
+            base_url_ws: Some(format!("ws://{addr}/ws")),
+            bootstrap_instrument_ids: vec![InstrumentId::from("BTC-USD-PERP.HYPERLIQUID")],
+            ..HyperliquidDataClientConfig::default()
+        },
+    )
+    .unwrap();
+    data_client.connect().await.unwrap();
+    data_client.disconnect().await.unwrap();
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    cache.borrow_mut().add_instrument(eth).unwrap();
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let order = make_limit_order_on_instrument(
+        "O-LAZY-ETH",
+        InstrumentId::from("ETH-USD-PERP.HYPERLIQUID"),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    client.submit_order(make_submit_cmd(&order)).unwrap();
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        drain_denied_events(&mut rx, Duration::from_millis(250))
+            .await
+            .is_empty()
+    );
+    assert_eq!(*exchange_count.lock().await, 1);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_exec_client_shared_cache_without_handoff_uses_one_fallback_catalog() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
@@ -7082,6 +7146,7 @@ async fn test_generate_mass_status_reconstructs_filled_order_for_retained_fill()
     assert_eq!(stop_report.order_status, OrderStatus::Filled);
     assert_eq!(stop_report.order_type, OrderType::StopMarket);
     assert_eq!(stop_report.trigger_price, Some(Price::from("49950.0")));
+    assert_eq!(stop_report.trigger_type, Some(TriggerType::Default));
     assert_eq!(stop_report.price, None);
 
     client.disconnect().await.unwrap();

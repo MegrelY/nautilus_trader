@@ -141,7 +141,13 @@ fn deduplicate_historical_order_reports(reports: Vec<OrderStatusReport>) -> Vec<
         ) {
             best.price = best.price.or(other.price);
         }
+        let recovered_conditional_type =
+            best.trigger_price.is_none() && other.trigger_price.is_some();
         best.trigger_price = best.trigger_price.or(other.trigger_price);
+        best.trigger_type = best.trigger_type.or(other.trigger_type);
+        if recovered_conditional_type {
+            best.order_type = other.order_type;
+        }
         best_by_venue_order_id.insert(best.venue_order_id, best);
     }
 
@@ -1551,8 +1557,10 @@ impl HyperliquidHttpClient {
 
             Some(instrument)
         } else {
-            // For non-vault tokens, log warning and return None
-            log::warn!("Instrument not found in cache: {coin}");
+            // A scoped bootstrap intentionally omits inactive instruments. The
+            // caller records the structured private-state gap, so avoid one
+            // warning per historical row while retaining diagnostic detail.
+            log::debug!("Instrument not found in scoped cache: {coin}");
             None
         }
     }
@@ -2788,10 +2796,15 @@ impl HyperliquidHttpClient {
                 .order_type
                 .as_deref()
                 .is_some_and(|label| label.ends_with("Market"));
-            let historical_order_type = match tpsl.as_ref() {
-                Some(tpsl) => parse_trigger_order_type(is_market, tpsl),
-                None if is_market => OrderType::Market,
-                None => OrderType::Limit,
+            let trigger_px = entry
+                .order
+                .trigger_px
+                .filter(|price| *price != Decimal::ZERO);
+            let historical_order_type = match (tpsl.as_ref(), trigger_px) {
+                (Some(tpsl), Some(_)) => parse_trigger_order_type(is_market, tpsl),
+                (Some(_), None) => OrderType::Limit,
+                (None, _) if is_market => OrderType::Market,
+                (None, _) => OrderType::Limit,
             };
             let order = WsBasicOrderData {
                 coin: entry.order.coin,
@@ -2804,10 +2817,7 @@ impl HyperliquidHttpClient {
                 cloid: entry.order.cloid,
                 tif: entry.order.tif,
                 reduce_only: entry.order.reduce_only,
-                trigger_px: entry
-                    .order
-                    .trigger_px
-                    .filter(|price| *price != Decimal::ZERO),
+                trigger_px,
                 is_market: tpsl.is_some().then_some(is_market),
                 tpsl,
                 trigger_activated: None,
