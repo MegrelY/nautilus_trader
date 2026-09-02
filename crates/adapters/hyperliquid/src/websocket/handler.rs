@@ -554,9 +554,13 @@ impl FeedHandler {
                             }
                         }
                         Message::Ping(data) => {
-                            if let Some(ref client) = self.client
-                                && let Err(e) = client.send_pong(data.to_vec()).await {
-                                log::error!("Error sending pong: {e}");
+                            if let Some(ref client) = self.client {
+                                let payload_len = data.len();
+                                if let Err(e) = client.send_pong(data.to_vec()).await {
+                                    log::error!("Error sending pong: {e}");
+                                } else {
+                                    record_websocket_outbound(payload_len);
+                                }
                             }
                         }
                         Message::Close(_) => {
@@ -1493,6 +1497,7 @@ mod tests {
     use crate::{
         common::consts::HYPERLIQUID_VENUE,
         data_types::{HyperliquidAllDexsAssetCtxs, HyperliquidOpenInterest},
+        hyperliquid_network_metrics_snapshot,
     };
 
     fn btc_perp() -> InstrumentAny {
@@ -1619,6 +1624,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_discards_the_forming_candle_cache() {
+        let metrics_before = hyperliquid_network_metrics_snapshot();
         let subscriptions = SubscriptionState::new(':');
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1666,10 +1672,20 @@ mod tests {
             Some(NautilusWsMessage::Reconnected)
         ));
         assert!(handler.bar_cache.is_empty());
+        let metrics_after = hyperliquid_network_metrics_snapshot();
+        assert_eq!(
+            metrics_after.websocket_reconnects - metrics_before.websocket_reconnects,
+            1
+        );
+        assert_eq!(
+            metrics_after.websocket_inbound_messages - metrics_before.websocket_inbound_messages,
+            1
+        );
     }
 
     #[tokio::test]
     async fn raw_queue_high_water_requests_reconnect_without_dropping_messages() {
+        let metrics_before = hyperliquid_network_metrics_snapshot();
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1704,6 +1720,12 @@ mod tests {
         ));
         assert!(websocket_backpressure_active());
         assert_eq!(handler.raw_rx.len(), WEBSOCKET_QUEUE_CAPACITY);
+        let metrics_after = hyperliquid_network_metrics_snapshot();
+        assert_eq!(
+            metrics_after.websocket_backpressure_events
+                - metrics_before.websocket_backpressure_events,
+            1
+        );
         drop(handler);
         assert!(!websocket_backpressure_active());
     }
