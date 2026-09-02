@@ -66,6 +66,11 @@ use crate::data_types::{
     HyperliquidAllDexsAssetCtxs, HyperliquidAllMids, HyperliquidDexAssetCtx,
     HyperliquidImpactPrices,
 };
+use crate::network_metrics::{
+    record_websocket_backpressure, record_websocket_duplicate_subscription_skipped,
+    record_websocket_inbound, record_websocket_outbound, record_websocket_reconnect,
+    record_websocket_subscription_confirmation, record_websocket_subscription_send,
+};
 
 /// Commands sent from the outer client to the inner message handler.
 #[derive(Debug)]
@@ -264,9 +269,12 @@ impl FeedHandler {
                     || {
                         let payload = payload.clone();
                         async move {
+                            let payload_len = payload.len();
                             client.send_text(payload, None).await.map_err(|e| {
                                 HyperliquidWsError::ClientError(format!("Send failed: {e}"))
-                            })
+                            })?;
+                            record_websocket_outbound(payload_len);
+                            Ok(())
                         }
                     },
                     should_retry_hyperliquid_error,
@@ -284,6 +292,7 @@ impl FeedHandler {
             return;
         }
         self.backpressure_reconnect_requested = true;
+        record_websocket_backpressure();
         WEBSOCKET_BACKPRESSURE_HANDLERS.fetch_add(1, Ordering::AcqRel);
         let cmd_depth = self.cmd_rx.len();
         let raw_depth = self.raw_rx.len();
@@ -311,6 +320,7 @@ impl FeedHandler {
         let key = subscription_to_key(&subscription);
         let channel = safe_subscription_channel(&key);
         if !self.prepare_subscription_send(&key, replay) {
+            record_websocket_duplicate_subscription_skipped();
             log::debug!("Skipping duplicate subscribe request: channel={channel}");
             return;
         }
@@ -325,6 +335,8 @@ impl FeedHandler {
                 if let Err(e) = self.send_with_retry(payload).await {
                     log::error!("Error subscribing to {channel}: {e}");
                     self.subscriptions.mark_failure(&key);
+                } else {
+                    record_websocket_subscription_send(replay);
                 }
             }
             Err(e) => {
@@ -477,9 +489,11 @@ impl FeedHandler {
                 }
 
                 Some(raw_msg) = self.raw_rx.recv() => {
+                    record_websocket_inbound(Self::websocket_payload_len(&raw_msg));
                     match raw_msg {
                         Message::Text(text) => {
                             if text == RECONNECTED {
+                                record_websocket_reconnect();
                                 log::info!("Received RECONNECTED sentinel");
                                 self.clear_backpressure();
                                 self.bar_cache.clear();
@@ -565,14 +579,31 @@ impl FeedHandler {
         let key = subscription_to_key(&response.subscription);
         let channel = safe_subscription_channel(&key);
         match response.method.as_str() {
-            "subscribe" => self.subscriptions.confirm_subscribe(&key),
-            "unsubscribe" => self.subscriptions.confirm_unsubscribe(&key),
+            "subscribe" => {
+                self.subscriptions.confirm_subscribe(&key);
+                record_websocket_subscription_confirmation(false);
+            }
+            "unsubscribe" => {
+                self.subscriptions.confirm_unsubscribe(&key);
+                record_websocket_subscription_confirmation(true);
+            }
             method => {
                 self.subscriptions.mark_failure(&key);
                 log::error!(
                     "Unknown subscription response method: method={method}, channel={channel}"
                 );
             }
+        }
+    }
+
+    fn websocket_payload_len(message: &Message) -> usize {
+        match message {
+            Message::Text(text) => text.len(),
+            Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
+            Message::Close(frame) => frame
+                .as_ref()
+                .map_or(0, |frame| frame.reason.len().saturating_add(2)),
+            _ => 0,
         }
     }
 

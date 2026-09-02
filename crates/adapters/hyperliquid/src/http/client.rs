@@ -110,6 +110,7 @@ use crate::{
             exec_action_weight, info_base_weight, info_extra_weight,
         },
     },
+    network_metrics::{record_http_request, record_http_response},
     private_state::{
         HyperliquidPrivateStateBatch, HyperliquidPrivateStateGap, HyperliquidPrivateStateGapKind,
         HyperliquidPrivateStateSource,
@@ -718,8 +719,10 @@ impl HyperliquidRawHttpClient {
         let body_bytes = serde_json::to_string(&body)
             .map_err(Error::Serde)?
             .into_bytes();
+        record_http_request(body_bytes.len());
 
-        self.client
+        let response = self
+            .client
             .request(
                 Method::POST,
                 url.clone(),
@@ -730,7 +733,9 @@ impl HyperliquidRawHttpClient {
                 None,
             )
             .await
-            .map_err(Error::from_http_client)
+            .map_err(Error::from_http_client)?;
+        record_http_response(response.body.len());
+        Ok(response)
     }
 
     /// Send a signed action to the exchange.
@@ -940,6 +945,7 @@ impl HyperliquidRawHttpClient {
         let url = &self.base_exchange;
         let body = serde_json::to_string(&request).map_err(Error::Serde)?;
         let body_bytes = body.into_bytes();
+        record_http_request(body_bytes.len());
 
         let response = self
             .client
@@ -954,6 +960,7 @@ impl HyperliquidRawHttpClient {
             )
             .await
             .map_err(Error::from_http_client)?;
+        record_http_response(response.body.len());
 
         Ok(response)
     }

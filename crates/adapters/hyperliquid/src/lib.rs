@@ -55,6 +55,7 @@ pub mod data_types;
 pub mod execution;
 pub mod factories;
 pub mod http;
+mod network_metrics;
 pub mod outcome_settlement;
 pub mod private_state;
 pub mod signing;
@@ -80,6 +81,7 @@ pub use crate::{
         HyperliquidExecutionClientFactory, HyperliquidLeveragePreflightExecutionClientFactory,
     },
     http::client::HyperliquidHttpClient,
+    network_metrics::{HyperliquidNetworkMetricsSnapshot, hyperliquid_network_metrics_snapshot},
     private_state::{
         HyperliquidIncompleteMassStatus, HyperliquidPrivateStateGap,
         HyperliquidPrivateStateGapKind, HyperliquidPrivateStateSource,
