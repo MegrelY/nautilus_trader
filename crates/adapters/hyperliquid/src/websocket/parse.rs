@@ -25,7 +25,7 @@ use nautilus_model::{
     },
     enums::{
         AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType, RecordFlag,
-        TimeInForce,
+        TimeInForce, TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
@@ -381,7 +381,9 @@ pub fn parse_ws_order_status_report(
 
     if is_conditional && let Some(trigger_px) = order.order.trigger_px {
         let trigger_price = parse_price(trigger_px, instrument, "order.triggerPx")?;
-        report = report.with_trigger_price(trigger_price);
+        report = report
+            .with_trigger_price(trigger_price)
+            .with_trigger_type(TriggerType::Default);
     }
 
     Ok(report)
@@ -556,7 +558,7 @@ mod tests {
             enums::{
                 HyperliquidFillDirection, HyperliquidLiquidationMethod,
                 HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide,
-                HyperliquidTimeInForce,
+                HyperliquidTimeInForce, HyperliquidTpSl,
             },
         },
         websocket::messages::{
@@ -637,6 +639,45 @@ mod tests {
         assert!(report.post_only);
         assert!(report.reduce_only);
         assert!(report.trigger_price.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_ws_conditional_order_sets_required_trigger_fields() {
+        let instrument = create_test_instrument();
+        let account_id = AccountId::new("HYPERLIQUID-001");
+        let order_data = WsOrderData {
+            order: WsBasicOrderData {
+                coin: Ustr::from("BTC"),
+                side: HyperliquidSide::Sell,
+                limit_px: dec!(49940.0),
+                sz: dec!(0.001),
+                oid: 200003,
+                timestamp: 1704470400000,
+                orig_sz: dec!(0.001),
+                cloid: Some("test-stop-limit".to_string()),
+                tif: None,
+                reduce_only: Some(true),
+                trigger_px: Some(dec!(49950.0)),
+                is_market: Some(false),
+                tpsl: Some(HyperliquidTpSl::Sl),
+                trigger_activated: Some(false),
+                trailing_stop: None,
+            },
+            status: HyperliquidOrderStatusEnum::Open,
+            status_timestamp: 1704470400000,
+        };
+
+        let report = parse_ws_order_status_report(
+            &order_data,
+            &instrument,
+            account_id,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, OrderType::StopLimit);
+        assert_eq!(report.trigger_price, Some(Price::from("49950.0")));
+        assert_eq!(report.trigger_type, Some(TriggerType::Default));
     }
 
     #[rstest]
