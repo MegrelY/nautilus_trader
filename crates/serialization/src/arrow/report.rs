@@ -101,6 +101,7 @@ const EXECUTION_MASS_STATUS_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8_json("order_reports", false),
     JsonFieldSpec::utf8_json("fill_reports", false),
     JsonFieldSpec::utf8_json("position_reports", false),
+    JsonFieldSpec::boolean("position_reports_complete", false),
 ];
 
 fn instrument_metadata(type_name: &'static str, instrument_id: &str) -> HashMap<String, String> {
@@ -186,12 +187,14 @@ impl DecodeTypedFromRecordBatch for ExecutionMassStatus {
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
     ) -> Result<Vec<Self>, EncodingError> {
-        decode_batch(
-            metadata,
-            &record_batch,
-            EXECUTION_MASS_STATUS_FIELDS,
-            Some("ExecutionMassStatus"),
-        )
+        // Legacy batches predate the producer's completeness attestation.
+        // Deserialize without that final column so serde defaults it to false.
+        let fields = if record_batch.num_columns() == EXECUTION_MASS_STATUS_FIELDS.len() - 1 {
+            &EXECUTION_MASS_STATUS_FIELDS[..EXECUTION_MASS_STATUS_FIELDS.len() - 1]
+        } else {
+            EXECUTION_MASS_STATUS_FIELDS
+        };
+        decode_batch(metadata, &record_batch, fields, Some("ExecutionMassStatus"))
     }
 }
 

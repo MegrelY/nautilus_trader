@@ -47,6 +47,11 @@ pub struct ExecutionMassStatus {
     pub report_id: UUID4,
     /// UNIX timestamp (nanoseconds) when the object was initialized.
     pub ts_init: UnixNanos,
+    /// Whether the producer proved complete current position coverage for this
+    /// account. Absence can mean flat only when this is true. Legacy or partial
+    /// reports default to false.
+    #[serde(default)]
+    pub position_reports_complete: bool,
     /// The order status reports.
     order_reports: IndexMap<VenueOrderId, OrderStatusReport>,
     /// The fill reports.
@@ -71,6 +76,7 @@ impl ExecutionMassStatus {
             venue,
             report_id: report_id.unwrap_or_default(),
             ts_init,
+            position_reports_complete: false,
             order_reports: IndexMap::new(),
             fill_reports: IndexMap::new(),
             position_reports: IndexMap::new(),

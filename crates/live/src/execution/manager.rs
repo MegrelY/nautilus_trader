@@ -533,6 +533,7 @@ impl ExecutionManager {
         );
 
         let retained_fill_state = self.retained_fill_state();
+        let flat_historical_orders = self.flat_historical_orders(&mass_status);
         let reported_fill_keys: IndexSet<(AccountId, InstrumentId, TradeId)> = mass_status
             .fill_reports()
             .values()
@@ -889,9 +890,14 @@ impl ExecutionManager {
 
         events.sort_by_key(|e| e.ts_event());
 
+        let mut history_projected = 0usize;
         for event in &events {
             if let OrderEventAny::Filled(fill) = event
-                && (retained_fill_state.fill_keys.contains(&(
+                && (flat_historical_orders.contains(&(
+                    fill.account_id,
+                    fill.instrument_id,
+                    fill.venue_order_id,
+                )) || retained_fill_state.fill_keys.contains(&(
                     fill.account_id,
                     fill.instrument_id,
                     fill.trade_id,
@@ -913,6 +919,7 @@ impl ExecutionManager {
                     .is_some_and(|ts_opened| fill.ts_event < *ts_opened))
             {
                 exec_engine.borrow_mut().project_reconciliation_fill(fill);
+                history_projected += 1;
             } else {
                 exec_engine.borrow_mut().process(event);
             }
@@ -998,13 +1005,68 @@ impl ExecutionManager {
 
         log::info!(
             color = LogColor::Blue as u8;
-            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills={fills_applied}, positions={positions_created}, skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}",
+            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills_queued={fills_applied}, history_projected={history_projected}, positions={positions_created}, skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}",
         );
 
         ReconciliationResult {
             events,
             external_orders,
         }
+    }
+
+    /// Classify before external-order initialization mutates the cache. A closed
+    /// order from before snapshot collection is history when both the complete
+    /// venue position set and the local cache prove this account/instrument flat.
+    /// Known orders and any current exposure retain normal fill application.
+    fn flat_historical_orders(
+        &self,
+        mass_status: &ExecutionMassStatus,
+    ) -> IndexSet<(AccountId, InstrumentId, VenueOrderId)> {
+        if !mass_status.position_reports_complete || self.config.filter_position_reports {
+            return IndexSet::new();
+        }
+        let cache = self.cache.borrow();
+        let positions = mass_status.position_reports();
+        let fills = mass_status.fill_reports();
+        let local_open = cache.positions_open(None, None, None, None, None);
+        mass_status
+            .order_reports()
+            .values()
+            .filter(|report| {
+                report.account_id == mass_status.account_id
+                    && report.instrument_id.venue == mass_status.venue
+                    && report.order_status.is_closed()
+                    && !report.filled_qty.is_zero()
+                    && report.ts_last < mass_status.ts_init
+                    && report
+                        .client_order_id
+                        .is_none_or(|id| cache.order(&id).is_none())
+                    && cache.client_order_id(&report.venue_order_id).is_none()
+                    && !local_open.iter().any(|position| {
+                        position.account_id == report.account_id
+                            && position.instrument_id == report.instrument_id
+                    })
+                    && positions.get(&report.instrument_id).is_none_or(|reports| {
+                        reports.iter().all(|position| {
+                            position.account_id == report.account_id && position.quantity.is_zero()
+                        })
+                    })
+                    && fills.get(&report.venue_order_id).is_none_or(|reports| {
+                        reports.iter().all(|fill| {
+                            fill.account_id == report.account_id
+                                && fill.instrument_id == report.instrument_id
+                                && fill.ts_event < mass_status.ts_init
+                        })
+                    })
+            })
+            .map(|report| {
+                (
+                    report.account_id,
+                    report.instrument_id,
+                    report.venue_order_id,
+                )
+            })
+            .collect()
     }
 
     fn retained_fill_state(&self) -> RetainedFillState {

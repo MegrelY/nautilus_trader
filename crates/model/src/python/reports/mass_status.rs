@@ -91,6 +91,13 @@ impl ExecutionMassStatus {
         self.ts_init.as_u64()
     }
 
+    /// Whether the producer proved complete current account position coverage.
+    #[getter]
+    #[pyo3(name = "position_reports_complete")]
+    const fn py_position_reports_complete(&self) -> bool {
+        self.position_reports_complete
+    }
+
     /// Get a copy of the order reports map.
     #[getter]
     #[pyo3(name = "order_reports")]

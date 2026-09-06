@@ -2515,6 +2515,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
             )));
         }
 
+        mass_status.position_reports_complete = true;
         Ok(Some(mass_status))
     }
 }
