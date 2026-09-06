@@ -314,9 +314,9 @@ impl HyperliquidDataClient {
     }
 
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
-        let instruments = self
+        let (instruments, execution_instruments) = self
             .http_client
-            .request_instruments_scoped(&self.config.bootstrap_instrument_ids)
+            .request_bootstrap_instruments(&self.config.bootstrap_instrument_ids)
             .await
             .context("failed to fetch instruments during bootstrap")?;
 
@@ -345,7 +345,7 @@ impl HyperliquidDataClient {
             ),
             CatalogHandoff {
                 requested_instrument_ids: self.config.bootstrap_instrument_ids.clone(),
-                instruments: instruments.clone(),
+                instruments: execution_instruments,
             },
         );
 

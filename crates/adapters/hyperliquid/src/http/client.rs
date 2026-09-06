@@ -1691,6 +1691,23 @@ impl HyperliquidHttpClient {
         &self,
         instrument_ids: &[InstrumentId],
     ) -> Result<Vec<HyperliquidInstrumentDef>> {
+        let mut defs = self
+            .request_instrument_defs_for_scope(instrument_ids)
+            .await?;
+        if !instrument_ids.is_empty() {
+            let requested: AHashSet<_> = instrument_ids.iter().copied().collect();
+            defs.retain(|def| requested.contains(&instrument_id_for_def(def)));
+        }
+        Ok(defs)
+    }
+
+    // Keep the definitions already returned by the requested product-family
+    // endpoints. Execution reconciliation is account-wide, even when public
+    // data subscribes to only a few instruments from those families.
+    async fn request_instrument_defs_for_scope(
+        &self,
+        instrument_ids: &[InstrumentId],
+    ) -> Result<Vec<HyperliquidInstrumentDef>> {
         if instrument_ids.is_empty() {
             return self.request_instrument_defs().await;
         }
@@ -1804,7 +1821,6 @@ impl HyperliquidHttpClient {
             defs.extend(parse_outcome_instruments(&outcome_meta).map_err(Error::decode)?);
         }
 
-        defs.retain(|def| requested.contains(&instrument_id_for_def(def)));
         let found: AHashSet<_> = defs.iter().map(instrument_id_for_def).collect();
         let missing = instrument_ids
             .iter()
@@ -1872,6 +1888,25 @@ impl HyperliquidHttpClient {
     ) -> Result<Vec<InstrumentAny>> {
         let defs = self.request_instrument_defs_scoped(instrument_ids).await?;
         Ok(self.convert_defs(defs))
+    }
+
+    /// Shares already fetched product-family definitions with execution while
+    /// keeping the data client's published catalog scoped to its selection.
+    pub(crate) async fn request_bootstrap_instruments(
+        &self,
+        instrument_ids: &[InstrumentId],
+    ) -> Result<(Vec<InstrumentAny>, Vec<InstrumentAny>)> {
+        let defs = self
+            .request_instrument_defs_for_scope(instrument_ids)
+            .await?;
+        let available = self.convert_defs(defs);
+        let requested: AHashSet<_> = instrument_ids.iter().copied().collect();
+        let selected = available
+            .iter()
+            .filter(|instrument| requested.is_empty() || requested.contains(&instrument.id()))
+            .cloned()
+            .collect();
+        Ok((selected, available))
     }
 
     /// Builds the `allDexsAssetCtxs` normalization map from dex name to ordered instrument IDs.

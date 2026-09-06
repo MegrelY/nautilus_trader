@@ -177,6 +177,9 @@ pub enum HyperliquidTimeInForce {
     /// Add Liquidity Only - post-only order.
     Alo,
     /// Immediate or Cancel - fill immediately or cancel.
+    // The info API labels frontend market orders this way. Normalize only
+    // reads; our outgoing immediate-or-cancel orders still serialize as Ioc.
+    #[serde(alias = "FrontendMarket")]
     Ioc,
     /// Good Till Cancel - remain on book until filled or cancelled.
     Gtc,
@@ -1158,6 +1161,10 @@ mod tests {
 
     #[rstest]
     fn test_time_in_force_serde() {
+        assert_eq!(
+            serde_json::from_str::<HyperliquidTimeInForce>("\"FrontendMarket\"").unwrap(),
+            HyperliquidTimeInForce::Ioc,
+        );
         let test_cases = [
             (HyperliquidTimeInForce::Alo, "\"Alo\""),
             (HyperliquidTimeInForce::Ioc, "\"Ioc\""),

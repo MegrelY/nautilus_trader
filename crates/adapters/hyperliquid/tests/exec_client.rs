@@ -2260,6 +2260,10 @@ async fn test_exec_client_empty_shared_cache_requests_catalog_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exec_client_consumes_data_catalog_handoff_without_catalog_http_requests() {
     let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([open_order_value("ETH", 31)]));
+    *state.perp_clearinghouse_response.lock().await = Some(json!({
+        "assetPositions": [perp_position_value("ETH", "1.0")],
+    }));
     let addr = start_mock_server(state.clone()).await;
     let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(data_tx);
@@ -2294,6 +2298,16 @@ async fn test_exec_client_consumes_data_catalog_handoff_without_catalog_http_req
     add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
 
     client.connect().await.unwrap();
+
+    // ETH was in the same fetched native metadata but was not selected for
+    // public data. Account-wide reconciliation still needs its definition.
+    let mass = client.generate_mass_status(None).await.unwrap().unwrap();
+    assert!(mass.position_reports_complete);
+    assert_eq!(mass.order_reports().len(), 1);
+    assert!(
+        mass.position_reports()
+            .contains_key(&InstrumentId::from("ETH-USD-PERP.HYPERLIQUID"))
+    );
 
     let request_types = state.info_request_types.lock().await.clone();
     let catalog_requests_after_exec = request_types
