@@ -15,6 +15,7 @@
 
 pub mod client;
 pub mod error;
+mod fill_history;
 pub mod models;
 pub mod parse;
 pub mod query;

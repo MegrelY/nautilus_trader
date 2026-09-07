@@ -2371,7 +2371,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         let reports = self
             .http_client
-            .request_fill_reports(&account_address, cmd.instrument_id)
+            .request_fill_reports_since(&account_address, cmd.instrument_id, cmd.start)
             .await
             .context("failed to generate fill reports")?;
 
@@ -2437,10 +2437,17 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
         let account_address = self.get_account_address()?;
+        let fill_start = lookback_mins.map(|mins| {
+            UnixNanos::from(
+                ts_init
+                    .as_u64()
+                    .saturating_sub(mins.saturating_mul(60_000_000_000)),
+            )
+        });
         let ((snapshot, mut completeness), fill_batch) = tokio::join!(
             self.collect_private_state_snapshot(&account_address, PrivateStateSnapshotScope::All,),
             self.http_client
-                .request_fill_report_batch(&account_address, None),
+                .request_fill_report_batch(&account_address, None, fill_start),
         );
 
         let order_batch = self
@@ -2486,6 +2493,58 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     && !open_order_ids.contains(&report.venue_order_id)
             });
             order_reports.extend(historical_reports);
+            let known_order_ids: ahash::AHashSet<_> = order_reports
+                .iter()
+                .map(|report| report.venue_order_id)
+                .collect();
+            let mut missing_order_ids: Vec<_> = filled_order_ids
+                .difference(&known_order_ids)
+                .copied()
+                .collect();
+            missing_order_ids.sort();
+            const TARGETED_HISTORY_LIMIT: usize = 32;
+            if missing_order_ids.len() > TARGETED_HISTORY_LIMIT {
+                completeness.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::HistoricalOrders,
+                    HyperliquidPrivateStateGapKind::HistoryIncomplete,
+                    None,
+                    None,
+                    "Targeted historical-order request budget exhausted",
+                ));
+            }
+            for venue_order_id in missing_order_ids.into_iter().take(TARGETED_HISTORY_LIMIT) {
+                let oid = venue_order_id
+                    .as_str()
+                    .parse::<u64>()
+                    .context("invalid venue order ID in retained fill")?;
+                match self
+                    .http_client
+                    .request_order_status_report_exact(&account_address, oid)
+                    .await
+                {
+                    Ok(Some(report)) if report.venue_order_id == venue_order_id => {
+                        order_reports.push(report);
+                    }
+                    result => {
+                        let detail = match result {
+                            Ok(Some(_)) => {
+                                "Targeted order response has another identity".to_string()
+                            }
+                            Ok(None) => "Filled order is unavailable in venue history".to_string(),
+                            Err(error) => {
+                                format!("Targeted historical-order request failed: {error}")
+                            }
+                        };
+                        completeness.push_gap(HyperliquidPrivateStateGap::new(
+                            HyperliquidPrivateStateSource::HistoricalOrders,
+                            HyperliquidPrivateStateGapKind::HistoryIncomplete,
+                            None,
+                            Some(venue_order_id.as_str()),
+                            detail,
+                        ));
+                    }
+                }
+            }
         }
 
         let mut mass_status = ExecutionMassStatus::new(

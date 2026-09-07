@@ -36,6 +36,7 @@ pub enum HyperliquidPrivateStateGapKind {
     SourceFailure,
     ParseFailure,
     UnknownInstrument,
+    HistoryIncomplete,
 }
 
 /// One bounded private-state omission detected during reconciliation.

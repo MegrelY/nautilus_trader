@@ -80,6 +80,7 @@ use crate::{
     data_types::HyperliquidPublicTrade,
     http::{
         error::{Error, Result},
+        fill_history::{FILL_HISTORY_REQUEST_LIMIT, FillHistory},
         models::{
             ClearinghouseState, Cloid, HyperliquidActiveAssetData, HyperliquidCandleSnapshot,
             HyperliquidExchangeRequest, HyperliquidExchangeResponse, HyperliquidExecAction,
@@ -519,8 +520,13 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
-    async fn info_user_fills_raw(&self, user: &str) -> Result<Value> {
-        let request = InfoRequest::user_fills(user);
+    async fn info_user_fills_by_time_raw(
+        &self,
+        user: &str,
+        start_time: u64,
+        end_time: u64,
+    ) -> Result<Value> {
+        let request = InfoRequest::user_fills_by_time(user, start_time, end_time);
         self.send_info_request(&request).await
     }
 
@@ -2976,6 +2982,19 @@ impl HyperliquidHttpClient {
             };
         }
 
+        self.request_order_status_report_exact(user, oid).await
+    }
+
+    /// Query a known missing order directly, without repeating the open snapshot.
+    pub(crate) async fn request_order_status_report_exact(
+        &self,
+        user: &str,
+        oid: u64,
+    ) -> Result<Option<OrderStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let ts_init = self.clock.get_time_ns();
         // Order not in open set: query by oid (returns limited HyperliquidOrderInfo)
         let response = self.info_order_status(user, oid).await?;
         let entry = match response.into_order() {
@@ -3115,43 +3134,59 @@ impl HyperliquidHttpClient {
         &self,
         user: &str,
         instrument_id: Option<InstrumentId>,
+        start: Option<UnixNanos>,
     ) -> Result<HyperliquidPrivateStateBatch<FillReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let response = match self.inner.info_user_fills_raw(user).await {
-            Ok(response) => response,
-            Err(error) => {
-                let mut batch = HyperliquidPrivateStateBatch::default();
-                batch.push_gap(HyperliquidPrivateStateGap::new(
-                    HyperliquidPrivateStateSource::Fills,
-                    HyperliquidPrivateStateGapKind::SourceFailure,
-                    None,
-                    None,
-                    error.to_string(),
-                ));
-                return Ok(batch);
-            }
-        };
-        let Some(fills) = response.as_array() else {
-            let mut batch = HyperliquidPrivateStateBatch::default();
-            batch.push_gap(HyperliquidPrivateStateGap::new(
-                HyperliquidPrivateStateSource::Fills,
-                HyperliquidPrivateStateGapKind::ParseFailure,
-                None,
-                None,
-                "Expected a fill array",
-            ));
-            return Ok(batch);
-        };
-        let mut batch = HyperliquidPrivateStateBatch::default();
         let ts_init = self.clock.get_time_ns();
+        let end_ms = ts_init.as_u64() / 1_000_000;
+        let start_ms = start.map_or(0, |start| start.as_u64() / 1_000_000);
+        let mut history = FillHistory::new(start_ms, end_ms);
+        let mut batch = HyperliquidPrivateStateBatch::default();
+        for request_index in 0..FILL_HISTORY_REQUEST_LIMIT {
+            let response = match self
+                .inner
+                .info_user_fills_by_time_raw(user, history.cursor(), end_ms)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::Fills,
+                        HyperliquidPrivateStateGapKind::SourceFailure,
+                        None,
+                        None,
+                        error.to_string(),
+                    ));
+                    break;
+                }
+            };
+            match history.accept(response) {
+                Ok(true) => break,
+                Ok(false) if request_index + 1 < FILL_HISTORY_REQUEST_LIMIT => continue,
+                result => {
+                    let detail = result
+                        .err()
+                        .unwrap_or_else(|| "Fill history request budget exhausted".into());
+                    batch.push_gap(HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::Fills,
+                        HyperliquidPrivateStateGapKind::HistoryIncomplete,
+                        None,
+                        None,
+                        detail,
+                    ));
+                    break;
+                }
+            }
+        }
+        let fills = history.into_records();
 
         for fill_value in fills {
             let fill: HyperliquidFill = match serde_json::from_value(fill_value.clone()) {
                 Ok(fill) => fill,
                 Err(error) => {
-                    let identity = private_value_identity(fill_value);
+                    let identity = private_value_identity(&fill_value);
                     batch.push_gap(HyperliquidPrivateStateGap::new(
                         HyperliquidPrivateStateSource::Fills,
                         HyperliquidPrivateStateGapKind::ParseFailure,
@@ -3162,6 +3197,9 @@ impl HyperliquidHttpClient {
                     continue;
                 }
             };
+            if start.is_some_and(|start| fill.time < start.as_u64().div_ceil(1_000_000)) {
+                continue;
+            }
             let Some(instrument) = self.get_or_create_instrument(&fill.coin, None) else {
                 batch.push_gap(HyperliquidPrivateStateGap::new(
                     HyperliquidPrivateStateSource::Fills,
@@ -3193,7 +3231,7 @@ impl HyperliquidHttpClient {
 
     /// Request fill reports for a user.
     ///
-    /// Fetches user fills via `info_user_fills` and parses them into FillReports.
+    /// Fetches unaggregated, paginated retained history and parses it into FillReports.
     /// This method requires instruments to be added to the client cache via `cache_instrument()`.
     ///
     /// For vault tokens (starting with "vntls:") that are not in the cache, synthetic instruments
@@ -3209,7 +3247,20 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<FillReport>> {
-        let batch = self.request_fill_report_batch(user, instrument_id).await?;
+        self.request_fill_reports_since(user, instrument_id, None)
+            .await
+    }
+
+    /// Request bounded, complete retained fill history covering `start`.
+    pub async fn request_fill_reports_since(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+        start: Option<UnixNanos>,
+    ) -> Result<Vec<FillReport>> {
+        let batch = self
+            .request_fill_report_batch(user, instrument_id, start)
+            .await?;
         require_complete_private_reports("fill reports", batch)
     }
 

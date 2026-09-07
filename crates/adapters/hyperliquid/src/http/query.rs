@@ -114,6 +114,16 @@ pub struct UserFillsParams {
     pub user: String,
 }
 
+/// Fixed inclusive interval for unaggregated account fills.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFillsByTimeParams {
+    pub user: String,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub aggregate_by_time: bool,
+}
+
 /// Parameters for order status request.
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderStatusParams {
@@ -183,6 +193,7 @@ pub enum InfoRequestParams {
     L2Book(L2BookParams),
     RecentTrades(RecentTradesParams),
     UserFills(UserFillsParams),
+    UserFillsByTime(UserFillsByTimeParams),
     OrderStatus(OrderStatusParams),
     OpenOrders(OpenOrdersParams),
     ActiveAssetData(ActiveAssetDataParams),
@@ -285,6 +296,19 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::UserFills,
             params: InfoRequestParams::UserFills(UserFillsParams {
                 user: user.to_string(),
+            }),
+        }
+    }
+
+    /// Creates a request for exact fills in a fixed inclusive time interval.
+    pub fn user_fills_by_time(user: &str, start_time: u64, end_time: u64) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::UserFillsByTime,
+            params: InfoRequestParams::UserFillsByTime(UserFillsByTimeParams {
+                user: user.to_string(),
+                start_time,
+                end_time,
+                aggregate_by_time: false,
             }),
         }
     }
@@ -596,6 +620,19 @@ mod tests {
         assert_eq!(req.request_type, HyperliquidInfoRequestType::L2Book);
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"coin\":\"BTC\""));
+    }
+
+    #[rstest]
+    fn test_user_fills_by_time_has_exact_interval_and_no_aggregation() {
+        let request = InfoRequest::user_fills_by_time("0xaccount", 123, 456);
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "userFillsByTime", "user": "0xaccount",
+                "startTime": 123, "endTime": 456, "aggregateByTime": false,
+            })
+        );
     }
 
     #[rstest]

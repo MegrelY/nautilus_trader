@@ -195,7 +195,7 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             let book = load_json("http_l2_book_btc.json");
             Json(book).into_response()
         }
-        "userFills" => Json(json!([])).into_response(),
+        "userFills" | "userFillsByTime" => Json(json!([])).into_response(),
         "orderStatus" => {
             let custom = state.order_status_response.lock().await;
             Json(custom.clone().unwrap_or(json!({"statuses": []}))).into_response()

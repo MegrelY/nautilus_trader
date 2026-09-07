@@ -144,6 +144,7 @@ struct TestServerState {
     last_clearinghouse_user: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Optional override for `userFills` info responses; defaults to `[]`.
     user_fills_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    fill_history_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     /// Optional override for `historicalOrders` info responses; defaults to `[]`.
     historical_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     rate_limit_after: Arc<AtomicUsize>,
@@ -179,6 +180,7 @@ impl Default for TestServerState {
             perp_clearinghouse_by_dex: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_clearinghouse_user: Arc::new(tokio::sync::Mutex::new(None)),
             user_fills_response: Arc::new(tokio::sync::Mutex::new(None)),
+            fill_history_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             rate_limit_after: Arc::new(AtomicUsize::new(usize::MAX)),
             pause_next_exchange: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -312,8 +314,28 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
                 Json(json!({"status": "unknownOid"})).into_response()
             }
         }
-        "userFills" => {
-            if let Some(body) = state.user_fills_response.lock().await.clone() {
+        "userFills" | "userFillsByTime" => {
+            if request_type == "userFillsByTime" {
+                state
+                    .fill_history_requests
+                    .lock()
+                    .await
+                    .push(request_body.clone());
+            }
+            if let Some(mut body) = state.user_fills_response.lock().await.clone() {
+                if request_type == "userFillsByTime" {
+                    if let Some(fills) = body.as_array_mut() {
+                        let start = request_body["startTime"].as_u64().unwrap();
+                        let end = request_body["endTime"].as_u64().unwrap();
+                        fills.retain(|fill| {
+                            fill["time"]
+                                .as_u64()
+                                .is_none_or(|time| time >= start && time <= end)
+                        });
+                        fills.sort_by_key(|fill| fill["time"].as_u64());
+                        fills.truncate(2_000);
+                    }
+                }
                 Json(body).into_response()
             } else {
                 Json(json!([])).into_response()
@@ -6731,8 +6753,143 @@ async fn test_generate_fill_reports_filters_time_range() {
     assert_eq!(reports.len(), 1);
 
     let request_types = state.info_request_types.lock().await.clone();
-    assert_eq!(request_types, ["userFills"; 4]);
+    assert_eq!(request_types, ["userFillsByTime"; 4]);
 
+    client.disconnect().await.unwrap();
+}
+
+fn recovery_fill_value(id: u64, time: u64) -> Value {
+    json!({
+        "coin": "BTC", "px": "50000.0", "sz": "0.001", "side": "B",
+        "time": time, "startPosition": "0", "dir": "Open Long", "closedPnl": "0",
+        "hash": format!("0x{id:064x}"), "oid": 42u64, "crossed": true,
+        "fee": "0.01", "tid": id, "feeToken": "USDC",
+    })
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_fill_reports_paginates_fixed_unaggregated_interval() {
+    let state = TestServerState::default();
+    let fills: Vec<_> = (0..2_001)
+        .map(|id| recovery_fill_value(id, 1_000 + id / 2))
+        .collect();
+    *state.user_fills_response.lock().await = Some(json!(fills));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+    let cmd = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let reports = client.generate_fill_reports(cmd).await.unwrap();
+    assert_eq!(reports.len(), 2_001);
+    let requests = state.fill_history_requests.lock().await.clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["startTime"], json!(0));
+    assert_eq!(requests[1]["startTime"], json!(1_999));
+    assert_eq!(requests[0]["endTime"], requests[1]["endTime"]);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["aggregateByTime"] == false)
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_fill_reports_saturated_timestamp_is_incomplete() {
+    let state = TestServerState::default();
+    let fills: Vec<_> = (0..2_001)
+        .map(|id| recovery_fill_value(id, 1_000))
+        .collect();
+    *state.user_fills_response.lock().await = Some(json!(fills));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+    let cmd = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        client
+            .generate_fill_reports(cmd)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("fill reports")
+    );
+    assert_eq!(state.fill_history_requests.lock().await.len(), 2);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case(true)]
+#[case(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_queries_order_missing_from_historical_window(
+    #[case] order_available: bool,
+) {
+    let state = TestServerState::default();
+    *state.user_fills_response.lock().await = Some(json!([recovery_fill_value(1, 1_000)]));
+    if order_available {
+        *state.order_status_response.lock().await = Some(json!({
+            "status": "order",
+            "order": {
+                "order": {"coin": "BTC", "side": "B", "limitPx": "50000", "sz": "0",
+                    "oid": 42u64, "timestamp": 1_000u64, "origSz": "0.001"},
+                "status": "filled", "statusTimestamp": 1_001u64,
+            }
+        }));
+    }
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+    state.info_request_types.lock().await.clear();
+    let result = client.generate_mass_status(None).await;
+    if order_available {
+        let mass = result.unwrap().unwrap();
+        assert_eq!(
+            mass.order_reports()[&VenueOrderId::from("42")].order_status,
+            OrderStatus::Filled
+        );
+    } else {
+        let error = result.unwrap_err();
+        let incomplete = error
+            .downcast_ref::<HyperliquidIncompleteMassStatus>()
+            .unwrap();
+        assert_eq!(incomplete.mass_status().fill_reports().len(), 1);
+        assert!(incomplete.gaps().iter().any(|gap| {
+            gap.source() == HyperliquidPrivateStateSource::HistoricalOrders
+                && gap.kind() == HyperliquidPrivateStateGapKind::HistoryIncomplete
+        }));
+    }
+    let requests = state.info_request_types.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|kind| kind.as_str() == "orderStatus")
+            .count(),
+        1
+    );
+    assert!(!requests.iter().any(|kind| kind == "frontendOpenOrders"));
+    drop(requests);
     client.disconnect().await.unwrap();
 }
 
@@ -6822,7 +6979,11 @@ async fn test_generate_mass_status_aggregates_default_and_hip3_dexes() {
     );
     let request_types = state.info_request_types.lock().await.clone();
     assert!(request_types.iter().any(|request| request == "perpDexs"));
-    assert!(request_types.iter().any(|request| request == "userFills"));
+    assert!(
+        request_types
+            .iter()
+            .any(|request| request == "userFillsByTime")
+    );
     assert!(!request_types.iter().any(|request| {
         matches!(
             request.as_str(),
