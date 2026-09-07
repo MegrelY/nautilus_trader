@@ -37,6 +37,36 @@ impl FillHistory {
         self.cursor
     }
 
+    pub(super) fn needs_retention_probe(&self) -> bool {
+        self.oldest
+            .is_none_or(|oldest| self.requested_start <= oldest)
+    }
+
+    /// A short historical traversal alone is not a retention proof: fills
+    /// arriving after its fixed end can already have evicted the beginning.
+    /// The recent endpoint proves the number of post-end fills only when its
+    /// own page is not entirely saturated by newer records.
+    pub(super) fn verify_retention_probe(&self, response: &Value) -> Result<(), String> {
+        let recent = response.as_array().ok_or("Expected a recent fill array")?;
+        if recent.len() > FILL_PAGE_LIMIT {
+            return Err("Recent fill probe exceeds the response budget".into());
+        }
+        let mut newer = 0;
+        for fill in recent {
+            let time = fill
+                .get("time")
+                .and_then(Value::as_u64)
+                .ok_or("Recent fill probe has no exact timestamp")?;
+            if time > self.end {
+                newer += 1;
+            }
+        }
+        if newer == FILL_PAGE_LIMIT || self.records.len() + newer >= FILL_RETENTION_LIMIT {
+            return Err("New fills may have evicted the required fixed-interval history".into());
+        }
+        Ok(())
+    }
+
     /// Return true only when the retained history and requested start are proven.
     pub(super) fn accept(&mut self, response: Value) -> Result<bool, String> {
         let page = response.as_array().ok_or("Expected a fill array")?;
@@ -196,6 +226,32 @@ mod tests {
         let mut history = FillHistory::new(0, 10);
         assert!(history.accept(json!([fill(1, 1), fill(1, 1)])).unwrap());
         assert_eq!(history.into_records().len(), 1);
+    }
+
+    #[test]
+    fn newer_fills_cannot_hide_retention_eviction_behind_a_short_history() {
+        let mut history = FillHistory::new(0, 10_000);
+        for first in [1, 2_000, 3_999, 5_998] {
+            let page: Vec<_> = (first..first + 2_000).map(|id| fill(id, id)).collect();
+            assert!(!history.accept(json!(page)).unwrap());
+        }
+        let tail: Vec<_> = (7_997..=9_000).map(|id| fill(id, id)).collect();
+        assert!(history.accept(json!(tail)).unwrap());
+        assert!(history.needs_retention_probe());
+        let recent: Vec<_> = (10_001..=11_000).map(|id| fill(id, id)).collect();
+        assert!(history.verify_retention_probe(&json!(recent)).is_err());
+        assert!(
+            history
+                .verify_retention_probe(&json!([fill(10_001, 10_001)]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn entirely_newer_saturated_probe_cannot_prove_old_history_absent() {
+        let history = FillHistory::new(0, 1);
+        let recent: Vec<_> = (2..2_002).map(|id| fill(id, id)).collect();
+        assert!(history.verify_retention_probe(&json!(recent)).is_err());
     }
 
     #[test]

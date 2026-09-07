@@ -336,6 +336,12 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
                         fills.truncate(2_000);
                     }
                 }
+                if request_type == "userFills" {
+                    if let Some(fills) = body.as_array_mut() {
+                        fills.sort_by_key(|fill| std::cmp::Reverse(fill["time"].as_u64()));
+                        fills.truncate(2_000);
+                    }
+                }
                 Json(body).into_response()
             } else {
                 Json(json!([])).into_response()
@@ -6753,7 +6759,17 @@ async fn test_generate_fill_reports_filters_time_range() {
     assert_eq!(reports.len(), 1);
 
     let request_types = state.info_request_types.lock().await.clone();
-    assert_eq!(request_types, ["userFillsByTime"; 4]);
+    assert_eq!(
+        request_types,
+        [
+            "userFillsByTime",
+            "userFills",
+            "userFillsByTime",
+            "userFillsByTime",
+            "userFills",
+            "userFillsByTime",
+        ]
+    );
 
     client.disconnect().await.unwrap();
 }

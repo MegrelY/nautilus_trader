@@ -520,6 +520,10 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
+    async fn info_user_fills_raw(&self, user: &str) -> Result<Value> {
+        self.send_info_request(&InfoRequest::user_fills(user)).await
+    }
+
     async fn info_user_fills_by_time_raw(
         &self,
         user: &str,
@@ -3144,7 +3148,9 @@ impl HyperliquidHttpClient {
         let start_ms = start.map_or(0, |start| start.as_u64() / 1_000_000);
         let mut history = FillHistory::new(start_ms, end_ms);
         let mut batch = HyperliquidPrivateStateBatch::default();
-        for request_index in 0..FILL_HISTORY_REQUEST_LIMIT {
+        let mut complete = false;
+        // Reserve one request for checking fills newer than the fixed end.
+        for request_index in 0..FILL_HISTORY_REQUEST_LIMIT - 1 {
             let response = match self
                 .inner
                 .info_user_fills_by_time_raw(user, history.cursor(), end_ms)
@@ -3163,8 +3169,11 @@ impl HyperliquidHttpClient {
                 }
             };
             match history.accept(response) {
-                Ok(true) => break,
-                Ok(false) if request_index + 1 < FILL_HISTORY_REQUEST_LIMIT => continue,
+                Ok(true) => {
+                    complete = true;
+                    break;
+                }
+                Ok(false) if request_index + 2 < FILL_HISTORY_REQUEST_LIMIT => continue,
                 result => {
                     let detail = result
                         .err()
@@ -3178,6 +3187,21 @@ impl HyperliquidHttpClient {
                     ));
                     break;
                 }
+            }
+        }
+        if complete && history.needs_retention_probe() {
+            let result = match self.inner.info_user_fills_raw(user).await {
+                Ok(response) => history.verify_retention_probe(&response),
+                Err(error) => Err(format!("Recent retention probe failed: {error}")),
+            };
+            if let Err(detail) = result {
+                batch.push_gap(HyperliquidPrivateStateGap::new(
+                    HyperliquidPrivateStateSource::Fills,
+                    HyperliquidPrivateStateGapKind::HistoryIncomplete,
+                    None,
+                    None,
+                    detail,
+                ));
             }
         }
         let fills = history.into_records();
