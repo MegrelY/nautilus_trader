@@ -16,7 +16,7 @@
 //! Execution client trait definition.
 
 use async_trait::async_trait;
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -293,6 +293,21 @@ pub trait ExecutionClient {
         log_not_implemented(cmd);
         Ok(Vec::new())
     }
+
+    /// Requests node-owned mass reconciliation while recovery remains unresolved.
+    ///
+    /// This opt-in is observation-only. The node keeps normal execution/event
+    /// processing running while collecting reports, with bounded retry backoff.
+    fn requires_mass_status_reconciliation(&self) -> bool {
+        false
+    }
+
+    /// Notifies that this exact mass report has finished node reconciliation.
+    ///
+    /// Called after cache/event application and external-order registration,
+    /// including startup. This is not a completeness or safety approval: clients
+    /// must independently validate their required evidence and applied state.
+    fn on_mass_status_reconciled(&self, _report_id: UUID4) {}
 
     /// Generates mass status for executions.
     ///

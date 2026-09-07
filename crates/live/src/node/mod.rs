@@ -105,7 +105,7 @@ use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
-    reports::{OrderStatusReport, PositionStatusReport},
+    reports::{ExecutionMassStatus, OrderStatusReport, PositionStatusReport},
 };
 #[cfg(feature = "python")]
 use nautilus_system::trader::Trader;
@@ -133,12 +133,14 @@ pub mod config;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 
+mod mass_recovery;
 mod metrics;
 mod state;
 
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
 use config::{LiveNodeConfig, PluginConfig, validate_live_environment};
+use mass_recovery::MassStatusRetryState;
 pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsDelta, RunnerMetricsSnapshot};
 use metrics::{RunnerChannelQueueDepths, RunnerMetricChannel, RunnerMetrics};
 use state::{EngineConnectionStatus, RunningTransition};
@@ -709,8 +711,19 @@ impl LiveNode {
         let client_ids = self.kernel.exec_engine.borrow().client_ids();
 
         for client_id in client_ids {
+            let retry_requested = self
+                .exec_clients
+                .iter()
+                .find(|client| client.client_id() == client_id)
+                .is_some_and(ExecutionClient::requires_mass_status_reconciliation);
             let elapsed = start.elapsed();
             if elapsed >= timeout {
+                if retry_requested {
+                    log::warn!(
+                        "Startup reconciliation deadline exhausted for {client_id}; deferring opted-in recovery to the runner"
+                    );
+                    continue;
+                }
                 anyhow::bail!("Startup reconciliation timeout reached");
             }
             let remaining = timeout
@@ -735,10 +748,22 @@ impl LiveNode {
                 anyhow::anyhow!(
                     "Startup reconciliation timeout reached while requesting mass status from {client_id}"
                 )
-            })?;
+            }).and_then(std::convert::identity);
+            self.flush_pending_exec_client_instruments();
 
             match mass_status_result {
                 Ok(Some(mass_status)) => {
+                    if let Some(client) = self
+                        .exec_clients
+                        .iter()
+                        .find(|client| client.client_id() == client_id)
+                        && (mass_status.client_id != client_id
+                            || mass_status.account_id != client.account_id()
+                            || mass_status.venue != client.venue())
+                    {
+                        anyhow::bail!("Startup mass status ownership mismatch for {client_id}");
+                    }
+                    let report_id = mass_status.report_id;
                     log_info!(
                         "Reconciling ExecutionMassStatus for {}",
                         client_id,
@@ -780,6 +805,13 @@ impl LiveNode {
                             );
                         }
                     }
+                    if let Some(client) = self
+                        .exec_clients
+                        .iter()
+                        .find(|client| client.client_id() == client_id)
+                    {
+                        client.on_mass_status_reconciled(report_id);
+                    }
                 }
                 Ok(None) => {
                     log::warn!(
@@ -788,7 +820,14 @@ impl LiveNode {
                     );
                 }
                 Err(e) => {
-                    return Err(e).context(format!("Failed to get mass status from {client_id}"));
+                    if retry_requested {
+                        log::warn!(
+                            "Startup mass status failed for {client_id}; opted-in recovery remains pending: {e}"
+                        );
+                    } else {
+                        return Err(e)
+                            .context(format!("Failed to get mass status from {client_id}"));
+                    }
                 }
             }
         }
@@ -1232,6 +1271,7 @@ impl LiveNode {
         let mut open_order_report_task: Option<OpenOrderReportTask> = None;
         let mut targeted_order_report_task: Option<TargetedOrderReportTask> = None;
         let mut position_report_task: Option<PositionReportTask> = None;
+        let mut mass_recovery = MassStatusRetryState::new();
         let ctrl_c = dst::signal::ctrl_c();
         let terminate = dst::signal::terminate();
 
@@ -1281,6 +1321,29 @@ impl LiveNode {
                     }
                 }, if self.state() == NodeState::ShuttingDown => {
                     break;
+                }
+                result = async {
+                    match mass_recovery.task.as_mut() {
+                        Some(task) => task.future.as_mut().await,
+                        None => std::future::pending::<ReportTaskOutcome<anyhow::Result<Option<ExecutionMassStatus>>>>().await,
+                    }
+                }, if mass_recovery.task.is_some() => {
+                    let maintenance_start = dst::time::Instant::now();
+                    if let Some(client) = mass_recovery.finish(maintenance_start) {
+                        match result {
+                            ReportTaskOutcome::Completed(Ok(Some(report))) => {
+                                self.apply_recovery_mass_status(&client, report).await;
+                            }
+                            ReportTaskOutcome::Completed(Ok(None)) => log::warn!(
+                                "Recovery mass status unavailable from {}", client.client_id()),
+                            ReportTaskOutcome::Completed(Err(error)) => log::warn!(
+                                "Recovery mass status failed for {}: {error}", client.client_id()),
+                            ReportTaskOutcome::TimedOut => log::warn!(
+                                "Recovery mass status timed out for {} after {:?}",
+                                client.client_id(), self.config.timeout_reconciliation),
+                        }
+                    }
+                    record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
                 result = async {
                     match open_order_report_task.as_mut() {
@@ -1396,6 +1459,17 @@ impl LiveNode {
 
                     let mut now = dst::time::Instant::now();
 
+                    if self.config.exec_engine.reconciliation && now >= recon_start
+                        && open_order_report_task.is_none()
+                        && targeted_order_report_task.is_none()
+                        && position_report_task.is_none()
+                    {
+                        mass_recovery.start_due(
+                            &self.exec_clients, now, self.config.timeout_reconciliation,
+                            self.config.exec_engine.reconciliation_lookback_mins.map(u64::from),
+                        );
+                    }
+
                     if recon_enabled && now >= recon_next {
                         let recon_intervals = ReconciliationCheckIntervals {
                             inflight: Duration::from_nanos(inflight_interval_ns),
@@ -1403,6 +1477,7 @@ impl LiveNode {
                             position: Duration::from_nanos(position_interval_ns),
                         };
                         let mut recon_state = ReconciliationCheckState {
+                            mass_status_pending: mass_recovery.task.is_some(),
                             last_inflight_check: &mut last_inflight_check,
                             last_open_check: &mut last_open_check,
                             last_position_check: &mut last_position_check,
@@ -1566,6 +1641,8 @@ impl LiveNode {
             log::debug!("Processed {residual_events} residual events during shutdown");
         }
 
+        // Cancel collection before teardown borrows clients mutably.
+        drop(mass_recovery.finish(dst::time::Instant::now()));
         self.cancel_report_tasks(
             &mut open_order_report_task,
             &mut targeted_order_report_task,
@@ -2430,6 +2507,10 @@ impl LiveNode {
             *state.last_inflight_check = now;
         }
 
+        if state.mass_status_pending {
+            return;
+        }
+
         let open_due = reconciliation_check_due(now, *state.last_open_check, intervals.open);
         let position_due =
             reconciliation_check_due(now, *state.last_position_check, intervals.position);
@@ -2475,6 +2556,40 @@ impl LiveNode {
             *state.open_order_report_task = self.start_open_order_report_check();
             *state.last_open_check = now;
         }
+    }
+
+    async fn apply_recovery_mass_status(
+        &mut self,
+        client: &LiveExecutionClient,
+        report: ExecutionMassStatus,
+    ) {
+        if report.client_id != client.client_id()
+            || report.account_id != client.account_id()
+            || report.venue != client.venue()
+        {
+            log::error!(
+                "Recovery mass status ownership mismatch for {}",
+                client.client_id()
+            );
+            return;
+        }
+        let report_id = report.report_id;
+        // The manager applies this synchronously; its async compatibility API
+        // performs no venue I/O and owns the existing exact-fill deduplication.
+        let result = self
+            .exec_manager
+            .reconcile_execution_mass_status(report, self.kernel.exec_engine.clone())
+            .await;
+        for external in result.external_orders {
+            self.kernel.exec_engine.borrow().register_external_order(
+                external.client_order_id,
+                external.venue_order_id,
+                external.instrument_id,
+                external.strategy_id,
+                external.ts_init,
+            );
+        }
+        client.on_mass_status_reconciled(report_id);
     }
 
     fn start_open_order_report_check(&mut self) -> Option<OpenOrderReportTask> {
@@ -2746,6 +2861,7 @@ struct ReconciliationCheckIntervals {
 }
 
 struct ReconciliationCheckState<'a> {
+    mass_status_pending: bool,
     last_inflight_check: &'a mut dst::time::Instant,
     last_open_check: &'a mut dst::time::Instant,
     last_position_check: &'a mut dst::time::Instant,
@@ -4292,6 +4408,7 @@ mod tests {
                 position: Duration::ZERO,
             },
             &mut ReconciliationCheckState {
+                mass_status_pending: false,
                 last_inflight_check: &mut last_inflight_check,
                 last_open_check: &mut last_open_check,
                 last_position_check: &mut last_position_check,

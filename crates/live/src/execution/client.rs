@@ -33,7 +33,7 @@ use nautilus_common::{
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -308,7 +308,7 @@ impl ExecutionClient for LiveExecutionClient {
 
     #[expect(
         clippy::await_holding_refcell_ref,
-        reason = "report generation uses a shared client handle during lifecycle-controlled calls"
+        reason = "report generation uses a shared client handle while the live loop keeps running"
     )]
     async fn generate_mass_status(
         &self,
@@ -318,6 +318,14 @@ impl ExecutionClient for LiveExecutionClient {
             .borrow()
             .generate_mass_status(lookback_mins)
             .await
+    }
+
+    fn requires_mass_status_reconciliation(&self) -> bool {
+        self.client.borrow().requires_mass_status_reconciliation()
+    }
+
+    fn on_mass_status_reconciled(&self, report_id: UUID4) {
+        self.client.borrow().on_mass_status_reconciled(report_id);
     }
 
     fn register_external_order(
