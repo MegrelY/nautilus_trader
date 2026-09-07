@@ -140,7 +140,7 @@ mod state;
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
 use config::{LiveNodeConfig, PluginConfig, validate_live_environment};
-use mass_recovery::MassStatusRetryState;
+use mass_recovery::{MassStatusActivity, MassStatusRetryState};
 pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsDelta, RunnerMetricsSnapshot};
 use metrics::{RunnerChannelQueueDepths, RunnerMetricChannel, RunnerMetrics};
 use state::{EngineConnectionStatus, RunningTransition};
@@ -166,6 +166,7 @@ pub struct LiveNode {
     handle: LiveNodeHandle,
     exec_manager: ExecutionManager,
     exec_clients: Vec<LiveExecutionClient>,
+    mass_status_activity: MassStatusActivity,
     external_msgbus: Option<ExternalMessageBusIngress>,
     shutdown_deadline: Option<dst::time::Instant>,
     #[cfg(feature = "plugin")]
@@ -192,6 +193,7 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients,
+            mass_status_activity: MassStatusActivity::default(),
             external_msgbus,
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
@@ -264,6 +266,7 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients: Vec::new(),
+            mass_status_activity: MassStatusActivity::default(),
             external_msgbus: None,
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
@@ -1286,6 +1289,11 @@ impl LiveNode {
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = self.state() == NodeState::Running;
+            if mass_recovery.task.as_ref().is_some_and(|task| {
+                !is_running || !task.client.requires_mass_status_reconciliation()
+            }) {
+                drop(mass_recovery.finish(dst::time::Instant::now()));
+            }
 
             tokio::select! {
                 biased;
@@ -1329,10 +1337,10 @@ impl LiveNode {
                     }
                 }, if mass_recovery.task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
-                    if let Some(client) = mass_recovery.finish(maintenance_start) {
+                    if let Some((client, captured_revision)) = mass_recovery.finish(maintenance_start) {
                         match result {
                             ReportTaskOutcome::Completed(Ok(Some(report))) => {
-                                self.apply_recovery_mass_status(&client, report).await;
+                                self.apply_recovery_mass_status(&client, report, captured_revision).await;
                             }
                             ReportTaskOutcome::Completed(Ok(None)) => log::warn!(
                                 "Recovery mass status unavailable from {}", client.client_id()),
@@ -1465,7 +1473,7 @@ impl LiveNode {
                         && position_report_task.is_none()
                     {
                         mass_recovery.start_due(
-                            &self.exec_clients, now, self.config.timeout_reconciliation,
+                            &self.exec_clients, &self.mass_status_activity, now, self.config.timeout_reconciliation,
                             self.config.exec_engine.reconciliation_lookback_mins.map(u64::from),
                         );
                     }
@@ -1737,6 +1745,7 @@ impl LiveNode {
         );
 
         for event in events {
+            self.mass_status_activity.order(event, &self.exec_clients);
             self.exec_manager
                 .record_local_activity(event.client_order_id());
             if let OrderEventAny::Filled(fill) = event {
@@ -1751,6 +1760,7 @@ impl LiveNode {
     }
 
     fn process_exec_event(&mut self, event: ExecutionEvent) {
+        self.mass_status_activity.event(&event, &self.exec_clients);
         let Some(close_ids) = self.observe_exec_event_before_dispatch(&event) else {
             return;
         };
@@ -2210,6 +2220,7 @@ impl LiveNode {
     }
 
     fn observe_exec_command_before_dispatch(&mut self, cmd: &TradingCommand) {
+        self.mass_status_activity.command(cmd, &self.exec_clients);
         match cmd {
             TradingCommand::SubmitOrder(submit) => {
                 self.exec_manager.register_inflight(submit.client_order_id);
@@ -2562,7 +2573,19 @@ impl LiveNode {
         &mut self,
         client: &LiveExecutionClient,
         report: ExecutionMassStatus,
+        captured_revision: u64,
     ) {
+        if !client.requires_mass_status_reconciliation()
+            || !self
+                .mass_status_activity
+                .unchanged(client, captured_revision)
+        {
+            log::warn!(
+                "Discarding recovery mass status for {}: recovery resolved or execution activity changed during collection",
+                client.client_id()
+            );
+            return;
+        }
         if report.client_id != client.client_id()
             || report.account_id != client.account_id()
             || report.venue != client.venue()

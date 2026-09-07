@@ -17,8 +17,16 @@
 
 use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
-use nautilus_common::{clients::ExecutionClient, live::dst};
-use nautilus_model::{identifiers::ClientId, reports::ExecutionMassStatus};
+use nautilus_common::{
+    clients::ExecutionClient,
+    live::dst,
+    messages::{ExecutionEvent, ExecutionReport, execution::TradingCommand},
+};
+use nautilus_model::{
+    events::OrderEventAny,
+    identifiers::{AccountId, ClientId, Venue},
+    reports::ExecutionMassStatus,
+};
 
 use super::ReportTaskOutcome;
 use crate::execution::client::LiveExecutionClient;
@@ -29,8 +37,100 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 type MassStatusReportFuture =
     Pin<Box<dyn Future<Output = ReportTaskOutcome<anyhow::Result<Option<ExecutionMassStatus>>>>>>;
 
+/// Monotonic local receipt revisions prevent an old account snapshot from
+/// reversing an order/fill processed while its HTTP collection was pending.
+#[derive(Debug, Default)]
+pub(super) struct MassStatusActivity {
+    revisions: HashMap<ClientId, u64>,
+}
+
+impl MassStatusActivity {
+    pub(super) fn revision(&self, client: &LiveExecutionClient) -> u64 {
+        self.revisions
+            .get(&client.client_id())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn unchanged(&self, client: &LiveExecutionClient, captured: u64) -> bool {
+        captured != u64::MAX && captured == self.revision(client)
+    }
+
+    fn mark(&mut self, client_id: ClientId) {
+        let revision = self.revisions.entry(client_id).or_default();
+        *revision = revision.saturating_add(1);
+    }
+
+    fn scope(&mut self, account: Option<AccountId>, venue: Venue, clients: &[LiveExecutionClient]) {
+        for client in clients {
+            if account.is_none_or(|account| account == client.account_id())
+                && client.handles_order_venue(venue)
+            {
+                self.mark(client.client_id());
+            }
+        }
+    }
+
+    pub(super) fn order(&mut self, event: &OrderEventAny, clients: &[LiveExecutionClient]) {
+        self.scope(event.account_id(), event.instrument_id().venue, clients);
+    }
+
+    pub(super) fn event(&mut self, event: &ExecutionEvent, clients: &[LiveExecutionClient]) {
+        match event {
+            ExecutionEvent::Order(event) => self.order(event, clients),
+            ExecutionEvent::OrderSubmittedBatch(batch) => {
+                for event in &batch.events {
+                    self.scope(Some(event.account_id), event.instrument_id.venue, clients);
+                }
+            }
+            ExecutionEvent::OrderAcceptedBatch(batch) => {
+                for event in &batch.events {
+                    self.scope(Some(event.account_id), event.instrument_id.venue, clients);
+                }
+            }
+            ExecutionEvent::OrderCanceledBatch(batch) => {
+                for event in &batch.events {
+                    self.scope(event.account_id, event.instrument_id.venue, clients);
+                }
+            }
+            ExecutionEvent::Report(report) => match report {
+                ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => {
+                    self.scope(Some(report.account_id), report.instrument_id.venue, clients)
+                }
+                ExecutionReport::Fill(report) => {
+                    self.scope(Some(report.account_id), report.instrument_id.venue, clients)
+                }
+                ExecutionReport::Position(report) => {
+                    self.scope(Some(report.account_id), report.instrument_id.venue, clients)
+                }
+                ExecutionReport::MassStatus(report) => {
+                    self.scope(Some(report.account_id), report.venue, clients)
+                }
+            },
+            // Collection itself refreshes account balances; those do not prove
+            // an order/position change and must not invalidate every request.
+            ExecutionEvent::Account(_) => {}
+        }
+    }
+
+    pub(super) fn command(&mut self, command: &TradingCommand, clients: &[LiveExecutionClient]) {
+        if matches!(
+            command,
+            TradingCommand::QueryAccount(_) | TradingCommand::QueryOrder(_)
+        ) {
+            return;
+        }
+        if let Some(client_id) = command.client_id() {
+            self.mark(client_id);
+        } else {
+            self.scope(None, command.instrument_id().venue, clients);
+        }
+    }
+}
+
 pub(super) struct MassStatusReportTask {
     pub(super) client: LiveExecutionClient,
+    activity_revision: u64,
     pub(super) future: MassStatusReportFuture,
 }
 
@@ -71,6 +171,7 @@ impl MassStatusRetryState {
     pub(super) fn start_due(
         &mut self,
         clients: &[LiveExecutionClient],
+        activity: &MassStatusActivity,
         now: dst::time::Instant,
         timeout: Duration,
         lookback_mins: Option<u64>,
@@ -98,6 +199,7 @@ impl MassStatusRetryState {
             let deadline = now + timeout;
             self.task = Some(MassStatusReportTask {
                 client: client.clone(),
+                activity_revision: activity.revision(client),
                 future: Box::pin(async move {
                     let remaining = deadline.saturating_duration_since(dst::time::Instant::now());
                     match dst::time::timeout(
@@ -117,7 +219,7 @@ impl MassStatusRetryState {
 
     // Drop the future before touching the client so cancellation releases its
     // shared report borrow and pending instrument updates can be applied.
-    pub(super) fn finish(&mut self, now: dst::time::Instant) -> Option<LiveExecutionClient> {
+    pub(super) fn finish(&mut self, now: dst::time::Instant) -> Option<(LiveExecutionClient, u64)> {
         let task = self.task.take()?;
         let client = task.client;
         drop(task.future);
@@ -125,7 +227,7 @@ impl MassStatusRetryState {
         if let Some(schedule) = self.schedules.get_mut(&client.client_id()) {
             schedule.completed(now);
         }
-        Some(client)
+        Some((client, task.activity_revision))
     }
 }
 
@@ -252,11 +354,18 @@ mod tests {
         let clients = vec![client.clone()];
         let mut retries = MassStatusRetryState::new();
         let now = dst::time::Instant::now();
-        retries.start_due(&clients, now, Duration::from_secs(30), None);
+        retries.start_due(
+            &clients,
+            &MassStatusActivity::default(),
+            now,
+            Duration::from_secs(30),
+            None,
+        );
         assert!(retries.task.is_none());
         advance_clock(INITIAL_RETRY_DELAY).await;
         retries.start_due(
             &clients,
+            &MassStatusActivity::default(),
             dst::time::Instant::now(),
             Duration::from_secs(30),
             None,
@@ -270,7 +379,8 @@ mod tests {
         assert_eq!(collected.get(), 1);
         assert!(applied.borrow().is_empty());
         let result = task.future.as_mut().await;
-        let completed_client = retries.finish(dst::time::Instant::now()).unwrap();
+        let (completed_client, captured_revision) =
+            retries.finish(dst::time::Instant::now()).unwrap();
         let ReportTaskOutcome::Completed(Ok(Some(report))) = result else {
             panic!("expected collected report");
         };
@@ -286,15 +396,16 @@ mod tests {
         .unwrap();
         let mut wrong_account = report.clone();
         wrong_account.account_id = AccountId::from("OTHER-001");
-        node.apply_recovery_mass_status(&completed_client, wrong_account)
+        node.apply_recovery_mass_status(&completed_client, wrong_account, captured_revision)
             .await;
         assert!(applied.borrow().is_empty());
-        node.apply_recovery_mass_status(&completed_client, report)
+        node.apply_recovery_mass_status(&completed_client, report, captured_revision)
             .await;
         assert_eq!(&*applied.borrow(), &[report_id]);
         assert!(!requested.get());
         retries.start_due(
             &clients,
+            &MassStatusActivity::default(),
             dst::time::Instant::now() + MAX_RETRY_DELAY,
             Duration::from_secs(30),
             None,
@@ -321,6 +432,7 @@ mod tests {
         let clients = vec![client];
         retries.start_due(
             &clients,
+            &MassStatusActivity::default(),
             dst::time::Instant::now(),
             Duration::from_secs(1),
             None,
@@ -328,6 +440,7 @@ mod tests {
         advance_clock(INITIAL_RETRY_DELAY).await;
         retries.start_due(
             &clients,
+            &MassStatusActivity::default(),
             dst::time::Instant::now(),
             Duration::from_secs(1),
             None,
@@ -336,11 +449,12 @@ mod tests {
             retries.task.as_mut().unwrap().future.as_mut().await,
             ReportTaskOutcome::TimedOut
         ));
-        let mut client = retries.finish(dst::time::Instant::now()).unwrap();
+        let (mut client, _) = retries.finish(dst::time::Instant::now()).unwrap();
         client.stop().unwrap(); // Mutably borrows the underlying client after cancellation.
         assert!(applied.borrow().is_empty());
         retries.start_due(
             &clients,
+            &MassStatusActivity::default(),
             dst::time::Instant::now(),
             Duration::from_secs(1),
             None,
@@ -379,5 +493,75 @@ mod tests {
         assert_eq!(result.is_ok(), opt_in);
         assert!(applied.borrow().is_empty());
         assert_eq!(requested.get(), opt_in);
+    }
+
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn execution_activity_during_collection_discards_stale_snapshot() {
+        let requested = Rc::new(Cell::new(true));
+        let applied = Rc::new(RefCell::new(Vec::new()));
+        let client = LiveExecutionClient::new(Box::new(RecoveryClient {
+            requested: requested.clone(),
+            collected: Rc::new(Cell::new(0)),
+            applied: applied.clone(),
+        }));
+        let clients = vec![client.clone()];
+        let mut node = LiveNode::build(
+            "FreshRecoveryProof".to_string(),
+            Some(LiveNodeConfig::default()),
+        )
+        .unwrap();
+        let mut retries = MassStatusRetryState::new();
+        retries.start_due(
+            &clients,
+            &node.mass_status_activity,
+            dst::time::Instant::now(),
+            Duration::from_secs(30),
+            None,
+        );
+        advance_clock(INITIAL_RETRY_DELAY).await;
+        retries.start_due(
+            &clients,
+            &node.mass_status_activity,
+            dst::time::Instant::now(),
+            Duration::from_secs(30),
+            None,
+        );
+        let task = retries.task.as_mut().unwrap();
+        tokio::select! {
+            biased;
+            _ = task.future.as_mut() => panic!("report must still be pending"),
+            _ = dst::time::sleep(Duration::from_millis(100)) => {},
+        }
+        // An unrelated account does not prevent this recovery from progressing.
+        node.mass_status_activity.scope(
+            Some(AccountId::from("OTHER-001")),
+            client.venue(),
+            &clients,
+        );
+        assert!(node.mass_status_activity.unchanged(&client, 0));
+        // Same scope as a TP/SL fill received while collection is pending.
+        node.mass_status_activity
+            .scope(Some(client.account_id()), client.venue(), &clients);
+        let result = task.future.as_mut().await;
+        let (client, captured) = retries.finish(dst::time::Instant::now()).unwrap();
+        let ReportTaskOutcome::Completed(Ok(Some(report))) = result else {
+            panic!("expected report");
+        };
+        node.apply_recovery_mass_status(&client, report.clone(), captured)
+            .await;
+        assert!(applied.borrow().is_empty());
+        assert!(requested.get(), "a racing fill must leave recovery pending");
+        requested.set(false);
+        let current = node.mass_status_activity.revision(&client);
+        node.apply_recovery_mass_status(&client, report, current)
+            .await;
+        assert!(
+            applied.borrow().is_empty(),
+            "resolved recovery must discard late snapshots too"
+        );
     }
 }
