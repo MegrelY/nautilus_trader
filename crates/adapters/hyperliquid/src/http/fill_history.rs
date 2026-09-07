@@ -56,6 +56,10 @@ impl FillHistory {
             let key = fill_identity(value)?;
             if let Some(previous) = self.records.get(&key) {
                 if previous != value {
+                    // Neither version has authority when this snapshot
+                    // contradicts itself. Do not expose the first one as a
+                    // known report through an incomplete mass-status result.
+                    self.records.remove(&key);
                     return Err("Conflicting payloads for the same venue fill identity".into());
                 }
             } else {
@@ -64,9 +68,7 @@ impl FillHistory {
                 }
                 self.records.insert(key.clone(), value.clone());
             }
-            if page_keys.insert(key, time).is_some() {
-                return Err("Duplicate fill within one venue page".into());
-            }
+            page_keys.insert(key, time);
             self.oldest = Some(self.oldest.map_or(time, |oldest| oldest.min(time)));
             newest = newest.max(time);
         }
@@ -186,6 +188,14 @@ mod tests {
                 .unwrap_err()
                 .contains("Conflicting")
         );
+        assert_eq!(history.into_records().len(), 1_999);
+    }
+
+    #[test]
+    fn identical_duplicates_within_one_page_are_applied_once() {
+        let mut history = FillHistory::new(0, 10);
+        assert!(history.accept(json!([fill(1, 1), fill(1, 1)])).unwrap());
+        assert_eq!(history.into_records().len(), 1);
     }
 
     #[test]
