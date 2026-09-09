@@ -941,6 +941,7 @@ pub enum HyperliquidInfoRequestType {
 impl HyperliquidInfoRequestType {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::UserAbstraction => "userAbstraction",
             Self::Meta => "meta",
             Self::SpotMeta => "spotMeta",
             Self::MetaAndAssetCtxs => "metaAndAssetCtxs",

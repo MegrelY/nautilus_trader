@@ -129,8 +129,36 @@ impl HyperliquidIncompleteMassStatus {
         }
     }
 
-    pub(crate) fn with_native_perpetuals_complete(mut self, complete: bool) -> Self {
-        self.native_perpetuals_complete = complete;
+    pub(crate) fn prove_native_perpetual_scope(
+        mut self,
+        starting_mode: Option<&str>,
+        ending_mode: Option<&str>,
+        fresh_generation: bool,
+    ) -> Self {
+        let native = |id: nautilus_model::identifiers::InstrumentId| {
+            id.symbol.as_str().ends_with("-USD-PERP") && !id.symbol.as_str().contains(':')
+        };
+        self.native_perpetuals_complete = fresh_generation
+            && starting_mode.is_some_and(|mode| matches!(mode, "default" | "disabled"))
+            && starting_mode == ending_mode
+            && self.omitted_gap_count == 0
+            && !self.gaps.is_empty()
+            && self.gaps.iter().all(|gap| {
+                gap.source() == HyperliquidPrivateStateSource::SpotPositions
+                    && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
+                    && gap.unreserved_spot_token().is_some()
+            })
+            && self
+                .mass_status
+                .order_reports()
+                .values()
+                .all(|report| native(report.instrument_id))
+            && self
+                .mass_status
+                .fill_reports()
+                .values()
+                .flatten()
+                .all(|report| native(report.instrument_id));
         self
     }
 
@@ -230,6 +258,112 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn spot_isolation_requires_identity_standard_mode_and_complete_fresh_execution() {
+        use nautilus_model::identifiers::{AccountId, ClientId, Venue};
+        let status = || {
+            ExecutionMassStatus::new(
+                ClientId::from("HYPERLIQUID"),
+                AccountId::from("HYPERLIQUID-001"),
+                Venue::from("HYPERLIQUID"),
+                nautilus_core::UnixNanos::from(1),
+                None,
+            )
+        };
+        let gap = |source, kind, token| {
+            HyperliquidPrivateStateGap::new(source, kind, None, Some("NEW"), "missing")
+                .with_unreserved_spot_token(token)
+        };
+        let valid = gap(
+            HyperliquidPrivateStateSource::SpotPositions,
+            HyperliquidPrivateStateGapKind::UnknownInstrument,
+            Some(77),
+        );
+        for mode in ["default", "disabled"] {
+            let result = HyperliquidIncompleteMassStatus::new(status(), vec![valid.clone()], 0)
+                .prove_native_perpetual_scope(Some(mode), Some(mode), true);
+            assert!(result.native_perpetuals_complete());
+            assert_eq!(result.gaps().len(), 1);
+            assert!(!result.mass_status().position_reports_complete);
+        }
+        for (start, end, fresh, omitted, finding) in [
+            (
+                Some("unifiedAccount"),
+                Some("unifiedAccount"),
+                true,
+                0,
+                valid.clone(),
+            ),
+            (
+                Some("portfolioMargin"),
+                Some("portfolioMargin"),
+                true,
+                0,
+                valid.clone(),
+            ),
+            (
+                Some("default"),
+                Some("unifiedAccount"),
+                true,
+                0,
+                valid.clone(),
+            ),
+            (None, None, true, 0, valid.clone()),
+            (Some("default"), Some("default"), false, 0, valid.clone()),
+            (Some("default"), Some("default"), true, 1, valid.clone()),
+            (
+                Some("default"),
+                Some("default"),
+                true,
+                0,
+                gap(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    None,
+                ),
+            ),
+            (
+                Some("default"),
+                Some("default"),
+                true,
+                0,
+                gap(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    Some(0),
+                ),
+            ),
+            (
+                Some("default"),
+                Some("default"),
+                true,
+                0,
+                gap(
+                    HyperliquidPrivateStateSource::OpenOrders,
+                    HyperliquidPrivateStateGapKind::UnknownInstrument,
+                    Some(77),
+                ),
+            ),
+            (
+                Some("default"),
+                Some("default"),
+                true,
+                0,
+                gap(
+                    HyperliquidPrivateStateSource::SpotPositions,
+                    HyperliquidPrivateStateGapKind::ParseFailure,
+                    Some(77),
+                ),
+            ),
+        ] {
+            assert!(
+                !HyperliquidIncompleteMassStatus::new(status(), vec![finding], omitted)
+                    .prove_native_perpetual_scope(start, end, fresh)
+                    .native_perpetuals_complete()
+            );
+        }
+    }
 
     #[rstest]
     fn private_state_gap_cap_is_deterministic() {

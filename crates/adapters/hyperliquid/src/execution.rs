@@ -1028,11 +1028,6 @@ impl HyperliquidExecutionClient {
     }
 }
 
-fn is_native_perpetual(instrument_id: InstrumentId) -> bool {
-    let symbol = instrument_id.symbol.as_str();
-    symbol.ends_with("-USD-PERP") && !symbol.contains(':')
-}
-
 async fn execute_leverage_preflight(
     http_client: &HyperliquidHttpClient,
     connected: &AtomicBool,
@@ -2638,39 +2633,20 @@ impl ExecutionClient for HyperliquidExecutionClient {
             {
                 log::warn!("Reconciliation catalog refresh unavailable: {error}");
             }
-            let native_only = omitted_gap_count == 0
-                && !gaps.is_empty()
-                && gaps.iter().all(|gap| {
-                    gap.source() == HyperliquidPrivateStateSource::SpotPositions
-                        && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
-                        && gap.unreserved_spot_token().is_some()
-                })
-                && mass_status
-                    .order_reports()
-                    .values()
-                    .all(|report| is_native_perpetual(report.instrument_id))
-                && mass_status
-                    .fill_reports()
-                    .values()
-                    .flatten()
-                    .all(|report| is_native_perpetual(report.instrument_id));
-            let mode_safe = native_only
-                && starting_mode
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|mode| matches!(mode, "default" | "disabled"))
-                && self
-                    .http_client
-                    .info_user_abstraction(&account_address)
-                    .await
-                    .ok()
-                    == starting_mode;
-            let fresh = mode_safe
-                && crate::private_observation::read(self.config.environment, &account_address)
-                    .is_some_and(|current| current.generation == snapshot.generation);
+            let ending_mode = self
+                .http_client
+                .info_user_abstraction(&account_address)
+                .await
+                .ok();
+            let fresh = crate::private_observation::read(self.config.environment, &account_address)
+                .is_some_and(|current| current.generation == snapshot.generation);
             return Err(anyhow::Error::new(
                 HyperliquidIncompleteMassStatus::new(mass_status, gaps, omitted_gap_count)
-                    .with_native_perpetuals_complete(fresh),
+                    .prove_native_perpetual_scope(
+                        starting_mode.as_ref().and_then(serde_json::Value::as_str),
+                        ending_mode.as_ref().and_then(serde_json::Value::as_str),
+                        fresh,
+                    ),
             ));
         }
 
