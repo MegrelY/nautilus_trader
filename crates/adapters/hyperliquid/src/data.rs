@@ -319,26 +319,21 @@ impl HyperliquidDataClient {
             self.config.http_url(),
             self.config.proxy_url.clone(),
         );
+        let requested: AHashSet<_> = self
+            .config
+            .bootstrap_instrument_ids
+            .iter()
+            .copied()
+            .collect();
         let seeded = crate::catalog_handoff::take_catalog_handoff(&key).filter(|handoff| {
-            !handoff.instruments.is_empty()
-                && self.config.bootstrap_instrument_ids.iter().all(|id| {
-                    handoff
-                        .instruments
-                        .iter()
-                        .any(|instrument| instrument.id() == *id)
-                })
+            let available: AHashSet<_> = handoff.instruments.iter().map(Instrument::id).collect();
+            !handoff.instruments.is_empty() && requested.is_subset(&available)
         });
         let (instruments, execution_instruments) = if let Some(handoff) = seeded {
             let selected = handoff
                 .instruments
                 .iter()
-                .filter(|instrument| {
-                    self.config.bootstrap_instrument_ids.is_empty()
-                        || self
-                            .config
-                            .bootstrap_instrument_ids
-                            .contains(&instrument.id())
-                })
+                .filter(|instrument| requested.is_empty() || requested.contains(&instrument.id()))
                 .cloned()
                 .collect();
             (selected, handoff.instruments)
@@ -361,10 +356,8 @@ impl HyperliquidDataClient {
             }
         });
 
-        for instrument in &instruments {
-            self.http_client.cache_instrument(instrument);
-            self.ws_client.cache_instrument(instrument.clone());
-        }
+        self.http_client.cache_instruments(&instruments);
+        self.ws_client.cache_instruments_batch(&instruments);
 
         publish_catalog_handoff(
             CatalogHandoffKey::new(

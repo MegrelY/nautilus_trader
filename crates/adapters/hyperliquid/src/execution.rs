@@ -712,10 +712,8 @@ impl HyperliquidExecutionClient {
     }
 
     fn cache_execution_instruments(&self, instruments: &[InstrumentAny]) {
-        for instrument in instruments {
-            self.http_client.cache_instrument(instrument);
-            self.ws_client.cache_instrument(instrument.clone());
-        }
+        self.http_client.cache_instruments(instruments);
+        self.ws_client.cache_instruments_batch(instruments);
     }
 
     /// Promotes one instrument already admitted to the node cache into the

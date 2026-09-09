@@ -1494,60 +1494,52 @@ impl HyperliquidHttpClient {
     /// This is required for parsing orders, fills, and positions into reports.
     /// Any existing instrument with the same symbol will be replaced.
     pub fn cache_instrument(&self, instrument: &InstrumentAny) {
-        let full_symbol = instrument.symbol().inner();
-        let coin = instrument.raw_symbol().inner();
+        self.cache_instruments(std::slice::from_ref(instrument));
+    }
 
-        if let Some(asset_index) = instrument_asset_index(instrument) {
-            self.asset_indices.insert(full_symbol, asset_index);
+    /// Merges a catalog with one clone-and-swap per routing map.
+    /// Existing definitions and canonical first-write aliases are retained.
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        if instruments.is_empty() {
+            return;
         }
-
-        self.instruments.rcu(|m| {
-            m.insert(full_symbol, instrument.clone());
-            // HTTP responses only include coins, external code may lookup by coin
-            m.insert(coin, instrument.clone());
+        self.asset_indices.rcu(|m| {
+            for instrument in instruments {
+                if let Some(asset_index) = instrument_asset_index(instrument) {
+                    m.insert(instrument.symbol().inner(), asset_index);
+                }
+            }
         });
-
-        // Composite key allows disambiguating same coin across PERP and SPOT
-        if let Ok(product_type) = HyperliquidProductType::from_symbol(full_symbol.as_str()) {
-            self.instruments_by_coin.rcu(|m| {
+        self.instruments.rcu(|m| {
+            for instrument in instruments {
+                m.insert(instrument.symbol().inner(), instrument.clone());
+                // HTTP responses include coins; callers may use either key.
+                m.insert(instrument.raw_symbol().inner(), instrument.clone());
+            }
+        });
+        self.instruments_by_coin.rcu(|m| {
+            for instrument in instruments {
+                let full_symbol = instrument.symbol().inner();
+                let coin = instrument.raw_symbol().inner();
+                let Ok(product_type) = HyperliquidProductType::from_symbol(full_symbol.as_str())
+                else {
+                    log::warn!("Unable to determine product type for symbol: {full_symbol}");
+                    continue;
+                };
                 m.insert((coin, product_type), instrument.clone());
-
-                // Secondary alias key for two distinct callers:
-                //
-                // * Spot raw_symbols are either `@{pair_index}` or slash format
-                //   (e.g., "PURR/USDC"); spot balance/position reconciliation
-                //   maps the venue token name (e.g., "PURR") to instruments via
-                //   this alias.
-                // * Order submission paths split `instrument_id.symbol` on `-`
-                //   to derive a coin key. For HIP-3 perps with wildcard-bearing
-                //   venue names, the sanitized base in `instrument_id.symbol`
-                //   (e.g., "dex:STREAMABCDxxxx") differs from `raw_symbol` /
-                //   `coin` (e.g., "dex:STREAMABCD****"), so an alias on the
-                //   sanitized base lets that lookup resolve.
-                //
-                // For outcomes the alias is the `+<encoding>` token form
-                // (matching the `coin` field on `spotClearinghouseState`);
-                // for perps / spots it is the leading symbol segment.
-                // `cache_alias_for_symbol` keeps the two rules co-located so
-                // every caller derives the same key.
-                //
-                // First-write-wins guards against non-canonical spot pairs that
-                // share a base token overwriting the canonical instrument; the
-                // spot loader sorts canonical pairs first so the alias resolves
-                // to the canonical one. For standard perps `base == coin`, so
-                // the alias is a no-op.
-                if let Some(alias_ustr) = cache_alias_for_symbol(full_symbol.as_str())
+                // Token aliases identify spot holdings; sanitized aliases route
+                // HIP-3 instruments; outcome aliases use their +encoding token.
+                // Keep canonical spot pairs first, including across refreshes.
+                if let Some(alias) = cache_alias_for_symbol(full_symbol.as_str())
                     .map(|alias| Ustr::from(alias.as_str()))
                 {
-                    let key = (alias_ustr, product_type);
-                    if alias_ustr != coin && !m.contains_key(&key) {
+                    let key = (alias, product_type);
+                    if alias != coin && !m.contains_key(&key) {
                         m.insert(key, instrument.clone());
                     }
                 }
-            });
-        } else {
-            log::warn!("Unable to determine product type for symbol: {full_symbol}");
-        }
+            }
+        });
     }
 
     fn get_or_create_instrument(

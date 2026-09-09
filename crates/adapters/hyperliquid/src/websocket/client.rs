@@ -1098,13 +1098,23 @@ impl HyperliquidWebSocketClient {
     ///
     /// Any existing instrument with the same raw_symbol will be replaced.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
-        let coin = instrument.raw_symbol().inner();
-        self.instruments.insert(coin, instrument.clone());
+        self.cache_instruments_batch(std::slice::from_ref(&instrument));
+    }
 
-        // Before connect() the handler isn't running; this send will fail and that's expected
-        // because connect() replays the instruments via InitializeInstruments
+    /// Merges definitions without copying the entire cache for each item.
+    /// The running handler receives the same ordered batch and retains other keys.
+    pub fn cache_instruments_batch(&self, instruments: &[InstrumentAny]) {
+        if instruments.is_empty() {
+            return;
+        }
+        self.instruments.rcu(|m| {
+            for instrument in instruments {
+                m.insert(instrument.raw_symbol().inner(), instrument.clone());
+            }
+        });
+        // Before connect the receiver is absent; connect replays this cache.
         if let Ok(cmd_tx) = self.cmd_tx.try_read() {
-            let _ = cmd_tx.send(HandlerCommand::UpdateInstrument(instrument));
+            let _ = cmd_tx.send(HandlerCommand::InitializeInstruments(instruments.to_vec()));
         }
     }
 
