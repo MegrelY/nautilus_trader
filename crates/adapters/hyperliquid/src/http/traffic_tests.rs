@@ -61,6 +61,11 @@ async fn surcharge_debt_reserve_and_shared_cooldown_are_preserved() {
     limiter.debit_extra(100).await;
     assert_eq!(limiter.snapshot().await.tokens, 0);
     assert!(
+        tokio::time::timeout(Duration::from_millis(100), limiter.acquire_bounded(1, true))
+            .await
+            .expect("read debt must preserve protective capacity")
+    );
+    assert!(
         tokio::time::timeout(Duration::from_millis(50), limiter.acquire(1))
             .await
             .is_err(),

@@ -31,8 +31,8 @@ use crate::{
 
 #[derive(Debug)]
 pub struct WeightedLimiter {
-    capacity: f64,       // tokens per minute (e.g., 1200)
-    refill_per_sec: f64, // capacity / 60
+    capacity: f64,       // maximum burst across both lanes
+    refill_per_sec: f64, // shared configured weight per second
     state: tokio::sync::Mutex<State>,
     reserve: f64,
     queue: tokio::sync::Semaphore,
@@ -41,6 +41,7 @@ pub struct WeightedLimiter {
 #[derive(Debug)]
 struct State {
     tokens: f64,
+    protective_tokens: f64,
     last_refill: Instant,
     cooldown: Instant,
 }
@@ -59,7 +60,8 @@ impl WeightedLimiter {
             reserve: reserve as f64,
             queue: tokio::sync::Semaphore::new(64),
             state: tokio::sync::Mutex::new(State {
-                tokens: cap,
+                tokens: cap - reserve as f64,
+                protective_tokens: reserve as f64,
                 last_refill: Instant::now(),
                 cooldown: Instant::now(),
             }),
@@ -106,16 +108,33 @@ impl WeightedLimiter {
     async fn acquire_chunk(&self, need: f64, action: bool) {
         loop {
             let mut st = self.state.lock().await;
-            Self::refill_locked(&mut st, self.refill_per_sec, self.capacity);
+            self.refill_locked(&mut st);
 
             let cooldown = st.cooldown.saturating_duration_since(Instant::now());
-            let reserve = if action { 0.0 } else { self.reserve };
-            if st.tokens >= need + reserve && cooldown.is_zero() {
-                st.tokens -= need;
+            let available = if action {
+                st.tokens.max(0.0) + st.protective_tokens
+            } else {
+                st.tokens
+            };
+            if available >= need && cooldown.is_zero() {
+                let ordinary = if action {
+                    need.min(st.tokens.max(0.0))
+                } else {
+                    need
+                };
+                st.tokens -= ordinary;
+                st.protective_tokens -= need - ordinary;
                 return;
             }
-            let deficit = (need + reserve - st.tokens).max(0.0);
-            let secs = deficit / self.refill_per_sec;
+            let deficit = (need - available).max(0.0);
+            let rate = if action {
+                self.refill_per_sec
+            } else {
+                self.refill_per_sec * (1.0 - self.reserve / self.capacity)
+            };
+            // Recheck when either lane refills; ordinary response debt must
+            // never delay an action which fits the independent reserve.
+            let secs = (deficit / rate).min(1.0);
             drop(st);
             tokio::time::sleep(Duration::from_secs_f64(secs.max(0.01)).max(cooldown)).await;
         }
@@ -127,24 +146,30 @@ impl WeightedLimiter {
             return;
         }
         let mut st = self.state.lock().await;
-        Self::refill_locked(&mut st, self.refill_per_sec, self.capacity);
+        self.refill_locked(&mut st);
         st.tokens -= extra as f64; // Keep response surcharge debt; never forgive it.
     }
 
     pub async fn snapshot(&self) -> RateLimitSnapshot {
         let mut st = self.state.lock().await;
-        Self::refill_locked(&mut st, self.refill_per_sec, self.capacity);
+        self.refill_locked(&mut st);
         RateLimitSnapshot {
             capacity: self.capacity as u32,
-            tokens: st.tokens.max(0.0) as u32,
+            tokens: (st.tokens + st.protective_tokens).max(0.0) as u32,
         }
     }
 
-    fn refill_locked(st: &mut State, per_sec: f64, cap: f64) {
-        let dt = Instant::now().duration_since(st.last_refill).as_secs_f64();
+    fn refill_locked(&self, st: &mut State) {
+        let now = Instant::now();
+        let dt = now.duration_since(st.last_refill).as_secs_f64();
         if dt > 0.0 {
-            st.tokens = (st.tokens + dt * per_sec).min(cap);
-            st.last_refill = Instant::now();
+            // Split, rather than duplicate, the configured refill budget.
+            // Reserved capacity cannot be spent by read-response surcharges.
+            let protective_rate = self.refill_per_sec * self.reserve / self.capacity;
+            st.tokens = (st.tokens + dt * (self.refill_per_sec - protective_rate))
+                .min(self.capacity - self.reserve);
+            st.protective_tokens = (st.protective_tokens + dt * protective_rate).min(self.reserve);
+            st.last_refill = now;
         }
     }
 }
