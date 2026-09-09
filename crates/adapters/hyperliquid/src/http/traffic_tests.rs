@@ -79,3 +79,23 @@ async fn surcharge_debt_reserve_and_shared_cooldown_are_preserved() {
             .is_err()
     );
 }
+
+#[test]
+fn recent_trades_charge_the_documented_response_surcharge() {
+    let request = InfoRequest::recent_trades("BTC");
+    assert_eq!(info_base_weight(&request), 20);
+    assert_eq!(
+        info_extra_weight(
+            &request,
+            &serde_json::json!(vec![serde_json::json!({}); 19])
+        ),
+        0
+    );
+    assert_eq!(
+        info_extra_weight(
+            &request,
+            &serde_json::json!(vec![serde_json::json!({}); 40])
+        ),
+        2
+    );
+}
