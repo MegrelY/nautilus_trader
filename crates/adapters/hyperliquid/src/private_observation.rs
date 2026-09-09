@@ -44,3 +44,27 @@ pub fn read(environment: HyperliquidEnvironment, user: &str) -> Option<PrivateAc
         .find(|(env, address, _)| *env == environment && address.eq_ignore_ascii_case(user))?;
     client.read_private_observation(user, Duration::from_secs(30))
 }
+
+/// A narrow reconciliation proof is usable only on its originating connection
+/// generation. Possessing this guard grants no account mutation authority.
+#[derive(Debug, Clone)]
+pub struct PrivateObservationGuard {
+    environment: HyperliquidEnvironment,
+    user: String,
+    generation: u64,
+}
+
+impl PrivateObservationGuard {
+    pub(crate) fn new(environment: HyperliquidEnvironment, user: &str, generation: u64) -> Self {
+        Self {
+            environment,
+            user: user.to_owned(),
+            generation,
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        read(self.environment, &self.user)
+            .is_some_and(|observation| observation.generation == self.generation)
+    }
+}

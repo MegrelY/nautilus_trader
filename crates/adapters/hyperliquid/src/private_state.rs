@@ -113,6 +113,7 @@ pub struct HyperliquidIncompleteMassStatus {
     gaps: Vec<HyperliquidPrivateStateGap>,
     omitted_gap_count: usize,
     native_perpetuals_complete: bool,
+    native_observation_guard: Option<crate::private_observation::PrivateObservationGuard>,
 }
 
 impl HyperliquidIncompleteMassStatus {
@@ -126,6 +127,7 @@ impl HyperliquidIncompleteMassStatus {
             gaps,
             omitted_gap_count,
             native_perpetuals_complete: false,
+            native_observation_guard: None,
         }
     }
 
@@ -160,6 +162,29 @@ impl HyperliquidIncompleteMassStatus {
                 .flatten()
                 .all(|report| native(report.instrument_id));
         self
+    }
+
+    pub(crate) fn bind_native_observation(
+        mut self,
+        environment: crate::common::enums::HyperliquidEnvironment,
+        user: &str,
+        generation: u64,
+    ) -> Self {
+        if self.native_perpetuals_complete {
+            self.native_observation_guard =
+                Some(crate::private_observation::PrivateObservationGuard::new(
+                    environment,
+                    user,
+                    generation,
+                ));
+        }
+        self
+    }
+
+    pub fn native_observation_guard(
+        &self,
+    ) -> Option<crate::private_observation::PrivateObservationGuard> {
+        self.native_observation_guard.clone()
     }
 
     /// Does not establish spot ownership, collateral value, or account-wide completeness.

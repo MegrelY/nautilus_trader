@@ -2646,6 +2646,11 @@ impl ExecutionClient for HyperliquidExecutionClient {
                         starting_mode.as_ref().and_then(serde_json::Value::as_str),
                         ending_mode.as_ref().and_then(serde_json::Value::as_str),
                         fresh,
+                    )
+                    .bind_native_observation(
+                        self.config.environment,
+                        &account_address,
+                        snapshot.generation,
                     ),
             ));
         }
