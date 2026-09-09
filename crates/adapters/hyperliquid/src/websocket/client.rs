@@ -1552,6 +1552,17 @@ impl HyperliquidWebSocketClient {
         Ok(())
     }
 
+    pub(crate) fn read_private_observation(
+        &self,
+        user: &str,
+        age: Duration,
+    ) -> Option<crate::private_observation::PrivateAccountObservation> {
+        if !self.is_active() {
+            return None;
+        }
+        self.private_state_snapshots.read_observation(user, age)
+    }
+
     /// Waits for a generation-consistent complete private-state snapshot.
     ///
     /// Subscriptions are installed once and retained so the transport's normal

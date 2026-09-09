@@ -57,6 +57,7 @@ pub mod factories;
 pub mod http;
 mod network_metrics;
 pub mod outcome_settlement;
+pub mod private_observation;
 pub mod private_state;
 pub mod signing;
 pub mod websocket;

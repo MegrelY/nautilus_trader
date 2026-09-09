@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 pub mod client;
+mod discovery;
 pub mod error;
 mod fill_history;
 pub mod models;

@@ -47,6 +47,7 @@ pub struct HyperliquidPrivateStateGap {
     dex: Option<String>,
     identity: Option<String>,
     detail: String,
+    independent_spot_token: Option<u32>,
 }
 
 impl HyperliquidPrivateStateGap {
@@ -63,6 +64,7 @@ impl HyperliquidPrivateStateGap {
             dex: dex.map(|value| bound_text(value, PRIVATE_STATE_IDENTITY_LIMIT)),
             identity: identity.map(|value| bound_text(value, PRIVATE_STATE_IDENTITY_LIMIT)),
             detail: bound_text(detail.as_ref(), PRIVATE_STATE_DETAIL_LIMIT),
+            independent_spot_token: None,
         }
     }
 
@@ -86,6 +88,17 @@ impl HyperliquidPrivateStateGap {
         self.identity.as_deref()
     }
 
+    pub(crate) fn with_unreserved_spot_token(mut self, token: Option<u32>) -> Self {
+        self.independent_spot_token = token.filter(|token| *token != 0);
+        self
+    }
+
+    /// A parsed positive spot balance with a concrete non-USDC token and no hold.
+    /// Account mode and complete execution coverage must be proven separately.
+    pub fn unreserved_spot_token(&self) -> Option<u32> {
+        self.independent_spot_token
+    }
+
     #[must_use]
     pub fn detail(&self) -> &str {
         &self.detail
@@ -99,6 +112,7 @@ pub struct HyperliquidIncompleteMassStatus {
     mass_status: ExecutionMassStatus,
     gaps: Vec<HyperliquidPrivateStateGap>,
     omitted_gap_count: usize,
+    native_perpetuals_complete: bool,
 }
 
 impl HyperliquidIncompleteMassStatus {
@@ -111,7 +125,18 @@ impl HyperliquidIncompleteMassStatus {
             mass_status,
             gaps,
             omitted_gap_count,
+            native_perpetuals_complete: false,
         }
+    }
+
+    pub(crate) fn with_native_perpetuals_complete(mut self, complete: bool) -> Self {
+        self.native_perpetuals_complete = complete;
+        self
+    }
+
+    /// Does not establish spot ownership, collateral value, or account-wide completeness.
+    pub const fn native_perpetuals_complete(&self) -> bool {
+        self.native_perpetuals_complete
     }
 
     #[must_use]

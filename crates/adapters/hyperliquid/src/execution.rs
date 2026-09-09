@@ -373,6 +373,7 @@ pub struct HyperliquidExecutionClient {
     http_client: HyperliquidHttpClient,
     ws_client: HyperliquidWebSocketClient,
     catalog_initialized: AtomicBool,
+    catalog_refresh_attempt: tokio::sync::Mutex<Option<std::time::Instant>>,
     pending_tasks: TaskHandles,
     ws_stream_handle: Option<JoinHandle<()>>,
     settlement_poll_handle: Option<JoinHandle<()>>,
@@ -650,6 +651,7 @@ impl HyperliquidExecutionClient {
             http_client,
             ws_client,
             catalog_initialized: AtomicBool::new(false),
+            catalog_refresh_attempt: tokio::sync::Mutex::new(None),
             pending_tasks: TaskHandles::default(),
             ws_stream_handle: None,
             settlement_poll_handle: None,
@@ -993,9 +995,42 @@ impl HyperliquidExecutionClient {
         (snapshot, completeness)
     }
 
+    async fn refresh_unknown_catalog(&self) -> anyhow::Result<()> {
+        let mut attempt = self.catalog_refresh_attempt.lock().await;
+        if attempt.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60)) {
+            return Ok(());
+        }
+        // Record failed attempts too. Reconciliation owns retries; no timer.
+        *attempt = Some(std::time::Instant::now());
+        let instruments = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.http_client.request_instruments(),
+        )
+        .await??;
+        anyhow::ensure!(!instruments.is_empty(), "refreshed catalog is empty");
+        let sender = nautilus_common::live::runner::try_get_data_event_sender()
+            .ok_or_else(|| anyhow::anyhow!("catalog refresh node receiver unavailable"))?;
+        self.cache_execution_instruments(&instruments);
+        for instrument in instruments {
+            // Add/replace current definitions without deleting historical ones.
+            sender
+                .send(nautilus_common::messages::DataEvent::Instrument(instrument))
+                .map_err(|_| anyhow::anyhow!("catalog refresh node receiver closed"))?;
+        }
+        log::info!(
+            "Refreshed reconciliation catalog after unknown instrument; next recovery retries parsing"
+        );
+        Ok(())
+    }
+
     fn abort_pending_tasks(&self) {
         self.pending_tasks.abort_all();
     }
+}
+
+fn is_native_perpetual(instrument_id: InstrumentId) -> bool {
+    let symbol = instrument_id.symbol.as_str();
+    symbol.ends_with("-USD-PERP") && !symbol.contains(':')
 }
 
 async fn execute_leverage_preflight(
@@ -2354,6 +2389,17 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 .parse_order_status_report_snapshot(&snapshot.open_orders, None)
                 .context("failed to parse order status snapshot")?;
             let reports = completeness.absorb(batch);
+            if !completeness.is_complete() {
+                let (resolved, gaps, omitted) = completeness.into_parts();
+                if gaps
+                    .iter()
+                    .any(|gap| gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument)
+                    && let Err(error) = self.refresh_unknown_catalog().await
+                {
+                    log::warn!("Reconciliation catalog refresh unavailable: {error}");
+                }
+                completeness = HyperliquidPrivateStateBatch::from_parts(resolved, gaps, omitted);
+            }
             require_complete_snapshot_reports("order status reports", reports, completeness)?
         };
 
@@ -2424,6 +2470,17 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 )
                 .context("failed to parse position status snapshot")?;
             let reports = completeness.absorb(batch);
+            if !completeness.is_complete() {
+                let (resolved, gaps, omitted) = completeness.into_parts();
+                if gaps
+                    .iter()
+                    .any(|gap| gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument)
+                    && let Err(error) = self.refresh_unknown_catalog().await
+                {
+                    log::warn!("Reconciliation catalog refresh unavailable: {error}");
+                }
+                completeness = HyperliquidPrivateStateBatch::from_parts(resolved, gaps, omitted);
+            }
             require_complete_snapshot_reports("position status reports", reports, completeness)?
         };
 
@@ -2437,6 +2494,13 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
         let account_address = self.get_account_address()?;
+        // Mode brackets a mass observation only for scoped safety proof; an
+        // unavailable mode cannot turn otherwise complete reconciliation into a gap.
+        let starting_mode = self
+            .http_client
+            .info_user_abstraction(&account_address)
+            .await
+            .ok();
         let fill_start = lookback_mins.map(|mins| {
             UnixNanos::from(
                 ts_init
@@ -2567,11 +2631,47 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         if !completeness.is_complete() {
             let (_, gaps, omitted_gap_count) = completeness.into_parts();
-            return Err(anyhow::Error::new(HyperliquidIncompleteMassStatus::new(
-                mass_status,
-                gaps,
-                omitted_gap_count,
-            )));
+            if gaps
+                .iter()
+                .any(|gap| gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument)
+                && let Err(error) = self.refresh_unknown_catalog().await
+            {
+                log::warn!("Reconciliation catalog refresh unavailable: {error}");
+            }
+            let native_only = omitted_gap_count == 0
+                && !gaps.is_empty()
+                && gaps.iter().all(|gap| {
+                    gap.source() == HyperliquidPrivateStateSource::SpotPositions
+                        && gap.kind() == HyperliquidPrivateStateGapKind::UnknownInstrument
+                        && gap.unreserved_spot_token().is_some()
+                })
+                && mass_status
+                    .order_reports()
+                    .values()
+                    .all(|report| is_native_perpetual(report.instrument_id))
+                && mass_status
+                    .fill_reports()
+                    .values()
+                    .flatten()
+                    .all(|report| is_native_perpetual(report.instrument_id));
+            let mode_safe = native_only
+                && starting_mode
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|mode| matches!(mode, "default" | "disabled"))
+                && self
+                    .http_client
+                    .info_user_abstraction(&account_address)
+                    .await
+                    .ok()
+                    == starting_mode;
+            let fresh = mode_safe
+                && crate::private_observation::read(self.config.environment, &account_address)
+                    .is_some_and(|current| current.generation == snapshot.generation);
+            return Err(anyhow::Error::new(
+                HyperliquidIncompleteMassStatus::new(mass_status, gaps, omitted_gap_count)
+                    .with_native_perpetuals_complete(fresh),
+            ));
         }
 
         mass_status.position_reports_complete = true;
@@ -2592,6 +2692,11 @@ impl HyperliquidExecutionClient {
 
         // Connect and subscribe before spawning the event loop
         ws_client.connect().await?;
+        crate::private_observation::register(
+            self.config.environment,
+            &subscription_address,
+            ws_client.clone(),
+        );
         ws_client
             .subscribe_order_updates(&subscription_address)
             .await?;

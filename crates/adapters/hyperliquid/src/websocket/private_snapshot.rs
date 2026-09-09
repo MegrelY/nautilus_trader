@@ -47,6 +47,7 @@ struct SnapshotState {
     open_orders: AHashMap<String, Vec<Value>>,
     clearinghouse_states: Option<AHashMap<String, Value>>,
     spot_state: Option<Value>,
+    last_account_frame: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +184,7 @@ impl PrivateStateSnapshotCache {
             HyperliquidWsMessage::AllDexsClearinghouseState { data }
                 if request.user.eq_ignore_ascii_case(&data.user) =>
             {
+                state.last_account_frame = Some(std::time::Instant::now());
                 state.clearinghouse_states = Some(match &data.clearinghouse_states {
                     WsAllDexsClearinghouseStateData::Entries(entries) => {
                         entries.iter().cloned().collect()
@@ -270,10 +272,40 @@ impl PrivateStateSnapshotCache {
         }
     }
 
+    pub(crate) fn read_observation(
+        &self,
+        user: &str,
+        maximum_age: Duration,
+    ) -> Option<crate::private_observation::PrivateAccountObservation> {
+        let state = self.inner.state.lock().ok()?;
+        let request = state.request.as_ref()?;
+        if !request.user.eq_ignore_ascii_case(user)
+            || request.dexes.is_empty()
+            || state.last_account_frame?.elapsed() >= maximum_age
+        {
+            return None;
+        }
+        let generation = state.generation;
+        drop(state);
+        let snapshot = self.snapshot();
+        if snapshot.generation != generation
+            || !snapshot.is_complete(PrivateStateSnapshotScope::All)
+        {
+            return None;
+        }
+        Some(crate::private_observation::PrivateAccountObservation {
+            generation,
+            clearinghouse_states: snapshot.clearinghouse_states,
+            spot_state: snapshot.spot_state?,
+            open_orders: snapshot.open_orders,
+        })
+    }
+
     fn clear_values(state: &mut SnapshotState) {
         state.open_orders.clear();
         state.clearinghouse_states = None;
         state.spot_state = None;
+        state.last_account_frame = None;
     }
 }
 
@@ -392,5 +424,35 @@ mod tests {
             }]
         );
         assert_eq!(cache.snapshot().missing_open_order_dexes, ["", "xyz"]);
+    }
+    #[test]
+    fn observation_rejects_wrong_user_staleness_and_reconnect_generation() {
+        let cache = PrivateStateSnapshotCache::default();
+        cache.configure("0xabc", &[String::new()]);
+        {
+            let mut state = cache.inner.state.lock().unwrap();
+            state.open_orders.insert(String::new(), vec![]);
+            state.clearinghouse_states =
+                Some(AHashMap::from_iter([(String::new(), json!({"time":1}))]));
+            state.spot_state = Some(json!({"balances":[]}));
+            state.last_account_frame = Some(std::time::Instant::now());
+        }
+        assert!(
+            cache
+                .read_observation("0xABC", Duration::from_secs(30))
+                .is_some()
+        );
+        assert!(
+            cache
+                .read_observation("0xdef", Duration::from_secs(30))
+                .is_none()
+        );
+        assert!(cache.read_observation("0xabc", Duration::ZERO).is_none());
+        cache.invalidate_generation();
+        assert!(
+            cache
+                .read_observation("0xabc", Duration::from_secs(30))
+                .is_none()
+        );
     }
 }

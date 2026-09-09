@@ -64,7 +64,7 @@ use crate::{
         consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS, exchange_url, info_url},
         credential::{Secrets, VaultAddress, credential_env_vars},
         enums::{
-            HyperliquidBarInterval, HyperliquidEnvironment,
+            HyperliquidBarInterval, HyperliquidEnvironment, HyperliquidInfoRequestType,
             HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidProductType,
             HyperliquidTpSl,
         },
@@ -105,7 +105,7 @@ use crate::{
             parse_position_status_report, parse_recent_public_trade, parse_spot_instruments,
             parse_spot_position_status_report, resolve_perp_settlement_currency,
         },
-        query::{ExchangeAction, InfoRequest},
+        query::{ExchangeAction, ExchangeActionParams, InfoRequest},
         rate_limits::{
             RateLimitSnapshot, WeightedLimiter, backoff_full_jitter, exchange_weight,
             exec_action_weight, info_base_weight, info_extra_weight,
@@ -259,6 +259,7 @@ pub struct HyperliquidRawHttpClient {
     rate_limit_backoff_base: Duration,
     rate_limit_backoff_cap: Duration,
     rate_limit_max_attempts_info: u32,
+    request_timeout: Duration,
 }
 
 impl HyperliquidRawHttpClient {
@@ -275,9 +276,9 @@ impl HyperliquidRawHttpClient {
         Ok(Self {
             client: HttpClient::new(
                 Self::default_headers(),
+                vec!["retry-after".to_owned()],
                 vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
+                None,
                 Some(timeout_secs),
                 proxy_url,
             )?,
@@ -287,10 +288,11 @@ impl HyperliquidRawHttpClient {
             signer: None,
             nonce_manager: None,
             vault_address: None,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
-            rate_limit_backoff_base: Duration::from_millis(125),
+            rest_limiter: super::rate_limits::process_budget(environment),
+            rate_limit_backoff_base: Duration::from_secs(1),
             rate_limit_backoff_cap: Duration::from_secs(5),
             rate_limit_max_attempts_info: 3,
+            request_timeout: Duration::from_secs(timeout_secs),
         })
     }
 
@@ -312,9 +314,9 @@ impl HyperliquidRawHttpClient {
         Ok(Self {
             client: HttpClient::new(
                 Self::default_headers(),
+                vec!["retry-after".to_owned()],
                 vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
+                None,
                 Some(timeout_secs),
                 proxy_url,
             )?,
@@ -324,10 +326,11 @@ impl HyperliquidRawHttpClient {
             signer: Some(signer),
             nonce_manager: Some(nonce_manager),
             vault_address: secrets.vault_address,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
-            rate_limit_backoff_base: Duration::from_millis(125),
+            rest_limiter: super::rate_limits::process_budget(secrets.environment),
+            rate_limit_backoff_base: Duration::from_secs(1),
             rate_limit_backoff_cap: Duration::from_secs(5),
             rate_limit_max_attempts_info: 3,
+            request_timeout: Duration::from_secs(timeout_secs),
         })
     }
 
@@ -374,8 +377,8 @@ impl HyperliquidRawHttpClient {
     /// Configure rate limiting parameters (chainable).
     #[must_use]
     pub fn with_rate_limits(mut self) -> Self {
-        self.rest_limiter = Arc::new(WeightedLimiter::per_minute(1200));
-        self.rate_limit_backoff_base = Duration::from_millis(125);
+        self.rest_limiter = super::rate_limits::process_budget(self.environment);
+        self.rate_limit_backoff_base = Duration::from_secs(1);
         self.rate_limit_backoff_cap = Duration::from_secs(5);
         self.rate_limit_max_attempts_info = 3;
         self
@@ -438,7 +441,10 @@ impl HyperliquidRawHttpClient {
 
     fn parse_retry_after_simple(&self, headers: &HashMap<String, String>) -> Option<u64> {
         let retry_after = headers.get("retry-after")?;
-        retry_after.parse::<u64>().ok().map(|s| s * 1000) // convert seconds to ms
+        retry_after
+            .parse::<u64>()
+            .ok()
+            .map(|s| s.saturating_mul(1000)) // convert seconds to ms
     }
 
     /// Get metadata about available markets.
@@ -491,8 +497,7 @@ impl HyperliquidRawHttpClient {
 
     /// Get the list of perp dex names aligned by dex index.
     pub(crate) async fn load_perp_dexs(&self) -> Result<Vec<Option<PerpDex>>> {
-        let request = InfoRequest::perp_dexs();
-        let response = self.send_info_request(&request).await?;
+        let response = super::discovery::roster(self, &self.base_info).await?;
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
@@ -648,12 +653,26 @@ impl HyperliquidRawHttpClient {
     }
 
     async fn send_info_request(&self, request: &InfoRequest) -> Result<Value> {
+        tokio::time::timeout(self.request_timeout, self.send_info_attempts(request))
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+
+    async fn send_info_attempts(&self, request: &InfoRequest) -> Result<Value> {
         let base_w = info_base_weight(request);
-        self.rest_limiter.acquire(base_w).await;
 
         let mut attempt = 0u32;
 
         loop {
+            let queued = std::time::Instant::now();
+            if !self.rest_limiter.acquire_bounded(base_w, false).await {
+                return Err(Error::rate_limit("local-info-budget", base_w, None));
+            }
+            log::debug!(
+                "Hyperliquid HTTP attempt: endpoint={}, weight={base_w}, attempt={attempt}, queue_ms={}",
+                request.request_type.as_str(),
+                queued.elapsed().as_millis()
+            );
             let response = self.http_roundtrip_info(request).await?;
 
             if response.status.is_success() {
@@ -672,10 +691,6 @@ impl HyperliquidRawHttpClient {
 
             // 429 → respect Retry-After; else jittered backoff. Retry Info only.
             if response.status.as_u16() == 429 {
-                if attempt >= self.rate_limit_max_attempts_info {
-                    let ra = self.parse_retry_after_simple(&response.headers);
-                    return Err(Error::rate_limit("info", base_w, ra));
-                }
                 let delay = self
                     .parse_retry_after_simple(&response.headers)
                     .map_or_else(
@@ -688,6 +703,15 @@ impl HyperliquidRawHttpClient {
                         },
                         Duration::from_millis,
                     );
+                let delay = delay.max(Duration::from_secs(1));
+                self.rest_limiter.cool_down(delay).await;
+                if attempt >= self.rate_limit_max_attempts_info {
+                    return Err(Error::rate_limit(
+                        "info",
+                        base_w,
+                        Some(delay.as_millis().min(u64::MAX as u128) as u64),
+                    ));
+                }
                 log::warn!(
                     "429 Too Many Requests; backing off: endpoint={}, attempt={attempt}, wait_ms={:?}",
                     request.request_type.as_str(),
@@ -695,8 +719,6 @@ impl HyperliquidRawHttpClient {
                 );
                 attempt += 1;
                 tokio::time::sleep(delay).await;
-                // tiny re-acquire to avoid stampede exactly on minute boundary
-                self.rest_limiter.acquire(1).await;
                 continue;
             }
 
@@ -760,7 +782,16 @@ impl HyperliquidRawHttpClient {
         action: &ExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exchange_weight(action);
-        self.rest_limiter.acquire(w).await;
+        let protective = match &action.params {
+            ExchangeActionParams::Cancel(_) => true,
+            ExchangeActionParams::Order(params) => {
+                params.orders.iter().all(|order| order.reduce_only)
+            }
+            _ => false,
+        };
+        if !self.rest_limiter.acquire_bounded(w, protective).await {
+            return Err(Error::rate_limit("local-action-budget", w, None));
+        }
 
         let signer = self
             .signer
@@ -831,6 +862,9 @@ impl HyperliquidRawHttpClient {
             }
         } else if response.status.as_u16() == 429 {
             let ra = self.parse_retry_after_simple(&response.headers);
+            self.rest_limiter
+                .cool_down(Duration::from_millis(ra.unwrap_or(1000).max(1000)))
+                .await;
             Err(Error::rate_limit("exchange", w, ra))
         } else {
             let error_body = String::from_utf8_lossy(&response.body);
@@ -906,7 +940,18 @@ impl HyperliquidRawHttpClient {
         action: &HyperliquidExecAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exec_action_weight(action);
-        self.rest_limiter.acquire(w).await;
+        let protective = match action {
+            HyperliquidExecAction::Cancel { .. }
+            | HyperliquidExecAction::CancelByCloid { .. }
+            | HyperliquidExecAction::ScheduleCancel { .. } => true,
+            HyperliquidExecAction::Order { orders, .. } => {
+                orders.iter().all(|order| order.reduce_only)
+            }
+            _ => false,
+        };
+        if !self.rest_limiter.acquire_bounded(w, protective).await {
+            return Err(Error::rate_limit("local-action-budget", w, None));
+        }
 
         let request = self.sign_action_exec_request(action, None)?;
 
@@ -936,6 +981,9 @@ impl HyperliquidRawHttpClient {
             }
         } else if response.status.as_u16() == 429 {
             let ra = self.parse_retry_after_simple(&response.headers);
+            self.rest_limiter
+                .cool_down(Duration::from_millis(ra.unwrap_or(1000).max(1000)))
+                .await;
             Err(Error::rate_limit("exchange", w, ra))
         } else {
             let error_body = String::from_utf8_lossy(&response.body);
@@ -1027,6 +1075,45 @@ impl Default for HyperliquidHttpClient {
 }
 
 impl HyperliquidHttpClient {
+    /// Read-only extension endpoints use the same quota, retries and HTTP pool.
+    pub async fn info_raw(&self, request: &InfoRequest) -> Result<Value> {
+        if request.request_type == HyperliquidInfoRequestType::PerpDexs {
+            return super::discovery::roster(&self.inner, &self.inner.base_info).await;
+        }
+        self.inner.send_info_request_raw(request).await
+    }
+
+    /// Supply the catalog already fetched by station preparation. The data
+    /// client consumes and forwards the same definitions to execution.
+    pub fn seed_bootstrap_catalog(
+        &self,
+        requested_instrument_ids: Vec<InstrumentId>,
+        instruments: Vec<InstrumentAny>,
+    ) {
+        crate::catalog_handoff::publish_catalog_handoff(
+            crate::catalog_handoff::CatalogHandoffKey::new(
+                self.inner.environment,
+                self.inner.base_info.clone(),
+                None,
+            ),
+            crate::catalog_handoff::CatalogHandoff {
+                requested_instrument_ids,
+                instruments,
+            },
+        );
+    }
+
+    /// Refresh after a new DEX is observed; concurrent findings share cooldown.
+    pub async fn refresh_perp_dexs(&self) -> Result<Value> {
+        super::discovery::roster_with_refresh(&self.inner, &self.inner.base_info, true).await
+    }
+
+    pub async fn info_user_abstraction(&self, user: &str) -> Result<Value> {
+        let mut request = InfoRequest::clearinghouse_state(user);
+        request.request_type = HyperliquidInfoRequestType::UserAbstraction;
+        self.info_raw(&request).await
+    }
+
     /// Creates a new [`HyperliquidHttpClient`] for public endpoints only.
     ///
     /// # Errors
@@ -3348,13 +3435,25 @@ impl HyperliquidHttpClient {
             };
             let Some(instrument) = self.get_or_create_instrument(&balance.coin, Some(product_type))
             else {
-                batch.push_gap(HyperliquidPrivateStateGap::new(
-                    HyperliquidPrivateStateSource::SpotPositions,
-                    HyperliquidPrivateStateGapKind::UnknownInstrument,
-                    None,
-                    Some(balance.coin.as_str()),
-                    "Instrument not cached",
-                ));
+                batch.push_gap(
+                    HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::SpotPositions,
+                        HyperliquidPrivateStateGapKind::UnknownInstrument,
+                        None,
+                        Some(balance.coin.as_str()),
+                        "Instrument not cached",
+                    )
+                    .with_unreserved_spot_token(
+                        if product_type == HyperliquidProductType::Spot
+                            && balance.total > rust_decimal::Decimal::ZERO
+                            && balance.hold.is_zero()
+                        {
+                            balance.token
+                        } else {
+                            None
+                        },
+                    ),
+                );
                 continue;
             };
             if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
@@ -3584,13 +3683,25 @@ impl HyperliquidHttpClient {
             };
             let Some(instrument) = self.get_or_create_instrument(&balance.coin, Some(product_type))
             else {
-                batch.push_gap(HyperliquidPrivateStateGap::new(
-                    HyperliquidPrivateStateSource::SpotPositions,
-                    HyperliquidPrivateStateGapKind::UnknownInstrument,
-                    None,
-                    Some(balance.coin.as_str()),
-                    "Instrument not cached",
-                ));
+                batch.push_gap(
+                    HyperliquidPrivateStateGap::new(
+                        HyperliquidPrivateStateSource::SpotPositions,
+                        HyperliquidPrivateStateGapKind::UnknownInstrument,
+                        None,
+                        Some(balance.coin.as_str()),
+                        "Instrument not cached",
+                    )
+                    .with_unreserved_spot_token(
+                        if product_type == HyperliquidProductType::Spot
+                            && balance.total > rust_decimal::Decimal::ZERO
+                            && balance.hold.is_zero()
+                        {
+                            balance.token
+                        } else {
+                            None
+                        },
+                    ),
+                );
                 continue;
             };
             if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
@@ -4527,6 +4638,10 @@ fn is_hip3_instrument_id(instrument_id: InstrumentId) -> bool {
 fn perp_meta_requires_spot_metadata(meta: &PerpMeta) -> bool {
     meta.collateral_token.is_some_and(|token| token != 0)
 }
+
+#[cfg(test)]
+#[path = "traffic_tests.rs"]
+mod traffic_tests;
 
 #[cfg(test)]
 mod tests {

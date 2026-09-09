@@ -866,6 +866,8 @@ pub enum HyperliquidFillDirection {
 #[serde(rename_all = "camelCase")]
 #[strum(serialize_all = "camelCase")]
 pub enum HyperliquidInfoRequestType {
+    /// Verify account abstraction and collateral mode.
+    UserAbstraction,
     /// Get metadata about available markets.
     Meta,
     /// Get spot metadata (tokens and pairs).

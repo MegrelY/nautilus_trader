@@ -314,11 +314,40 @@ impl HyperliquidDataClient {
     }
 
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
-        let (instruments, execution_instruments) = self
-            .http_client
-            .request_bootstrap_instruments(&self.config.bootstrap_instrument_ids)
-            .await
-            .context("failed to fetch instruments during bootstrap")?;
+        let key = CatalogHandoffKey::new(
+            self.config.environment,
+            self.config.http_url(),
+            self.config.proxy_url.clone(),
+        );
+        let seeded = crate::catalog_handoff::take_catalog_handoff(&key).filter(|handoff| {
+            !handoff.instruments.is_empty()
+                && self.config.bootstrap_instrument_ids.iter().all(|id| {
+                    handoff
+                        .instruments
+                        .iter()
+                        .any(|instrument| instrument.id() == *id)
+                })
+        });
+        let (instruments, execution_instruments) = if let Some(handoff) = seeded {
+            let selected = handoff
+                .instruments
+                .iter()
+                .filter(|instrument| {
+                    self.config.bootstrap_instrument_ids.is_empty()
+                        || self
+                            .config
+                            .bootstrap_instrument_ids
+                            .contains(&instrument.id())
+                })
+                .cloned()
+                .collect();
+            (selected, handoff.instruments)
+        } else {
+            self.http_client
+                .request_bootstrap_instruments(&self.config.bootstrap_instrument_ids)
+                .await
+                .context("failed to fetch instruments during bootstrap")?
+        };
 
         self.instruments.rcu(|m| {
             for instrument in &instruments {

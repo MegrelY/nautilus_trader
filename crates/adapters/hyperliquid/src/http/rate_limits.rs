@@ -34,54 +34,101 @@ pub struct WeightedLimiter {
     capacity: f64,       // tokens per minute (e.g., 1200)
     refill_per_sec: f64, // capacity / 60
     state: tokio::sync::Mutex<State>,
+    reserve: f64,
+    queue: tokio::sync::Semaphore,
 }
 
 #[derive(Debug)]
 struct State {
     tokens: f64,
     last_refill: Instant,
+    cooldown: Instant,
 }
 
 impl WeightedLimiter {
     pub fn per_minute(capacity: u32) -> Self {
-        let cap = capacity as f64;
+        Self::with_burst(capacity, capacity, 0)
+    }
+
+    pub fn with_burst(per_minute: u32, burst: u32, reserve: u32) -> Self {
+        assert!(per_minute > 0 && burst > reserve);
+        let cap = burst as f64;
         Self {
             capacity: cap,
-            refill_per_sec: cap / 60.0,
+            refill_per_sec: per_minute as f64 / 60.0,
+            reserve: reserve as f64,
+            queue: tokio::sync::Semaphore::new(64),
             state: tokio::sync::Mutex::new(State {
                 tokens: cap,
                 last_refill: Instant::now(),
+                cooldown: Instant::now(),
             }),
         }
     }
 
     /// Acquire `weight` tokens, sleeping until available.
     pub async fn acquire(&self, weight: u32) {
-        let need = weight as f64;
+        self.acquire_inner(weight, false).await;
+    }
 
+    /// Bound admission wait and pending readers. Signed actions have reserved
+    /// tokens and do not queue behind catalog/history reads.
+    pub async fn acquire_bounded(&self, weight: u32, action: bool) -> bool {
+        let _permit = if action {
+            None
+        } else {
+            match self.queue.try_acquire() {
+                Ok(p) => Some(p),
+                Err(_) => return false,
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), self.acquire_inner(weight, action))
+            .await
+            .is_ok()
+    }
+
+    pub async fn cool_down(&self, delay: Duration) {
+        let mut state = self.state.lock().await;
+        state.cooldown = state.cooldown.max(Instant::now() + delay);
+    }
+
+    async fn acquire_inner(&self, weight: u32, action: bool) {
+        // Large requests pay in chunks; never wait for more than bucket capacity.
+        let available = self.capacity - if action { 0.0 } else { self.reserve };
+        let mut remaining = weight as f64;
+        while remaining > 0.0 {
+            let need = remaining.min(available);
+            self.acquire_chunk(need, action).await;
+            remaining -= need;
+        }
+    }
+
+    async fn acquire_chunk(&self, need: f64, action: bool) {
         loop {
             let mut st = self.state.lock().await;
             Self::refill_locked(&mut st, self.refill_per_sec, self.capacity);
 
-            if st.tokens >= need {
+            let cooldown = st.cooldown.saturating_duration_since(Instant::now());
+            let reserve = if action { 0.0 } else { self.reserve };
+            if st.tokens >= need + reserve && cooldown.is_zero() {
                 st.tokens -= need;
                 return;
             }
-            let deficit = need - st.tokens;
+            let deficit = (need + reserve - st.tokens).max(0.0);
             let secs = deficit / self.refill_per_sec;
             drop(st);
-            tokio::time::sleep(Duration::from_secs_f64(secs.max(0.01))).await;
+            tokio::time::sleep(Duration::from_secs_f64(secs.max(0.01)).max(cooldown)).await;
         }
     }
 
-    /// Post-response debit for per-items adders (can temporarily clamp to 0).
+    /// Post-response debit for per-item adders, retaining debt until refill.
     pub async fn debit_extra(&self, extra: u32) {
         if extra == 0 {
             return;
         }
         let mut st = self.state.lock().await;
         Self::refill_locked(&mut st, self.refill_per_sec, self.capacity);
-        st.tokens = (st.tokens - extra as f64).max(0.0);
+        st.tokens -= extra as f64; // Keep response surcharge debt; never forgive it.
     }
 
     pub async fn snapshot(&self) -> RateLimitSnapshot {
@@ -100,6 +147,43 @@ impl WeightedLimiter {
             st.last_refill = Instant::now();
         }
     }
+}
+
+/// One IP-budget allocation per cell process and venue environment. Configure
+/// before constructing clients. This does not coordinate different processes.
+pub fn configure_process_budget(
+    environment: crate::common::enums::HyperliquidEnvironment,
+    per_minute: u32,
+    burst: u32,
+    reserve: u32,
+) -> Result<(), &'static str> {
+    budget_slot(environment)
+        .set(std::sync::Arc::new(WeightedLimiter::with_burst(
+            per_minute, burst, reserve,
+        )))
+        .map_err(|_| "Hyperliquid process budget was already initialized")
+}
+
+fn budget_slot(
+    environment: crate::common::enums::HyperliquidEnvironment,
+) -> &'static std::sync::OnceLock<std::sync::Arc<WeightedLimiter>> {
+    static MAINNET: std::sync::OnceLock<std::sync::Arc<WeightedLimiter>> =
+        std::sync::OnceLock::new();
+    static TESTNET: std::sync::OnceLock<std::sync::Arc<WeightedLimiter>> =
+        std::sync::OnceLock::new();
+    if environment == crate::common::enums::HyperliquidEnvironment::Mainnet {
+        &MAINNET
+    } else {
+        &TESTNET
+    }
+}
+
+pub fn process_budget(
+    environment: crate::common::enums::HyperliquidEnvironment,
+) -> std::sync::Arc<WeightedLimiter> {
+    budget_slot(environment)
+        .get_or_init(|| std::sync::Arc::new(WeightedLimiter::per_minute(1200)))
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,13 +216,10 @@ pub fn info_base_weight(req: &InfoRequest) -> u32 {
     match req.request_type {
         HyperliquidInfoRequestType::L2Book
         | HyperliquidInfoRequestType::AllMids
-        | HyperliquidInfoRequestType::RecentTrades
-        | HyperliquidInfoRequestType::ActiveAssetData
         | HyperliquidInfoRequestType::ClearinghouseState
         | HyperliquidInfoRequestType::OrderStatus
         | HyperliquidInfoRequestType::SpotClearinghouseState
-        | HyperliquidInfoRequestType::ExchangeStatus
-        | HyperliquidInfoRequestType::UserFees => 2,
+        | HyperliquidInfoRequestType::ExchangeStatus => 2,
         HyperliquidInfoRequestType::UserRole => 60,
         _ => 20,
     }
