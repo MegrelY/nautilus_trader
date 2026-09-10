@@ -3,7 +3,10 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde_json::Value;
@@ -17,6 +20,7 @@ use super::{
 #[derive(Clone)]
 pub(super) struct RecentSnapshot {
     pub values: Vec<Value>,
+    generation: u64,
     end: u64,
     // A full recent page may omit more records at its oldest millisecond.
     // None means the venue returned its entire (short) retained history.
@@ -37,13 +41,29 @@ struct RecentState {
 
 struct HistoryState {
     history: FillHistory,
+    generation: u64,
     complete: bool,
+    retention_verified: bool,
 }
 
 #[derive(Default)]
 struct AccountFills {
+    // Recent contradictions retire every historical checkpoint, including an
+    // in-flight walk, without blocking account observations on its HTTP calls.
+    generation: AtomicU64,
     recent: tokio::sync::Mutex<RecentState>,
     history: tokio::sync::Mutex<Option<HistoryState>>,
+}
+
+impl AccountFills {
+    fn ensure_generation(&self, generation: u64) -> Result<()> {
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Err(Error::decode(
+                "Fill observations changed during history recovery",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn shared(endpoint: &str, user: &str) -> Result<Arc<AccountFills>> {
@@ -105,6 +125,7 @@ fn merge(first: &[Value], second: &[Value]) -> Result<Vec<Value>> {
 
 fn bounded_recent(
     mut values: Vec<Value>,
+    generation: u64,
     end: u64,
     mut after: Option<u64>,
 ) -> Result<RecentSnapshot> {
@@ -112,7 +133,12 @@ fn bounded_recent(
         values.drain(..values.len() - FILL_PAGE_LIMIT);
         after = values.first().map(timestamp).transpose()?;
     }
-    Ok(RecentSnapshot { values, end, after })
+    Ok(RecentSnapshot {
+        values,
+        generation,
+        end,
+        after,
+    })
 }
 
 fn prune_before(values: &mut Vec<Value>, start: u64) {
@@ -150,7 +176,12 @@ pub(super) async fn recent(
         } else {
             None
         };
-        state.snapshot = Some(RecentSnapshot { values, end, after });
+        state.snapshot = Some(RecentSnapshot {
+            values,
+            generation: account.generation.load(Ordering::Acquire),
+            end,
+            after,
+        });
     }
     for _ in 0..FILL_HISTORY_REQUEST_LIMIT {
         let previous = state
@@ -188,6 +219,7 @@ pub(super) async fn recent(
             Err(error) => {
                 state.pending = None;
                 state.snapshot = None;
+                account.generation.fetch_add(1, Ordering::AcqRel);
                 return Err(Error::decode(error));
             }
         };
@@ -199,10 +231,16 @@ pub(super) async fn recent(
                 Err(error) => {
                     state.pending = None;
                     state.snapshot = None;
+                    account.generation.fetch_add(1, Ordering::AcqRel);
                     return Err(error);
                 }
             };
-            state.snapshot = Some(bounded_recent(values, accepted_end, previous.after)?);
+            state.snapshot = Some(bounded_recent(
+                values,
+                previous.generation,
+                accepted_end,
+                previous.after,
+            )?);
             state.pending = None;
         } else {
             state.pending = Some(accepted);
@@ -223,9 +261,11 @@ pub(super) async fn history(
     start: u64,
     end: u64,
 ) -> Result<Vec<Value>> {
+    let account = shared(endpoint, user)?;
     let recent = recent(client, endpoint, user, end).await?;
+    let generation = recent.generation;
     if recent.covers(start, end) {
-        return Ok(recent
+        let values = recent
             .values
             .into_iter()
             .filter(|value| {
@@ -233,17 +273,20 @@ pub(super) async fn history(
                     .as_u64()
                     .is_some_and(|time| start <= time && time <= end)
             })
-            .collect());
+            .collect();
+        account.ensure_generation(generation)?;
+        return Ok(values);
     }
-    let account = shared(endpoint, user)?;
     let mut stored = account.history.lock().await;
-    if stored
-        .as_ref()
-        .is_none_or(|state| start < state.history.requested_start())
-    {
+    account.ensure_generation(generation)?;
+    if stored.as_ref().is_none_or(|state| {
+        state.generation != generation || start < state.history.requested_start()
+    }) {
         *stored = Some(HistoryState {
             history: FillHistory::new(start, end),
+            generation,
             complete: false,
+            retention_verified: false,
         });
     }
     for _ in 0..FILL_HISTORY_REQUEST_LIMIT {
@@ -255,11 +298,17 @@ pub(super) async fn history(
                 // same inclusive boundary instead of asserting missing coverage.
                 state.history.extend_end(end);
                 state.complete = false;
+                state.retention_verified = false;
             } else {
-                if state.history.needs_retention_probe() {
+                if !state.retention_verified && state.history.needs_retention_probe() {
+                    // A seed captured before pagination cannot witness fills
+                    // which evicted the beginning during that traversal. This
+                    // post-traversal request pays the normal weighted budget.
+                    let probe = client.info_user_fills_raw(user).await?;
+                    account.ensure_generation(generation)?;
                     state
                         .history
-                        .verify_retention_probe(&Value::Array(recent.values.clone()))
+                        .verify_retention_probe(&probe)
                         .map_err(Error::decode)?;
                 }
                 let fixed = state.history.clone().into_records();
@@ -273,7 +322,13 @@ pub(super) async fn history(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                let mut values = merge(&fixed, &tail)?;
+                let mut values = match merge(&fixed, &tail) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        *stored = None;
+                        return Err(error);
+                    }
+                };
                 prune_before(&mut values, start);
                 if values.len() > 10_000
                     || (values.len() == 10_000
@@ -287,6 +342,8 @@ pub(super) async fn history(
                 }
                 // This prefix is complete only after the explicit tail join.
                 state.history = FillHistory::proven(start, end, values.clone());
+                state.retention_verified = true;
+                account.ensure_generation(generation)?;
                 return Ok(values
                     .into_iter()
                     .filter(|value| {
@@ -301,6 +358,7 @@ pub(super) async fn history(
         let response = client
             .info_user_fills_by_time_raw(user, state.history.cursor(), state.history.end())
             .await?;
+        account.ensure_generation(generation)?;
         let mut accepted = state.history.clone();
         let complete = match accepted.accept(response) {
             Ok(complete) => complete,
@@ -311,7 +369,9 @@ pub(super) async fn history(
         };
         *stored = Some(HistoryState {
             history: accepted,
+            generation,
             complete,
+            retention_verified: false,
         });
     }
     Err(Error::decode(
