@@ -16,6 +16,7 @@
 pub mod client;
 mod discovery;
 pub mod error;
+mod fill_cache;
 mod fill_history;
 pub mod models;
 pub mod parse;

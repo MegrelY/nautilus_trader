@@ -80,7 +80,6 @@ use crate::{
     data_types::HyperliquidPublicTrade,
     http::{
         error::{Error, Result},
-        fill_history::{FILL_HISTORY_REQUEST_LIMIT, FillHistory},
         models::{
             ClearinghouseState, Cloid, HyperliquidActiveAssetData, HyperliquidCandleSnapshot,
             HyperliquidExchangeRequest, HyperliquidExchangeResponse, HyperliquidExecAction,
@@ -525,11 +524,11 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
-    async fn info_user_fills_raw(&self, user: &str) -> Result<Value> {
+    pub(super) async fn info_user_fills_raw(&self, user: &str) -> Result<Value> {
         self.send_info_request(&InfoRequest::user_fills(user)).await
     }
 
-    async fn info_user_fills_by_time_raw(
+    pub(super) async fn info_user_fills_by_time_raw(
         &self,
         user: &str,
         start_time: u64,
@@ -2155,6 +2154,15 @@ impl HyperliquidHttpClient {
         self.inner.info_user_fills(user).await
     }
 
+    /// Fresh recent fills with validated inclusive incremental updates.
+    /// Shared only within this process, endpoint and exact account identity.
+    pub async fn info_recent_user_fills(&self, user: &str) -> Result<HyperliquidFills> {
+        let endpoint = format!("{:?}:{}", self.inner.environment, self.inner.base_info);
+        let end = self.clock.get_time_ns().as_u64() / 1_000_000;
+        let snapshot = super::fill_cache::recent(&self.inner, &endpoint, user, end).await?;
+        serde_json::from_value(Value::Array(snapshot.values)).map_err(Error::Serde)
+    }
+
     /// Get order status for a user.
     pub async fn info_order_status(&self, user: &str, oid: u64) -> Result<HyperliquidOrderStatus> {
         self.inner.info_order_status(user, oid).await
@@ -3225,65 +3233,28 @@ impl HyperliquidHttpClient {
         let ts_init = self.clock.get_time_ns();
         let end_ms = ts_init.as_u64() / 1_000_000;
         let start_ms = start.map_or(0, |start| start.as_u64() / 1_000_000);
-        let mut history = FillHistory::new(start_ms, end_ms);
         let mut batch = HyperliquidPrivateStateBatch::default();
-        let mut complete = false;
-        // Reserve one request for checking fills newer than the fixed end.
-        for request_index in 0..FILL_HISTORY_REQUEST_LIMIT - 1 {
-            let response = match self
-                .inner
-                .info_user_fills_by_time_raw(user, history.cursor(), end_ms)
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    batch.push_gap(HyperliquidPrivateStateGap::new(
-                        HyperliquidPrivateStateSource::Fills,
-                        HyperliquidPrivateStateGapKind::SourceFailure,
-                        None,
-                        None,
-                        error.to_string(),
-                    ));
-                    break;
-                }
-            };
-            match history.accept(response) {
-                Ok(true) => {
-                    complete = true;
-                    break;
-                }
-                Ok(false) if request_index + 2 < FILL_HISTORY_REQUEST_LIMIT => continue,
-                result => {
-                    let detail = result
-                        .err()
-                        .unwrap_or_else(|| "Fill history request budget exhausted".into());
-                    batch.push_gap(HyperliquidPrivateStateGap::new(
-                        HyperliquidPrivateStateSource::Fills,
-                        HyperliquidPrivateStateGapKind::HistoryIncomplete,
-                        None,
-                        None,
-                        detail,
-                    ));
-                    break;
-                }
-            }
-        }
-        if complete && history.needs_retention_probe() {
-            let result = match self.inner.info_user_fills_raw(user).await {
-                Ok(response) => history.verify_retention_probe(&response),
-                Err(error) => Err(format!("Recent retention probe failed: {error}")),
-            };
-            if let Err(detail) = result {
+        let endpoint = format!("{:?}:{}", self.inner.environment, self.inner.base_info);
+        let fills = match super::fill_cache::history(&self.inner, &endpoint, user, start_ms, end_ms)
+            .await
+        {
+            Ok(fills) => fills,
+            Err(error) => {
+                let kind = if matches!(error, Error::Decode(_)) {
+                    HyperliquidPrivateStateGapKind::HistoryIncomplete
+                } else {
+                    HyperliquidPrivateStateGapKind::SourceFailure
+                };
                 batch.push_gap(HyperliquidPrivateStateGap::new(
                     HyperliquidPrivateStateSource::Fills,
-                    HyperliquidPrivateStateGapKind::HistoryIncomplete,
+                    kind,
                     None,
                     None,
-                    detail,
+                    error.to_string(),
                 ));
+                return Ok(batch);
             }
-        }
-        let fills = history.into_records();
+        };
 
         for fill_value in fills {
             let fill: HyperliquidFill = match serde_json::from_value(fill_value.clone()) {

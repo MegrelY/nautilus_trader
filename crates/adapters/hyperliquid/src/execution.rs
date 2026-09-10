@@ -2487,13 +2487,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
         let account_address = self.get_account_address()?;
-        // Mode brackets a mass observation only for scoped safety proof; an
-        // unavailable mode cannot turn otherwise complete reconciliation into a gap.
-        let starting_mode = self
-            .http_client
-            .info_user_abstraction(&account_address)
-            .await
-            .ok();
+
         let fill_start = lookback_mins.map(|mins| {
             UnixNanos::from(
                 ts_init
@@ -2501,11 +2495,21 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     .saturating_sub(mins.saturating_mul(60_000_000_000)),
             )
         });
-        let ((snapshot, mut completeness), fill_batch) = tokio::join!(
-            self.collect_private_state_snapshot(&account_address, PrivateStateSnapshotScope::All,),
-            self.http_client
-                .request_fill_report_batch(&account_address, None, fill_start),
-        );
+        // History can span several quota-bound attempts. Read live account
+        // evidence afterward; a retained fill prefix is never account freshness.
+        let fill_batch = self
+            .http_client
+            .request_fill_report_batch(&account_address, None, fill_start)
+            .await;
+        // Keep the original earliest timestamp: the fill cutoff precedes these live reads.
+        let starting_mode = self
+            .http_client
+            .info_user_abstraction(&account_address)
+            .await
+            .ok();
+        let (snapshot, mut completeness) = self
+            .collect_private_state_snapshot(&account_address, PrivateStateSnapshotScope::All)
+            .await;
 
         let order_batch = self
             .http_client

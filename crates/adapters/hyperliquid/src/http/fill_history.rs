@@ -12,6 +12,7 @@ pub(super) const FILL_HISTORY_REQUEST_LIMIT: usize = 12;
 /// eviction at the 10,000-fill retention boundary. Keep the end fixed even while
 /// newer fills arrive. Every full page is repeated at its final timestamp;
 /// advancing by one millisecond would silently lose equal-timestamp fills.
+#[derive(Clone)]
 pub(super) struct FillHistory {
     requested_start: u64,
     end: u64,
@@ -31,6 +32,80 @@ impl FillHistory {
             boundary: Vec::new(),
             oldest: None,
         }
+    }
+
+    pub(super) const fn end(&self) -> u64 {
+        self.end
+    }
+
+    pub(super) const fn requested_start(&self) -> u64 {
+        self.requested_start
+    }
+
+    /// Continue a proven prefix with an inclusive boundary at its fixed end.
+    pub(super) fn extend_end(&mut self, end: u64) {
+        self.cursor = self.end;
+        self.boundary = self
+            .records
+            .iter()
+            .filter_map(|(key, value)| {
+                (value.get("time").and_then(Value::as_u64) == Some(self.cursor))
+                    .then(|| key.clone())
+            })
+            .collect();
+        self.end = end;
+    }
+
+    pub(super) fn tail(cursor: u64, end: u64, boundary: Vec<Value>) -> Self {
+        let mut history = Self::new(cursor, end);
+        history.cursor = cursor;
+        for value in boundary {
+            let key = fill_identity(&value).expect("recent boundary was validated");
+            history.boundary.push(key.clone());
+            history.records.insert(key, value);
+            history.oldest = Some(cursor);
+        }
+        history
+    }
+
+    /// Narrow a validated prefix while retaining its preceding timestamp witness.
+    /// Unfinished pages retain their existing inclusive cursor and boundary.
+    pub(super) fn prune_before(&mut self, start: u64) {
+        if let Some(witness) = self
+            .records
+            .values()
+            .filter_map(|value| value.get("time").and_then(Value::as_u64))
+            .filter(|time| *time < start)
+            .max()
+        {
+            self.records.retain(|_, value| {
+                value
+                    .get("time")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|time| time >= witness)
+            });
+            self.oldest = Some(witness);
+        }
+        self.requested_start = start;
+    }
+
+    /// Called only after a complete prefix and covered fresh tail have joined.
+    pub(super) fn proven(start: u64, end: u64, values: Vec<Value>) -> Self {
+        let mut history = Self::new(start, end);
+        history.cursor = end;
+        for value in values {
+            let key = fill_identity(&value).expect("joined fill was validated");
+            let time = value
+                .get("time")
+                .and_then(Value::as_u64)
+                .expect("joined time was validated");
+            history.oldest = Some(history.oldest.map_or(time, |oldest| oldest.min(time)));
+            if time == end {
+                history.boundary.push(key.clone());
+            }
+            history.records.insert(key, value);
+        }
+        history
     }
 
     pub(super) const fn cursor(&self) -> u64 {
@@ -139,7 +214,7 @@ impl FillHistory {
     }
 }
 
-fn fill_identity(value: &Value) -> Result<String, String> {
+pub(super) fn fill_identity(value: &Value) -> Result<String, String> {
     let coin = value
         .get("coin")
         .and_then(Value::as_str)
