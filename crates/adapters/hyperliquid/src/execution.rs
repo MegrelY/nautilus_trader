@@ -1044,12 +1044,15 @@ async fn execute_bounded_leverage_preflight(
     clock: &'static AtomicTime,
 ) -> HyperliquidLeveragePreflightOutcome {
     let processor_started_at = clock.get_time_ns();
-    let response = if request.enqueued_at.as_u64() == 0
+    let (response, started_before_deadline) = if request.enqueued_at.as_u64() == 0
         || request.expires_at <= request.enqueued_at
         || processor_started_at >= request.expires_at
     {
-        HyperliquidLeveragePreflightResponse::Failed(
-            HyperliquidLeveragePreflightFailure::RequestExpired,
+        (
+            HyperliquidLeveragePreflightResponse::Failed(
+                HyperliquidLeveragePreflightFailure::RequestExpired,
+            ),
+            false,
         )
     } else {
         let remaining = Duration::from_nanos(
@@ -1058,7 +1061,7 @@ async fn execute_bounded_leverage_preflight(
                 .as_u64()
                 .saturating_sub(processor_started_at.as_u64()),
         );
-        match tokio::time::timeout(
+        let response = match tokio::time::timeout(
             remaining,
             execute_leverage_preflight(http_client, connected, account_id, request, clock),
         )
@@ -1073,8 +1076,17 @@ async fn execute_bounded_leverage_preflight(
             Err(_) => HyperliquidLeveragePreflightResponse::Failed(
                 HyperliquidLeveragePreflightFailure::ExecutionTimedOut,
             ),
-        }
+        };
+        (response, true)
     };
+    let completed_at = clock.get_time_ns();
+    let response = enforce_leverage_completion_deadline(
+        response,
+        request.mode,
+        started_before_deadline,
+        completed_at,
+        request.expires_at,
+    );
     HyperliquidLeveragePreflightOutcome {
         command_id: request.command_id,
         account_id: request.account_id,
@@ -1082,8 +1094,33 @@ async fn execute_bounded_leverage_preflight(
         raw_symbol: request.raw_symbol,
         mode: request.mode,
         processor_started_at,
-        completed_at: clock.get_time_ns(),
+        completed_at,
         response,
+    }
+}
+
+fn enforce_leverage_completion_deadline(
+    response: HyperliquidLeveragePreflightResponse,
+    mode: HyperliquidLeveragePreflightMode,
+    started_before_deadline: bool,
+    completed_at: UnixNanos,
+    expires_at: UnixNanos,
+) -> HyperliquidLeveragePreflightResponse {
+    if started_before_deadline && completed_at >= expires_at {
+        match mode {
+            HyperliquidLeveragePreflightMode::ApplyAndVerify => {
+                HyperliquidLeveragePreflightResponse::Failed(
+                    HyperliquidLeveragePreflightFailure::UpdateAmbiguous,
+                )
+            }
+            HyperliquidLeveragePreflightMode::VerifyOnly => {
+                HyperliquidLeveragePreflightResponse::Failed(
+                    HyperliquidLeveragePreflightFailure::ExecutionTimedOut,
+                )
+            }
+        }
+    } else {
+        response
     }
 }
 
@@ -4304,9 +4341,9 @@ mod tests {
         CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
         OrderIdentity, PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
         build_ouo_resize_request, can_fast_cancel_order, determine_order_list_grouping,
-        execute_bounded_leverage_preflight, execute_leverage_preflight,
-        filter_order_status_reports_for_command, handle_execution_report,
-        register_order_identity_into, resolve_maximum_cross_leverage,
+        enforce_leverage_completion_deadline, execute_bounded_leverage_preflight,
+        execute_leverage_preflight, filter_order_status_reports_for_command,
+        handle_execution_report, register_order_identity_into, resolve_maximum_cross_leverage,
         run_leverage_preflight_processor, split_fast_cancel_requests,
         validate_order_for_hyperliquid, verified_maximum_cross_leverage,
     };
@@ -4794,6 +4831,53 @@ mod tests {
         );
         assert_eq!(state.exchange_requests.lock().await.len(), 1);
         assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn successful_result_completed_at_deadline_is_not_fresh_proof() {
+        let proven = super::HyperliquidLeveragePreflightResponse::Proven {
+            maximum_leverage: 10,
+            observed_leverage: 10,
+            observed_at: UnixNanos::new(90),
+        };
+        assert_eq!(
+            enforce_leverage_completion_deadline(
+                proven,
+                super::HyperliquidLeveragePreflightMode::VerifyOnly,
+                true,
+                UnixNanos::new(100),
+                UnixNanos::new(100),
+            ),
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::ExecutionTimedOut
+            )
+        );
+        assert_eq!(
+            enforce_leverage_completion_deadline(
+                proven,
+                super::HyperliquidLeveragePreflightMode::ApplyAndVerify,
+                true,
+                UnixNanos::new(101),
+                UnixNanos::new(100),
+            ),
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::UpdateAmbiguous
+            )
+        );
+        assert_eq!(
+            enforce_leverage_completion_deadline(
+                super::HyperliquidLeveragePreflightResponse::Failed(
+                    super::HyperliquidLeveragePreflightFailure::RequestExpired,
+                ),
+                super::HyperliquidLeveragePreflightMode::ApplyAndVerify,
+                false,
+                UnixNanos::new(100),
+                UnixNanos::new(100),
+            ),
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::RequestExpired
+            )
+        );
     }
 
     #[tokio::test]
