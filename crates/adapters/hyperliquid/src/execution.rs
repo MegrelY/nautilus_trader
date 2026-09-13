@@ -75,6 +75,10 @@ pub struct HyperliquidLeveragePreflightRequest {
     /// is not yet present in the execution client's compact routing cache.
     pub expected_asset_index: Option<u32>,
     pub mode: HyperliquidLeveragePreflightMode,
+    /// Caller clock time when this exact command entered the bounded request path.
+    pub enqueued_at: UnixNanos,
+    /// Absolute caller clock deadline for starting and completing this command.
+    pub expires_at: UnixNanos,
 }
 
 /// Fail-closed classification for an incomplete leverage preflight.
@@ -87,6 +91,8 @@ pub enum HyperliquidLeveragePreflightFailure {
     InstrumentIdentityMismatch,
     MaximumUnavailable,
     CrossMarginUnsupported,
+    RequestExpired,
+    ExecutionTimedOut,
     UpdateAmbiguous,
     VerificationUnavailable,
     VerificationMismatch,
@@ -111,6 +117,8 @@ pub struct HyperliquidLeveragePreflightOutcome {
     pub instrument_id: InstrumentId,
     pub raw_symbol: Ustr,
     pub mode: HyperliquidLeveragePreflightMode,
+    pub processor_started_at: UnixNanos,
+    pub completed_at: UnixNanos,
     pub response: HyperliquidLeveragePreflightResponse,
 }
 
@@ -682,29 +690,9 @@ impl HyperliquidExecutionClient {
         let connected = self.leverage_connected.clone();
         let account_id = self.core.account_id;
         let clock = self.clock;
-        self.leverage_preflight_handle = Some(get_runtime().spawn(async move {
-            while let Some(request) = channels.requests.recv().await {
-                let response = execute_leverage_preflight(
-                    &http_client,
-                    &connected,
-                    account_id,
-                    request,
-                    clock,
-                )
-                .await;
-                let outcome = HyperliquidLeveragePreflightOutcome {
-                    command_id: request.command_id,
-                    account_id: request.account_id,
-                    instrument_id: request.instrument_id,
-                    raw_symbol: request.raw_symbol,
-                    mode: request.mode,
-                    response,
-                };
-                if channels.outcomes.send(outcome).await.is_err() {
-                    break;
-                }
-            }
-        }));
+        self.leverage_preflight_handle = Some(get_runtime().spawn(
+            run_leverage_preflight_processor(channels, http_client, connected, account_id, clock),
+        ));
     }
 
     fn register_order_identity(&self, order: &OrderAny) {
@@ -1023,6 +1011,79 @@ impl HyperliquidExecutionClient {
 
     fn abort_pending_tasks(&self) {
         self.pending_tasks.abort_all();
+    }
+}
+
+async fn run_leverage_preflight_processor(
+    mut channels: HyperliquidLeveragePreflightChannels,
+    http_client: HyperliquidHttpClient,
+    connected: Arc<AtomicBool>,
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+) {
+    while let Some(request) = channels.requests.recv().await {
+        let outcome = execute_bounded_leverage_preflight(
+            &http_client,
+            &connected,
+            account_id,
+            request,
+            clock,
+        )
+        .await;
+        if channels.outcomes.send(outcome).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn execute_bounded_leverage_preflight(
+    http_client: &HyperliquidHttpClient,
+    connected: &AtomicBool,
+    account_id: AccountId,
+    request: HyperliquidLeveragePreflightRequest,
+    clock: &'static AtomicTime,
+) -> HyperliquidLeveragePreflightOutcome {
+    let processor_started_at = clock.get_time_ns();
+    let response = if request.enqueued_at.as_u64() == 0
+        || request.expires_at <= request.enqueued_at
+        || processor_started_at >= request.expires_at
+    {
+        HyperliquidLeveragePreflightResponse::Failed(
+            HyperliquidLeveragePreflightFailure::RequestExpired,
+        )
+    } else {
+        let remaining = Duration::from_nanos(
+            request
+                .expires_at
+                .as_u64()
+                .saturating_sub(processor_started_at.as_u64()),
+        );
+        match tokio::time::timeout(
+            remaining,
+            execute_leverage_preflight(http_client, connected, account_id, request, clock),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) if request.mode == HyperliquidLeveragePreflightMode::ApplyAndVerify => {
+                HyperliquidLeveragePreflightResponse::Failed(
+                    HyperliquidLeveragePreflightFailure::UpdateAmbiguous,
+                )
+            }
+            Err(_) => HyperliquidLeveragePreflightResponse::Failed(
+                HyperliquidLeveragePreflightFailure::ExecutionTimedOut,
+            ),
+        }
+    };
+    HyperliquidLeveragePreflightOutcome {
+        command_id: request.command_id,
+        account_id: request.account_id,
+        instrument_id: request.instrument_id,
+        raw_symbol: request.raw_symbol,
+        mode: request.mode,
+        processor_started_at,
+        completed_at: clock.get_time_ns(),
+        response,
     }
 }
 
@@ -4205,7 +4266,7 @@ mod tests {
         net::SocketAddr,
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         },
     };
 
@@ -4243,10 +4304,11 @@ mod tests {
         CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
         OrderIdentity, PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
         build_ouo_resize_request, can_fast_cancel_order, determine_order_list_grouping,
-        execute_leverage_preflight, filter_order_status_reports_for_command,
-        handle_execution_report, register_order_identity_into, resolve_maximum_cross_leverage,
-        split_fast_cancel_requests, validate_order_for_hyperliquid,
-        verified_maximum_cross_leverage,
+        execute_bounded_leverage_preflight, execute_leverage_preflight,
+        filter_order_status_reports_for_command, handle_execution_report,
+        register_order_identity_into, resolve_maximum_cross_leverage,
+        run_leverage_preflight_processor, split_fast_cancel_requests,
+        validate_order_for_hyperliquid, verified_maximum_cross_leverage,
     };
     use crate::{
         common::enums::{HyperliquidEnvironment, HyperliquidLeverageType},
@@ -4269,6 +4331,8 @@ mod tests {
         exchange_body: Arc<tokio::sync::RwLock<Value>>,
         exchange_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
         active_data_requests: Arc<AtomicUsize>,
+        meta_delay_ms: Arc<AtomicU64>,
+        exchange_delay_ms: Arc<AtomicU64>,
     }
 
     impl LeverageTestServerState {
@@ -4290,6 +4354,8 @@ mod tests {
                 }))),
                 exchange_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 active_data_requests: Arc::new(AtomicUsize::new(0)),
+                meta_delay_ms: Arc::new(AtomicU64::new(0)),
+                exchange_delay_ms: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -4323,7 +4389,13 @@ mod tests {
                 Json(Value::Array(vec![state.cached_meta.clone()])).into_response()
             }
             Some("outcomeMeta") => Json(json!({"outcomes": []})).into_response(),
-            Some("meta") => Json(state.fresh_meta.read().await.clone()).into_response(),
+            Some("meta") => {
+                tokio::time::sleep(Duration::from_millis(
+                    state.meta_delay_ms.load(Ordering::SeqCst),
+                ))
+                .await;
+                Json(state.fresh_meta.read().await.clone()).into_response()
+            }
             Some("activeAssetData") => {
                 state.active_data_requests.fetch_add(1, Ordering::SeqCst);
                 Json(state.active_data.read().await.clone()).into_response()
@@ -4340,6 +4412,10 @@ mod tests {
             return StatusCode::BAD_REQUEST.into_response();
         };
         state.exchange_requests.lock().await.push(request);
+        tokio::time::sleep(Duration::from_millis(
+            state.exchange_delay_ms.load(Ordering::SeqCst),
+        ))
+        .await;
         let status = StatusCode::from_u16(state.exchange_status.load(Ordering::SeqCst))
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, Json(state.exchange_body.read().await.clone())).into_response()
@@ -4376,6 +4452,7 @@ mod tests {
     }
 
     fn leverage_request() -> super::HyperliquidLeveragePreflightRequest {
+        let enqueued_at = get_atomic_clock_realtime().get_time_ns();
         super::HyperliquidLeveragePreflightRequest {
             command_id: UUID4::new(),
             account_id: AccountId::from("HYPERLIQUID-TESTNET-001"),
@@ -4383,6 +4460,8 @@ mod tests {
             raw_symbol: Ustr::from("PUMP"),
             expected_asset_index: None,
             mode: super::HyperliquidLeveragePreflightMode::ApplyAndVerify,
+            enqueued_at,
+            expires_at: UnixNanos::new(enqueued_at.as_u64().saturating_add(5_000_000_000)),
         }
     }
 
@@ -4595,6 +4674,126 @@ mod tests {
         ));
         assert!(state.exchange_requests.lock().await.is_empty());
         assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_fifo_apply_expires_before_start_without_a_late_effect() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        state.meta_delay_ms.store(100, Ordering::SeqCst);
+        let client = leverage_test_client(state.clone()).await;
+        let connected = Arc::new(AtomicBool::new(true));
+        let account_id = AccountId::from("HYPERLIQUID-TESTNET-001");
+        let (requests, request_receiver) = tokio::sync::mpsc::channel(2);
+        let (outcomes, mut outcome_receiver) = tokio::sync::mpsc::channel(2);
+        let processor = tokio::spawn(run_leverage_preflight_processor(
+            super::HyperliquidLeveragePreflightChannels {
+                requests: request_receiver,
+                outcomes,
+            },
+            client,
+            connected,
+            account_id,
+            get_atomic_clock_realtime(),
+        ));
+
+        let mut first = leverage_request();
+        first.expires_at = UnixNanos::new(first.enqueued_at.as_u64() + 500_000_000);
+        let mut obsolete = leverage_request();
+        obsolete.enqueued_at = first.enqueued_at;
+        obsolete.expires_at = UnixNanos::new(first.enqueued_at.as_u64() + 20_000_000);
+        requests.send(first).await.unwrap();
+        requests.send(obsolete).await.unwrap();
+        drop(requests);
+
+        let first_outcome = outcome_receiver.recv().await.unwrap();
+        let obsolete_outcome = outcome_receiver.recv().await.unwrap();
+        assert!(matches!(
+            first_outcome.response,
+            super::HyperliquidLeveragePreflightResponse::Proven { .. }
+        ));
+        assert_eq!(
+            obsolete_outcome.response,
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::RequestExpired
+            )
+        );
+        assert!(obsolete_outcome.processor_started_at >= obsolete.expires_at);
+        assert!(obsolete_outcome.completed_at >= obsolete_outcome.processor_started_at);
+        assert_eq!(state.exchange_requests.lock().await.len(), 1);
+        processor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_only_execution_timeout_is_safe_to_retry() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        state.meta_delay_ms.store(100, Ordering::SeqCst);
+        let client = leverage_test_client(state.clone()).await;
+        let connected = AtomicBool::new(true);
+        let account_id = AccountId::from("HYPERLIQUID-TESTNET-001");
+        let mut timed_out = leverage_request();
+        timed_out.mode = super::HyperliquidLeveragePreflightMode::VerifyOnly;
+        timed_out.expires_at = UnixNanos::new(timed_out.enqueued_at.as_u64() + 20_000_000);
+
+        let timed_out = execute_bounded_leverage_preflight(
+            &client,
+            &connected,
+            account_id,
+            timed_out,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+        assert_eq!(
+            timed_out.response,
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::ExecutionTimedOut
+            )
+        );
+        assert!(state.exchange_requests.lock().await.is_empty());
+
+        state.meta_delay_ms.store(0, Ordering::SeqCst);
+        let mut retry = leverage_request();
+        retry.mode = super::HyperliquidLeveragePreflightMode::VerifyOnly;
+        let retry = execute_bounded_leverage_preflight(
+            &client,
+            &connected,
+            account_id,
+            retry,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+        assert!(matches!(
+            retry.response,
+            super::HyperliquidLeveragePreflightResponse::Proven { .. }
+        ));
+        assert!(state.exchange_requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_timeout_after_signing_stays_ambiguous_when_response_is_late() {
+        let state = LeverageTestServerState::new(&["PUMP"], &["PUMP"]);
+        state.exchange_delay_ms.store(500, Ordering::SeqCst);
+        let client = leverage_test_client(state.clone()).await;
+        let connected = AtomicBool::new(true);
+        let mut request = leverage_request();
+        request.expires_at = UnixNanos::new(request.enqueued_at.as_u64() + 250_000_000);
+
+        let outcome = execute_bounded_leverage_preflight(
+            &client,
+            &connected,
+            request.account_id,
+            request,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.response,
+            super::HyperliquidLeveragePreflightResponse::Failed(
+                super::HyperliquidLeveragePreflightFailure::UpdateAmbiguous
+            )
+        );
+        assert_eq!(state.exchange_requests.lock().await.len(), 1);
+        assert_eq!(state.active_data_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
