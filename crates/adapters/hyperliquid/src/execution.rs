@@ -683,7 +683,7 @@ impl HyperliquidExecutionClient {
         if self.leverage_preflight_handle.is_some() {
             return;
         }
-        let Some(mut channels) = self.leverage_preflight_channels.take() else {
+        let Some(channels) = self.leverage_preflight_channels.take() else {
             return;
         };
         let http_client = self.http_client.clone();
@@ -4305,6 +4305,7 @@ mod tests {
             Arc,
             atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use axum::{
