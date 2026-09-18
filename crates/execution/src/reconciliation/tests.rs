@@ -5598,6 +5598,119 @@ fn test_reconciliation_updated_strips_trigger_price_for_limit(instrument: Instru
 }
 
 #[rstest]
+#[case::stop_market(OrderType::StopMarket)]
+#[case::market_if_touched(OrderType::MarketIfTouched)]
+#[case::trailing_stop_market(OrderType::TrailingStopMarket)]
+fn test_reconciliation_updated_strips_price_for_market_style_stop(
+    instrument: InstrumentAny,
+    #[case] order_type: OrderType,
+) {
+    // A venue can report a price on a trigger-market order: Hyperliquid bounds
+    // such an order with a `limitPx` (trigger x 0.995 for a sell) and the open
+    // order parser sets it as the report's price. `OrderCore::apply` rejects an
+    // `OrderUpdated` carrying a price for StopMarket, MarketIfTouched and
+    // TrailingStopMarket with `InvalidOrderEvent`, so the engine would log and
+    // drop the event and the cached order would stay at the old quantity.
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = match order_type {
+        OrderType::TrailingStopMarket => OrderTestBuilder::new(order_type)
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100))
+            .trigger_price(Price::from("1.00000"))
+            .trailing_offset(Decimal::from(1))
+            .build(),
+        _ => OrderTestBuilder::new(order_type)
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100))
+            .trigger_price(Price::from("1.00000"))
+            .build(),
+    };
+
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    // Hyperliquid performs the resize as cancel-and-replace under the same cloid,
+    // so the venue reports the replacement leg's id and the bounded `limitPx`.
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        VenueOrderId::from("V-002"),
+        instrument.id(),
+        order_type,
+        OrderStatus::Accepted,
+        Quantity::from(150),
+        Quantity::from(0),
+    );
+    report.price = Some(Price::from("0.99500"));
+    report.trigger_price = Some(Price::from("1.00000"));
+
+    assert!(should_reconciliation_update(&order, &report));
+
+    let event = create_reconciliation_updated(&order, &report, UnixNanos::default());
+    let updated = match event.clone() {
+        OrderEventAny::Updated(u) => u,
+        other => panic!("expected OrderUpdated, was {other:?}"),
+    };
+    assert_eq!(updated.price, None);
+    assert_eq!(updated.trigger_price, Some(Price::from("1.00000")));
+    assert_eq!(updated.quantity, Quantity::from(150));
+    // The report's leg is authoritative, so the canceled leg's id is repaired.
+    assert_eq!(updated.venue_order_id, Some(VenueOrderId::from("V-002")));
+
+    order.apply(event).unwrap();
+    assert_eq!(order.quantity(), Quantity::from(150));
+    assert_eq!(order.venue_order_id(), Some(VenueOrderId::from("V-002")));
+}
+
+#[rstest]
+fn test_reconciliation_updated_keeps_price_for_limit_resize(instrument: InstrumentAny) {
+    // The mirror of the market-style case: a limit order carries its price, so a
+    // resize must still forward it alongside the new quantity.
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        Quantity::from(150),
+        Quantity::from(0),
+    );
+    report.price = Some(Price::from("1.00000"));
+
+    let event = create_reconciliation_updated(&order, &report, UnixNanos::default());
+    let updated = match event.clone() {
+        OrderEventAny::Updated(u) => u,
+        other => panic!("expected OrderUpdated, was {other:?}"),
+    };
+    assert_eq!(updated.price, Some(Price::from("1.00000")));
+    assert_eq!(updated.trigger_price, None);
+    assert_eq!(updated.quantity, Quantity::from(150));
+
+    order.apply(event).unwrap();
+    assert_eq!(order.quantity(), Quantity::from(150));
+    assert_eq!(order.price(), Some(Price::from("1.00000")));
+}
+
+#[rstest]
 fn test_reconcile_closed_order_within_tolerance_is_noop(instrument: InstrumentAny) {
     // Venue can redeliver a filled order with sub-precision jitter on
     // filled_qty after it closed locally; the mismatch is within single-unit

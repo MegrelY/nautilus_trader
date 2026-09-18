@@ -953,6 +953,22 @@ pub(super) fn create_reconciliation_updated(
         _ => None,
     };
 
+    // Mirror positive list for price. Market, StopMarket, MarketIfTouched and
+    // TrailingStopMarket carry no price at all, and `OrderCore::apply` rejects an
+    // `OrderUpdated` that carries one for those types with `InvalidOrderEvent`, so
+    // the engine logs and drops the event and the resize never lands. Venues report
+    // a price on trigger-market orders anyway (Hyperliquid gives a trigger-market
+    // order a bounded `limitPx` and reports it as the order's price), so the field
+    // has to be filtered here rather than trusted.
+    let price = match order.order_type() {
+        OrderType::Limit
+        | OrderType::StopLimit
+        | OrderType::LimitIfTouched
+        | OrderType::TrailingStopLimit
+        | OrderType::MarketToLimit => report.price,
+        _ => None,
+    };
+
     OrderEventAny::Updated(OrderUpdated::new(
         order.trader_id(),
         order.strategy_id(),
@@ -963,9 +979,16 @@ pub(super) fn create_reconciliation_updated(
         report.ts_last,
         ts_now,
         true, // reconciliation
-        order.venue_order_id(),
+        // The report is authoritative for the client order it is bound to. A venue
+        // that performs a modify as cancel-and-replace (Hyperliquid) keeps the cloid
+        // and hands out a new venue order id, so a cell restarted across such a
+        // resize holds the canceled leg's id. `OrderCore::updated` adopts a differing
+        // id and appends it to the history, and `Cache::refresh_order` overwrites the
+        // reverse index for an `Updated` event, so the stale binding is repaired here.
+        // The superseded-cancel guard keeps an old leg's own report from regressing it.
+        Some(report.venue_order_id),
         order.account_id(),
-        report.price,
+        price,
         trigger_price,
         None, // protection_price
         order.is_quote_quantity(),
