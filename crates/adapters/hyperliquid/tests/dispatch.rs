@@ -125,6 +125,46 @@ fn make_status_report(
     report
 }
 
+/// Builds a trigger-order status report. Hyperliquid bounds a trigger-market
+/// order with a `limitPx` (trigger x 0.995 for a sell) and reports it as the
+/// order's `price`, alongside the trigger itself.
+fn make_trigger_status_report(
+    client_order_id: Option<&str>,
+    venue_order_id: &str,
+    order_type: OrderType,
+    status: OrderStatus,
+    price: Option<&str>,
+    trigger_price: Option<&str>,
+    quantity: &str,
+) -> OrderStatusReport {
+    let mut report = OrderStatusReport::new(
+        account_id(),
+        InstrumentId::from(INSTRUMENT_ID),
+        client_order_id.map(ClientOrderId::new),
+        VenueOrderId::new(venue_order_id),
+        OrderSide::Buy,
+        order_type,
+        TimeInForce::Gtc,
+        status,
+        Quantity::from(quantity),
+        Quantity::from("0"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    if let Some(px) = price {
+        report = report.with_price(Price::from(px));
+    }
+
+    if let Some(trigger) = trigger_price {
+        report = report.with_trigger_price(Price::from(trigger));
+    }
+
+    report
+}
+
 fn make_fill_report(
     client_order_id: Option<&str>,
     venue_order_id: &str,
@@ -639,6 +679,154 @@ fn test_cancel_replace_price_sources(
                 Some(VenueOrderId::new("5000"))
             );
         }
+    }
+}
+
+/// A resize of a resting market-style protective child must reach the engine.
+///
+/// Hyperliquid performs a modify as cancel-and-replace under the same cloid and
+/// reports the replacement leg's bounded `limitPx` as its `price`.
+/// `OrderCore::apply` (`crates/model/src/orders/mod.rs`) refuses an
+/// `OrderUpdated` carrying a `price` for `STOP_MARKET`, `MARKET_IF_TOUCHED` and
+/// `TRAILING_STOP_MARKET`, so forwarding it drops the event: the order stays at
+/// the old quantity in `PENDING_UPDATE`, bound to the canceled venue order id.
+/// The update must carry the new quantity, no price, and the reported trigger.
+#[rstest]
+#[case::stop_market(OrderType::StopMarket)]
+#[case::market_if_touched(OrderType::MarketIfTouched)]
+#[case::trailing_stop_market(OrderType::TrailingStopMarket)]
+fn test_cancel_replace_resize_of_market_style_stop_drops_price(#[case] order_type: OrderType) {
+    let (emitter, mut rx) = test_emitter();
+    let state = Arc::new(WsDispatchState::new());
+    let cid = ClientOrderId::new("O-CR-006");
+    state.register_identity(cid, identity(order_type));
+    state.insert_accepted(cid);
+    state.record_venue_order_id(cid, VenueOrderId::new("60407678123"));
+
+    // The station's own amend after a partial entry fill: resize the resting
+    // child from 0.00020 to 0.00035 under the same cloid.
+    let target_total = Quantity::from("0.00035");
+    state.mark_pending_modify(cid, VenueOrderId::new("60407678123"), target_total);
+
+    let accepted_new = make_trigger_status_report(
+        Some("O-CR-006"),
+        "60407755296",
+        order_type,
+        OrderStatus::Accepted,
+        Some("55720.0"),
+        Some("56000.0"),
+        "0.00035",
+    );
+    let outcome = dispatch_order_event(&accepted_new, &state, &emitter, UnixNanos::default());
+
+    assert_eq!(outcome, DispatchOutcome::Tracked);
+    let events = drain_events(&mut rx);
+    assert_event_types(&events, &["Updated"]);
+
+    if let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = &events[0] {
+        assert_eq!(
+            updated.venue_order_id,
+            Some(VenueOrderId::new("60407755296")),
+        );
+        assert_eq!(updated.quantity, target_total);
+        // The bounded `limitPx` must not reach an order type that cannot hold it.
+        assert_eq!(updated.price, None);
+        assert_eq!(updated.trigger_price, Some(Price::from("56000.0")));
+    } else {
+        panic!("expected OrderEventAny::Updated");
+    }
+
+    assert_eq!(
+        state.cached_venue_order_id(&cid),
+        Some(VenueOrderId::new("60407755296")),
+    );
+}
+
+/// A market-style stop holds no price, so a replacement leg with no price on
+/// the report and none cached on the identity must still be emitted. Skipping
+/// it (the `LIMIT` behaviour kept by `test_cancel_replace_price_sources`) would
+/// drop the resize. With no trigger on the report the resting trigger is left
+/// untouched, which is what a pure resize wants.
+#[rstest]
+fn test_cancel_replace_resize_of_market_style_stop_without_price_is_emitted() {
+    let (emitter, mut rx) = test_emitter();
+    let state = Arc::new(WsDispatchState::new());
+    let cid = ClientOrderId::new("O-CR-007");
+    state.register_identity(
+        cid,
+        OrderIdentity {
+            price: None,
+            ..identity(OrderType::StopMarket)
+        },
+    );
+    state.insert_accepted(cid);
+    state.record_venue_order_id(cid, VenueOrderId::new("8000"));
+
+    let accepted_new = make_trigger_status_report(
+        Some("O-CR-007"),
+        "8001",
+        OrderType::StopMarket,
+        OrderStatus::Accepted,
+        None,
+        None,
+        "0.00035",
+    );
+    let outcome = dispatch_order_event(&accepted_new, &state, &emitter, UnixNanos::default());
+
+    assert_eq!(outcome, DispatchOutcome::Tracked);
+    let events = drain_events(&mut rx);
+    assert_event_types(&events, &["Updated"]);
+
+    if let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = &events[0] {
+        assert_eq!(updated.venue_order_id, Some(VenueOrderId::new("8001")));
+        assert_eq!(updated.quantity, Quantity::from("0.00035"));
+        assert_eq!(updated.price, None);
+        assert_eq!(updated.trigger_price, None);
+    } else {
+        panic!("expected OrderEventAny::Updated");
+    }
+
+    assert_eq!(
+        state.cached_venue_order_id(&cid),
+        Some(VenueOrderId::new("8001")),
+    );
+}
+
+/// The same resize on a `LIMIT` order is unchanged: a limit order carries its
+/// price, so the `OrderUpdated` must still forward it alongside the new
+/// quantity.
+#[rstest]
+fn test_cancel_replace_resize_of_limit_keeps_price() {
+    let (emitter, mut rx) = test_emitter();
+    let state = Arc::new(WsDispatchState::new());
+    let cid = ClientOrderId::new("O-CR-008");
+    state.register_identity(cid, identity(OrderType::Limit));
+    state.insert_accepted(cid);
+    state.record_venue_order_id(cid, VenueOrderId::new("7000"));
+
+    let target_total = Quantity::from("0.00035");
+    state.mark_pending_modify(cid, VenueOrderId::new("7000"), target_total);
+
+    let accepted_new = make_status_report(
+        Some("O-CR-008"),
+        "7001",
+        OrderStatus::Accepted,
+        Some("53893.0"),
+        "0.00035",
+    );
+    let outcome = dispatch_order_event(&accepted_new, &state, &emitter, UnixNanos::default());
+
+    assert_eq!(outcome, DispatchOutcome::Tracked);
+    let events = drain_events(&mut rx);
+    assert_event_types(&events, &["Updated"]);
+
+    if let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = &events[0] {
+        assert_eq!(updated.venue_order_id, Some(VenueOrderId::new("7001")));
+        assert_eq!(updated.quantity, target_total);
+        assert_eq!(updated.price, Some(Price::from("53893.0")));
+        assert_eq!(updated.trigger_price, None);
+    } else {
+        panic!("expected OrderEventAny::Updated");
     }
 }
 

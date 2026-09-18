@@ -849,14 +849,14 @@ pub fn dispatch_order_fill(
             .zip(identity.price)
             .and_then(|(r, cached)| Price::from_decimal_dp(r.price, cached.precision).ok())
             .or(identity.price);
-        let Some(price) = price else {
+        if price.is_none() && update_requires_price(identity.order_type) {
             log::warn!(
                 "Cannot promote cancel-replace for {client_order_id} from fill: no target \
                  or cached price; buffering until the replacement ACCEPTED arrives",
             );
             state.buffer_fill(client_order_id, report.clone());
             return DispatchOutcome::Tracked;
-        };
+        }
         let updated_quantity = target.unwrap_or(identity.quantity);
         promote_cancel_replace(
             client_order_id,
@@ -973,14 +973,16 @@ fn handle_accepted(
     if let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
         && cached_voi != venue_order_id
     {
+        // A market-style stop carries no price, so a missing one must not skip the
+        // promotion: the resize still has to reach the engine.
         let price = report.price.or(identity.price);
-        let Some(price) = price else {
+        if price.is_none() && update_requires_price(identity.order_type) {
             log::warn!(
                 "Cannot emit OrderUpdated for cancel-replace {client_order_id}: \
                  no price on report and no cached price on identity",
             );
             return DispatchOutcome::Skip;
-        };
+        }
 
         // Prefer user target over venue's remaining-only `report.quantity`;
         // fall back when no marker (external modify).
@@ -1043,6 +1045,51 @@ fn handle_accepted(
     DispatchOutcome::Tracked
 }
 
+/// Returns whether a cancel-replace promotion for this order type needs a price.
+///
+/// Market-style orders hold no price at all, so a replacement leg arriving
+/// without one (and with no cached price on the identity) must still be
+/// promoted. Skipping it would drop a venue-side resize of a resting protective
+/// order, leaving it at the old quantity in `PENDING_UPDATE` and bound to the
+/// canceled venue order id.
+const fn update_requires_price(order_type: OrderType) -> bool {
+    !matches!(
+        order_type,
+        OrderType::Market
+            | OrderType::StopMarket
+            | OrderType::MarketIfTouched
+            | OrderType::TrailingStopMarket
+    )
+}
+
+/// Splits the `OrderUpdated` price fields by order type.
+///
+/// Hyperliquid bounds a trigger-market order with a `limitPx` (trigger x 0.995
+/// for a sell) and reports it as the replacement leg's `price`.
+/// `OrderCore::apply` rejects an `OrderUpdated` carrying a `price` for
+/// `STOP_MARKET`, `MARKET_IF_TOUCHED` or `TRAILING_STOP_MARKET`, a
+/// `trigger_price` for `LIMIT` or `MARKET_TO_LIMIT`, and either field for
+/// `MARKET`; the engine logs `Invalid event for order type` and drops the event,
+/// so the resize never reaches the cache. Emit only the fields the order type
+/// can hold. A `None` trigger leaves the resting trigger untouched, which is
+/// what a pure resize wants.
+const fn update_price_fields(
+    order_type: OrderType,
+    price: Option<Price>,
+    trigger_price: Option<Price>,
+) -> (Option<Price>, Option<Price>) {
+    match order_type {
+        OrderType::Market => (None, None),
+        OrderType::StopMarket | OrderType::MarketIfTouched | OrderType::TrailingStopMarket => {
+            (None, trigger_price)
+        }
+        OrderType::Limit | OrderType::MarketToLimit => (price, None),
+        OrderType::StopLimit | OrderType::LimitIfTouched | OrderType::TrailingStopLimit => {
+            (price, trigger_price)
+        }
+    }
+}
+
 // Shared by the ACCEPTED branch and the fill path (dropped-ACCEPTED recovery) so the
 // cancel-replace binding is recovered from whichever arrives first. See GH-3827, GH-3972.
 #[allow(
@@ -1056,7 +1103,7 @@ fn promote_cancel_replace(
     emitter: &ExecutionEventEmitter,
     venue_order_id: VenueOrderId,
     account_id: AccountId,
-    price: Price,
+    price: Option<Price>,
     quantity: Quantity,
     trigger_price: Option<Price>,
     ts_event: UnixNanos,
@@ -1064,9 +1111,12 @@ fn promote_cancel_replace(
 ) {
     state.record_venue_order_id(client_order_id, venue_order_id);
     state.update_identity_quantity(&client_order_id, quantity);
-    state.update_identity_price(&client_order_id, Some(price));
+    state.update_identity_price(&client_order_id, price);
     // Claim the front intent; the next queued modify advances to this replacement
     state.claim_front_modify(&client_order_id, venue_order_id);
+
+    let (update_price, update_trigger_price) =
+        update_price_fields(identity.order_type, price, trigger_price);
 
     let updated = OrderUpdated::new(
         emitter.trader_id(),
@@ -1080,8 +1130,8 @@ fn promote_cancel_replace(
         false,
         Some(venue_order_id),
         Some(account_id),
-        Some(price),
-        trigger_price,
+        update_price,
+        update_trigger_price,
         None,
         false,
     );
@@ -1131,13 +1181,14 @@ pub fn promote_replacement_from_query(
         return false;
     };
 
-    let Some(price) = report.price.or(identity.price) else {
+    let price = report.price.or(identity.price);
+    if price.is_none() && update_requires_price(identity.order_type) {
         log::warn!(
             "Cannot promote cancel-replace from query for {client_order_id}: \
              no price on report and no cached price on identity",
         );
         return false;
-    };
+    }
 
     // Prefer the user target over the venue's remaining-only `report.quantity`
     let updated_quantity = state
