@@ -15,7 +15,8 @@
 
 use std::fmt::Display;
 
-use alloy_primitives::{Address, keccak256};
+use alloy_primitives::Address;
+use nautilus_common::cloid::derive_cloid;
 use nautilus_core::hex;
 use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
 use rust_decimal::Decimal;
@@ -64,12 +65,13 @@ impl Cloid {
     }
 
     /// Creates a deterministic `Cloid` from a Nautilus `ClientOrderId`.
+    ///
+    /// The derivation lives in `nautilus-common` because the cache uses it to recognize an
+    /// order adopted under its raw cloid as one of our own; deriving through the same function
+    /// keeps the two from ever drifting apart.
     #[must_use]
     pub fn from_client_order_id(client_order_id: ClientOrderId) -> Self {
-        let hash = keccak256(client_order_id.as_str().as_bytes());
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&hash[..16]);
-        Self(bytes)
+        Self(derive_cloid(&client_order_id))
     }
 
     /// Returns whether the CLOID matches the UUIDv4 version and variant bits.

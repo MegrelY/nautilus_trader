@@ -78,6 +78,7 @@ use crate::{
         SYNTHETIC_INSTRUMENT_NOT_FOUND, SyntheticInstrumentLookupError, VenueOrderIdOwnershipError,
         database::{CacheDatabaseAdapter, CacheMap},
     },
+    cloid::derive_cloid_hex,
     signal::Signal,
 };
 
@@ -6384,6 +6385,219 @@ fn test_update_order_allows_venue_id_change_for_order_updated(mut cache: Cache) 
     assert_eq!(
         cache.client_order_id(&original_venue_order_id),
         Some(&live_order.client_order_id())
+    );
+}
+
+/// Seeds a station `STOP_MARKET` protection child accepted at `venue_order_id`, sized as the
+/// hl-long child was before the venue resized it behind a cancel-and-replace.
+fn seed_accepted_stop_order(
+    cache: &mut Cache,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+) -> OrderAny {
+    let account_id = AccountId::new("HYPERLIQUID-001");
+    let order = OrderTestBuilder::new(OrderType::StopMarket)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("40.9"))
+        .trigger_price(Price::from("0.44038"))
+        .build();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    let mut live_order = order;
+    let submitted = TestOrderEventStubs::submitted(&live_order, account_id);
+    update_order_with_event(cache, &mut live_order, submitted);
+    let accepted = TestOrderEventStubs::accepted(&live_order, account_id, venue_order_id);
+    update_order_with_event(cache, &mut live_order, accepted);
+
+    live_order
+}
+
+/// Seeds the order already owning `venue_order_id` when the resize arrives.
+fn seed_venue_order_id_incumbent(
+    cache: &mut Cache,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    strategy_id: StrategyId,
+    venue_order_id: VenueOrderId,
+) {
+    // Deliberately the same instrument, side and trigger as the claimant: resemblance must
+    // never take any part in who owns a venue order ID.
+    let order = OrderTestBuilder::new(OrderType::StopMarket)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .strategy_id(strategy_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("77.9"))
+        .trigger_price(Price::from("0.44038"))
+        .build();
+    cache.add_order(order, None, None, false).unwrap();
+    cache
+        .add_venue_order_id(&client_order_id, &venue_order_id, false)
+        .unwrap();
+}
+
+/// Builds the resize the engine emits once a mass-status report is bound back to our own ID.
+fn build_stop_resize(
+    order: &OrderAny,
+    venue_order_id: VenueOrderId,
+    quantity: Quantity,
+) -> OrderEventAny {
+    OrderEventAny::Updated(build_order_updated(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        quantity,
+        Some(venue_order_id),
+        Some(AccountId::new("HYPERLIQUID-001")),
+        None,
+        Some(Price::from("0.44038")),
+        None,
+    ))
+}
+
+fn assert_stop_resize_refused_by_incumbent(
+    incumbent_client_order_id: ClientOrderId,
+    incumbent_strategy_id: StrategyId,
+) {
+    let mut cache = Cache::default();
+    let audusd_sim = audusd_sim();
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim.clone()))
+        .unwrap();
+
+    let client_order_id = ClientOrderId::new("STP-7fb04249d5880da9e30f2583");
+    let old_venue_order_id = VenueOrderId::new("60407678124");
+    let new_venue_order_id = VenueOrderId::new("60407755297");
+
+    let live_order = seed_accepted_stop_order(
+        &mut cache,
+        audusd_sim.id(),
+        client_order_id,
+        old_venue_order_id,
+    );
+    seed_venue_order_id_incumbent(
+        &mut cache,
+        audusd_sim.id(),
+        incumbent_client_order_id,
+        incumbent_strategy_id,
+        new_venue_order_id,
+    );
+
+    let resized = build_stop_resize(&live_order, new_venue_order_id, Quantity::from("77.9"));
+    let error = cache.update_order(&resized).unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<VenueOrderIdOwnershipError>(),
+        Some(&VenueOrderIdOwnershipError {
+            venue_order_id: new_venue_order_id,
+            existing_client_order_id: incumbent_client_order_id,
+            claimant_client_order_id: client_order_id,
+        })
+    );
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().quantity(),
+        Quantity::from("40.9")
+    );
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().venue_order_id(),
+        Some(old_venue_order_id)
+    );
+    assert_eq!(
+        cache.client_order_id(&new_venue_order_id),
+        Some(&incumbent_client_order_id)
+    );
+    assert_eq!(
+        cache.venue_order_id(&incumbent_client_order_id),
+        Some(&new_venue_order_id)
+    );
+}
+
+#[rstest]
+fn an_updated_event_reclaims_its_venue_order_id_from_its_own_adopted_external_twin(
+    mut cache: Cache,
+) {
+    let audusd_sim = audusd_sim();
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim.clone()))
+        .unwrap();
+
+    let client_order_id = ClientOrderId::new("STP-7fb04249d5880da9e30f2583");
+    let old_venue_order_id = VenueOrderId::new("60407678124");
+    let new_venue_order_id = VenueOrderId::new("60407755297");
+    // An earlier process saw the replacement leg reported under its raw cloid alone and adopted
+    // it as an external order named by that cloid, which took the new venue order ID with it.
+    let twin_client_order_id = ClientOrderId::new(derive_cloid_hex(&client_order_id));
+
+    let live_order = seed_accepted_stop_order(
+        &mut cache,
+        audusd_sim.id(),
+        client_order_id,
+        old_venue_order_id,
+    );
+    seed_venue_order_id_incumbent(
+        &mut cache,
+        audusd_sim.id(),
+        twin_client_order_id,
+        StrategyId::external(),
+        new_venue_order_id,
+    );
+
+    let resized = build_stop_resize(&live_order, new_venue_order_id, Quantity::from("77.9"));
+    let applied = cache.update_order(&resized).unwrap();
+
+    assert_eq!(applied.quantity(), Quantity::from("77.9"));
+    assert_eq!(applied.venue_order_id(), Some(new_venue_order_id));
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().quantity(),
+        Quantity::from("77.9")
+    );
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().venue_order_id(),
+        Some(new_venue_order_id)
+    );
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().trigger_price(),
+        Some(Price::from("0.44038"))
+    );
+    assert_eq!(
+        cache.client_order_id(&new_venue_order_id),
+        Some(&client_order_id)
+    );
+    assert_eq!(
+        cache.venue_order_id(&client_order_id),
+        Some(&new_venue_order_id)
+    );
+    // The twin keeps its place in the cache; only its claim on the venue order ID is gone, and
+    // no index entry is left pointing two ways.
+    assert!(cache.order(&twin_client_order_id).is_some());
+    assert_eq!(cache.venue_order_id(&twin_client_order_id), None);
+}
+
+#[rstest]
+fn an_updated_event_still_cannot_steal_a_venue_order_id_from_an_unrelated_order() {
+    // (a) Another station order.
+    assert_stop_resize_refused_by_incumbent(
+        ClientOrderId::new("STP-1f4618a7c1d0b2e3f4a5b6c7"),
+        StrategyId::new("SSL-001"),
+    );
+
+    // (b) An adopted external order named by some other venue cloid.
+    assert_stop_resize_refused_by_incumbent(
+        ClientOrderId::new("0x0012329971d895b1c9af61048aa31d87"),
+        StrategyId::external(),
+    );
+
+    // (c) A station order that happens to carry our derived cloid as its name. The derivation
+    // alone does not move ownership: the incumbent must also be an adopted external order.
+    assert_stop_resize_refused_by_incumbent(
+        ClientOrderId::new(derive_cloid_hex(&ClientOrderId::new(
+            "STP-7fb04249d5880da9e30f2583",
+        ))),
+        StrategyId::new("SSL-001"),
     );
 }
 

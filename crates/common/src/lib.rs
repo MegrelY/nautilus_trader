@@ -121,6 +121,7 @@ pub mod actor;
 pub mod cache;
 pub mod clients;
 pub mod clock;
+pub mod cloid;
 pub mod component;
 pub mod config;
 pub mod custom;

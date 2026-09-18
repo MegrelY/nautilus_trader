@@ -41,7 +41,7 @@ python = [
 ]
 live = ["tokio"]
 simulation = ["live", "madsim", "nautilus-core/simulation"]
-defi = ["nautilus-model/defi", "alloy-primitives"]
+defi = ["nautilus-model/defi"]
 high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization?/high-precision",
@@ -81,6 +81,9 @@ nautilus-model = { workspace = true, features = ["stubs"] }
 nautilus-serialization = { workspace = true, optional = true }
 
 ahash = { workspace = true }
+# Required unconditionally by `cloid`, which derives the venue client order ID that the cache
+# uses to prove an adopted external order is one of our own orders under its venue name.
+alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -103,7 +106,6 @@ sysinfo = { workspace = true }
 thiserror = { workspace = true }
 ustr = { workspace = true }
 
-alloy-primitives = { workspace = true, optional = true }
 capnp = { workspace = true, optional = true }
 madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }

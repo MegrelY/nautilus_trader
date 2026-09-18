@@ -93,7 +93,7 @@ pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, Po
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use crate::xrate::get_exchange_rate;
+use crate::{cloid::is_derived_cloid_of, xrate::get_exchange_rate};
 
 // TODO: Reassess whether CacheView should consolidate with CacheApi once adapter and client
 // construction no longer need a cache-handle facade.
@@ -4408,7 +4408,14 @@ impl Cache {
         venue_order_id: &VenueOrderId,
         overwrite: bool,
     ) -> anyhow::Result<()> {
-        self.validate_venue_order_id_claim(client_order_id, venue_order_id, overwrite)?;
+        // Validate the whole claim before mutating anything, so a refused claim never leaves a
+        // half-transferred index behind.
+        let reclaimed_from =
+            self.validate_venue_order_id_claim(client_order_id, venue_order_id, overwrite)?;
+
+        if let Some(incumbent) = reclaimed_from {
+            self.transfer_venue_order_id(&incumbent, client_order_id, venue_order_id);
+        }
 
         self.index
             .client_order_ids
@@ -4420,13 +4427,18 @@ impl Cache {
         Ok(())
     }
 
+    /// Validates a claim on `venue_order_id` by `client_order_id` without mutating the index.
+    ///
+    /// Returns the incumbent owner whose claim `client_order_id` may take over, if any; see
+    /// [`Self::validate_venue_order_id_ownership`] for the one case in which that happens.
     fn validate_venue_order_id_claim(
         &self,
         client_order_id: &ClientOrderId,
         venue_order_id: &VenueOrderId,
         overwrite: bool,
-    ) -> anyhow::Result<()> {
-        self.validate_venue_order_id_ownership(client_order_id, venue_order_id)?;
+    ) -> anyhow::Result<Option<ClientOrderId>> {
+        let reclaimed_from =
+            self.validate_venue_order_id_ownership(client_order_id, venue_order_id)?;
 
         if let Some(existing_venue_order_id) = self.index.client_order_ids.get(client_order_id)
             && !overwrite
@@ -4440,26 +4452,86 @@ impl Cache {
             );
         }
 
-        Ok(())
+        Ok(reclaimed_from)
     }
 
+    /// Validates that `client_order_id` may own `venue_order_id` without mutating the index.
+    ///
+    /// Returns `Ok(None)` when the venue order ID is unowned or already owned by the claimant,
+    /// and `Ok(Some(incumbent))` when the claimant may take ownership from `incumbent` under
+    /// [`Self::is_adopted_cloid_twin`]. Every other conflict is a
+    /// [`VenueOrderIdOwnershipError`], exactly as before.
     fn validate_venue_order_id_ownership(
         &self,
         client_order_id: &ClientOrderId,
         venue_order_id: &VenueOrderId,
-    ) -> anyhow::Result<()> {
-        if let Some(existing_client_order_id) = self.index.venue_order_ids.get(venue_order_id)
-            && existing_client_order_id != client_order_id
-        {
-            return Err(VenueOrderIdOwnershipError {
-                venue_order_id: *venue_order_id,
-                existing_client_order_id: *existing_client_order_id,
-                claimant_client_order_id: *client_order_id,
-            }
-            .into());
+    ) -> anyhow::Result<Option<ClientOrderId>> {
+        let Some(existing_client_order_id) =
+            self.index.venue_order_ids.get(venue_order_id).copied()
+        else {
+            return Ok(None);
+        };
+
+        if existing_client_order_id == *client_order_id {
+            return Ok(None);
         }
 
-        Ok(())
+        if self.is_adopted_cloid_twin(&existing_client_order_id, client_order_id) {
+            return Ok(Some(existing_client_order_id));
+        }
+
+        Err(VenueOrderIdOwnershipError {
+            venue_order_id: *venue_order_id,
+            existing_client_order_id,
+            claimant_client_order_id: *client_order_id,
+        }
+        .into())
+    }
+
+    /// Returns whether `incumbent` is an adopted external order that is `claimant` under the
+    /// venue's own name for it.
+    ///
+    /// A venue that names orders by a cloid reports a replacement leg under that cloid alone.
+    /// With no client order ID in the report, reconciliation adopts the leg as an *external*
+    /// order whose client order ID *is* the raw cloid hex, and that external order takes the
+    /// venue order ID with it. When the claimant's client order ID derives to exactly that hex
+    /// (`keccak256(client_order_id)[..16]`, see [`crate::cloid`]), the two are the same order
+    /// under two names, and the venue order ID belongs to the claimant.
+    ///
+    /// The proof rests on the keccak256 preimage alone. No quantity, price, side or timing
+    /// resemblance takes any part in it, and the relation is one directional, so it can never
+    /// hand a venue order ID back the other way.
+    fn is_adopted_cloid_twin(&self, incumbent: &ClientOrderId, claimant: &ClientOrderId) -> bool {
+        is_derived_cloid_of(incumbent, claimant)
+            && self
+                .orders
+                .get(incumbent)
+                .is_some_and(|order| order.borrow().strategy_id().is_external())
+    }
+
+    /// Moves ownership of `venue_order_id` from `incumbent` to `claimant`.
+    ///
+    /// The incumbent's forward binding is dropped along with the reverse one, so no index entry
+    /// is left pointing two ways. Callers must have proven the transfer through
+    /// [`Self::validate_venue_order_id_ownership`] first.
+    fn transfer_venue_order_id(
+        &mut self,
+        incumbent: &ClientOrderId,
+        claimant: &ClientOrderId,
+        venue_order_id: &VenueOrderId,
+    ) {
+        log::warn!(
+            "Transferring venue order ID {venue_order_id} from adopted external order \
+             {incumbent} to {claimant}, which derives {incumbent} as its venue cloid"
+        );
+
+        if self.index.client_order_ids.get(incumbent) == Some(venue_order_id) {
+            self.index.client_order_ids.remove(incumbent);
+        }
+
+        self.index
+            .venue_order_ids
+            .insert(*venue_order_id, *claimant);
     }
 
     /// Adds the `order` to the cache indexed with any given identifiers.
@@ -4950,7 +5022,15 @@ impl Cache {
         // refresh inconsistency, while other refresh failures, such as a backing database error,
         // remain logged after the canonical state is committed.
         if let Some(venue_order_id) = snapshot.venue_order_id() {
-            self.validate_venue_order_id_ownership(&client_order_id, &venue_order_id)?;
+            // A refusal here discards the whole event, quantity included, so the one conflict
+            // that is provably this order under its venue name transfers the ID instead. This is
+            // the last fallible step, so a transfer is only ever followed by the commit below.
+            let reclaimed_from =
+                self.validate_venue_order_id_ownership(&client_order_id, &venue_order_id)?;
+
+            if let Some(incumbent) = reclaimed_from {
+                self.transfer_venue_order_id(&incumbent, &client_order_id, &venue_order_id);
+            }
         }
 
         *order_cell.borrow_mut() = snapshot.clone();
