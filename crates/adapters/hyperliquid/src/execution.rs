@@ -2494,7 +2494,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
             require_complete_snapshot_reports("order status reports", reports, completeness)?
         };
 
-        let reports = filter_order_status_reports_for_command(reports, cmd);
+        let mut reports = filter_order_status_reports_for_command(reports, cmd);
+
+        // After every `.await`: the cache borrow must not be held across a suspension point.
+        self.rebind_cloid_reports(&mut reports);
 
         log::debug!("Generated {} order status reports", reports.len());
         Ok(reports)
@@ -2705,6 +2708,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 }
             }
         }
+
+        // After every `.await`: the cache borrow must not be held across a suspension point.
+        self.rebind_cloid_reports(&mut order_reports);
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -3011,6 +3017,90 @@ impl HyperliquidExecutionClient {
         log::debug!("Hyperliquid WebSocket execution stream started");
         Ok(())
     }
+
+    /// Binds raw venue cloids on `reports` back to the cached client order IDs deriving them.
+    ///
+    /// Must be called after every `.await` on the report path: the cache `Ref` taken here is
+    /// dropped before returning, so it is never held across a suspension point.
+    fn rebind_cloid_reports(&self, reports: &mut [OrderStatusReport]) {
+        if !reports
+            .iter()
+            .any(|report| report.client_order_id.as_ref().is_some_and(is_raw_cloid))
+        {
+            return;
+        }
+
+        let cached_client_order_ids = {
+            let cache = self.core.cache();
+            cache.client_order_ids(Some(&self.core.venue), None, None, None)
+        };
+
+        let index = cloid_client_order_id_index(&cached_client_order_ids);
+        rebind_cloid_client_order_ids(&index, reports);
+    }
+}
+
+/// Indexes the cached client order IDs by the cloid Hyperliquid derives from them.
+///
+/// `Cloid::from_client_order_id` is `keccak256(client_order_id)[..16]`, so the mapping is
+/// deterministic and invertible against a known set of client order IDs. A cloid that two
+/// cached orders derive to maps to `None`: keccak256 makes that practically impossible, but
+/// resolving it arbitrarily would bind a report to the wrong order, so it must bind to
+/// nothing.
+fn cloid_client_order_id_index(
+    cached_client_order_ids: &ahash::AHashSet<ClientOrderId>,
+) -> AHashMap<String, Option<ClientOrderId>> {
+    let mut index: AHashMap<String, Option<ClientOrderId>> =
+        AHashMap::with_capacity(cached_client_order_ids.len());
+
+    for client_order_id in cached_client_order_ids {
+        let cloid_hex = Cloid::from_client_order_id(*client_order_id).to_hex();
+        index
+            .entry(cloid_hex)
+            .and_modify(|bound| *bound = None)
+            .or_insert(Some(*client_order_id));
+    }
+
+    index
+}
+
+/// Rebinds reports whose `client_order_id` is a raw venue cloid back to our own ID.
+///
+/// The open-order endpoint returns only the cloid, and the parser sets it verbatim as the
+/// report's `client_order_id`. A venue that performs a modify as cancel-and-replace hands out a
+/// new venue order ID under the same cloid, so after a restart neither the raw cloid nor the
+/// replacement leg's venue order ID is in the cache index: the execution engine adopts the
+/// replacement as an *external* order and the cached order stays frozen at the old quantity,
+/// bound to the canceled leg. Binding the cloid back lets reconciliation see the resize.
+///
+/// A cloid no cached order derives to is left untouched so genuinely external orders (venue
+/// liquidations, ADL, orders placed elsewhere under the same account) are still adopted.
+fn rebind_cloid_client_order_ids(
+    index: &AHashMap<String, Option<ClientOrderId>>,
+    reports: &mut [OrderStatusReport],
+) {
+    for report in reports {
+        let Some(reported) = report.client_order_id else {
+            continue;
+        };
+
+        if !is_raw_cloid(&reported) {
+            continue;
+        }
+
+        if let Some(Some(client_order_id)) = index.get(reported.as_str()) {
+            log::debug!("Rebound raw cloid {reported} to cached {client_order_id}");
+            report.client_order_id = Some(*client_order_id);
+        }
+    }
+}
+
+/// Returns whether this ID is a raw venue cloid rather than one of our own client order IDs.
+///
+/// Matches the discriminator the WebSocket dispatch already uses: our client order IDs never
+/// start with `0x`.
+fn is_raw_cloid(client_order_id: &ClientOrderId) -> bool {
+    client_order_id.as_str().starts_with("0x")
 }
 
 fn filter_order_status_reports_for_command(
@@ -4339,14 +4429,16 @@ mod tests {
     use ustr::Ustr;
 
     use super::{
-        CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
-        OrderIdentity, PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
-        build_ouo_resize_request, can_fast_cancel_order, determine_order_list_grouping,
+        AHashMap, CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient,
+        HyperliquidWebSocketClient, OrderIdentity, PostRejectionRoute, StagedBracketChild,
+        StagedBracketState, WsDispatchState, build_ouo_resize_request, can_fast_cancel_order,
+        cloid_client_order_id_index, determine_order_list_grouping,
         enforce_leverage_completion_deadline, execute_bounded_leverage_preflight,
         execute_leverage_preflight, filter_order_status_reports_for_command,
-        handle_execution_report, register_order_identity_into, resolve_maximum_cross_leverage,
-        run_leverage_preflight_processor, split_fast_cancel_requests,
-        validate_order_for_hyperliquid, verified_maximum_cross_leverage,
+        handle_execution_report, rebind_cloid_client_order_ids, register_order_identity_into,
+        resolve_maximum_cross_leverage, run_leverage_preflight_processor,
+        split_fast_cancel_requests, validate_order_for_hyperliquid,
+        verified_maximum_cross_leverage,
     };
     use crate::{
         common::enums::{HyperliquidEnvironment, HyperliquidLeverageType},
@@ -5207,6 +5299,117 @@ mod tests {
                 Some(ClientOrderId::from("O-HER-FILTER-KEEP-OPEN")),
                 Some(ClientOrderId::from("O-HER-FILTER-KEEP-CLOSED")),
             ]
+        );
+    }
+
+    /// The open-order endpoint returns only the cloid, so the parser sets it verbatim as the
+    /// report's `client_order_id`. After a restart across a cancel-replace resize neither that
+    /// raw cloid nor the replacement leg's venue order id is in the cache index, so the engine
+    /// would adopt the replacement as an external order and leave our cached order frozen at
+    /// the old quantity. The derivation is `keccak256(client_order_id)[..16]`, so it inverts
+    /// against the cached client order ids.
+    #[rstest]
+    fn test_rebind_cloid_client_order_ids_binds_derived_cloid() {
+        let client_order_id = ClientOrderId::from("SSL-7fb04249d5880da9e30f2583");
+        let cloid_hex = cloid_for("SSL-7fb04249d5880da9e30f2583");
+        let mut reports = vec![make_status_report(
+            Some(cloid_hex.as_str()),
+            "60407755296",
+            OrderStatus::Accepted,
+        )];
+
+        let cached: ahash::AHashSet<ClientOrderId> =
+            [client_order_id, ClientOrderId::from("O-OTHER-1")]
+                .into_iter()
+                .collect();
+        let index = cloid_client_order_id_index(&cached);
+        rebind_cloid_client_order_ids(&index, &mut reports);
+
+        assert_eq!(reports[0].client_order_id, Some(client_order_id));
+    }
+
+    /// A cloid no cached order derives to belongs to a genuinely external order (a venue
+    /// liquidation, ADL, or an order placed elsewhere under the same account), so it must be
+    /// left alone for the engine's external-order path to adopt.
+    #[rstest]
+    fn test_rebind_cloid_client_order_ids_leaves_unknown_cloid() {
+        let unknown = cloid_for("SSL-not-in-our-cache");
+        let mut reports = vec![make_status_report(
+            Some(unknown.as_str()),
+            "60407755297",
+            OrderStatus::Accepted,
+        )];
+
+        let cached: ahash::AHashSet<ClientOrderId> =
+            [ClientOrderId::from("SSL-7fb04249d5880da9e30f2583")]
+                .into_iter()
+                .collect();
+        let index = cloid_client_order_id_index(&cached);
+        rebind_cloid_client_order_ids(&index, &mut reports);
+
+        assert_eq!(
+            reports[0].client_order_id,
+            Some(ClientOrderId::new(unknown.as_str()))
+        );
+    }
+
+    /// Two cached orders deriving the same cloid make the binding ambiguous, so it must bind to
+    /// nothing rather than corrupt one of them. keccak256 makes this practically impossible, so
+    /// the ambiguous index entry is built directly.
+    #[rstest]
+    fn test_rebind_cloid_client_order_ids_leaves_colliding_cloid() {
+        let colliding = cloid_for("SSL-7fb04249d5880da9e30f2583");
+        let mut reports = vec![make_status_report(
+            Some(colliding.as_str()),
+            "60407755298",
+            OrderStatus::Accepted,
+        )];
+
+        let mut index: AHashMap<String, Option<ClientOrderId>> = AHashMap::new();
+        index.insert(colliding.to_string(), None);
+        rebind_cloid_client_order_ids(&index, &mut reports);
+
+        assert_eq!(
+            reports[0].client_order_id,
+            Some(ClientOrderId::new(colliding.as_str()))
+        );
+    }
+
+    /// Our own client order ids never start with `0x`, so a bound report must not be rewritten
+    /// even if a cached order happens to derive a cloid equal to its id.
+    #[rstest]
+    fn test_rebind_cloid_client_order_ids_leaves_bound_report() {
+        let client_order_id = ClientOrderId::from("SSL-7fb04249d5880da9e30f2583");
+        let mut reports = vec![
+            make_status_report(
+                Some("SSL-7fb04249d5880da9e30f2583"),
+                "60407755299",
+                OrderStatus::Accepted,
+            ),
+            make_status_report(None, "60407755300", OrderStatus::Accepted),
+        ];
+
+        let cached: ahash::AHashSet<ClientOrderId> = [client_order_id].into_iter().collect();
+        let index = cloid_client_order_id_index(&cached);
+        rebind_cloid_client_order_ids(&index, &mut reports);
+
+        assert_eq!(reports[0].client_order_id, Some(client_order_id));
+        assert_eq!(reports[1].client_order_id, None);
+    }
+
+    /// The index inverts the venue's own derivation, so a cached id maps to exactly the hex the
+    /// venue reports back.
+    #[rstest]
+    fn test_cloid_client_order_id_index_maps_derived_hex() {
+        let client_order_id = ClientOrderId::from("SSL-7fb04249d5880da9e30f2583");
+        let cached: ahash::AHashSet<ClientOrderId> = [client_order_id].into_iter().collect();
+
+        let index = cloid_client_order_id_index(&cached);
+
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.get(cloid_for("SSL-7fb04249d5880da9e30f2583").as_str()),
+            Some(&Some(client_order_id))
         );
     }
 
