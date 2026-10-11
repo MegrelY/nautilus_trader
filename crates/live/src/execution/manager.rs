@@ -163,10 +163,17 @@ pub struct ReconciliationResult {
 /// Result of inflight order checks containing terminal events and intermediate queries.
 #[derive(Debug, Default)]
 pub struct InflightCheckResult {
-    /// Terminal events (rejection/cancellation) for orders that exceeded max retries.
+    /// Terminal events (cancellation) for orders stuck in pending modify/cancel that exceeded
+    /// max retries.
     pub events: Vec<OrderEventAny>,
     /// Intermediate venue queries for orders still within retry budget.
     pub queries: Vec<TradingCommand>,
+    /// Venue proofs for submitted orders that exceeded max retries.
+    ///
+    /// A timeout does not prove that the venue lacks the order, so such an order gets no
+    /// rejection until the responsible execution clients have answered these queries through
+    /// [`ExecutionManager::reconcile_targeted_order_reports`].
+    pub(crate) targeted_queries: Vec<TargetedOrderQuery>,
 }
 
 #[derive(Debug, Default)]
@@ -180,6 +187,8 @@ pub(crate) struct TargetedOrderQuery {
     client_order_id: ClientOrderId,
     responsible_clients: IndexSet<ClientId>,
     command: GenerateOrderStatusReport,
+    /// Whether the query proves a submitted order absent before its inflight timeout.
+    inflight_proof: bool,
 }
 
 impl TargetedOrderQuery {
@@ -194,6 +203,7 @@ pub(crate) struct TargetedOrderReportResult {
     client_order_id: ClientOrderId,
     report: Option<OrderStatusReport>,
     coverage_complete: bool,
+    inflight_proof: bool,
 }
 
 /// Snapshot and command for one continuous open-order reconciliation check.
@@ -1117,9 +1127,37 @@ impl ExecutionManager {
     /// Checks inflight orders and returns terminal events and intermediate venue queries.
     ///
     /// For retries below `inflight_max_retries`, generates `QueryOrder` commands to poll
-    /// the venue for the order's current status. At max retries, generates terminal events
-    /// (rejection or cancellation) based on the order's status.
+    /// the venue for the order's current status. At max retries, an order stuck in pending
+    /// modify or cancel gets a cancellation event. A submitted order gets no event: a
+    /// timeout does not prove that the venue lacks it, so it stays in flight until a caller
+    /// runs the venue proof that [`Self::check_inflight_orders_for_clients`] plans.
     pub fn check_inflight_orders(&mut self) -> InflightCheckResult {
+        let mut result = self.check_inflight_orders_for_clients(&[]);
+
+        // This caller cannot run the proofs, so release them for a later check.
+        for query in result.targeted_queries.drain(..) {
+            self.targeted_order_queries
+                .shift_remove(&query.client_order_id);
+        }
+
+        result
+    }
+
+    /// Checks inflight orders like [`Self::check_inflight_orders`], and plans a venue proof
+    /// for each submitted order that exhausted its retries.
+    ///
+    /// The proof asks the execution clients that are responsible for the order. The order is
+    /// rejected with `INFLIGHT_TIMEOUT` only when every one of them answers that the venue does
+    /// not know the order, and the order is still submitted when the answers arrive. A failed
+    /// or incomplete answer keeps the order in flight, and it is proved again after the
+    /// threshold. A report goes through the normal order reconciliation instead.
+    ///
+    /// An execution client must therefore answer `Ok(None)` only when the venue itself says
+    /// that it does not know the order. A transport failure is an error.
+    pub(crate) fn check_inflight_orders_for_clients(
+        &mut self,
+        clients: &[&dyn ExecutionClient],
+    ) -> InflightCheckResult {
         let mut result = InflightCheckResult::default();
         let now = dst::time::Instant::now();
         let threshold = Duration::from_millis(self.config.inflight_threshold_ms);
@@ -1170,14 +1208,13 @@ impl ExecutionManager {
                     if let Some(order) = self.get_order(client_order_id) {
                         match order.status() {
                             OrderStatus::Submitted => {
-                                // Generate rejection for submitted orders that never got accepted
-                                if let Some(event) = create_reconciliation_rejected(
-                                    &order,
-                                    Some("INFLIGHT_TIMEOUT"),
-                                    ts_now,
-                                ) {
-                                    result.events.push(event);
+                                // A submitted order that never got accepted may still rest or
+                                // have filled behind a lost acknowledgement. Ask the venue, and
+                                // keep the order in flight until the answer decides.
+                                if let Some(query) = self.plan_inflight_proof(&order, clients) {
+                                    result.targeted_queries.push(query);
                                 }
+                                continue;
                             }
                             OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {
                                 // Generate cancellation for orders stuck in pending modify/cancel
@@ -1224,6 +1261,102 @@ impl ExecutionManager {
         }
 
         result
+    }
+
+    /// Plans the venue proof for a submitted order that exhausted its inflight retries.
+    ///
+    /// Returns `None` when no execution client can be asked. The order then stays in flight.
+    fn plan_inflight_proof(
+        &mut self,
+        order: &OrderAny,
+        clients: &[&dyn ExecutionClient],
+    ) -> Option<TargetedOrderQuery> {
+        let client_order_id = order.client_order_id();
+
+        let responsible_clients = match self.resolve_order_report_client_coverage(order, clients) {
+            ReportClientCoverage::Resolved(responsible) if !responsible.is_empty() => responsible,
+            _ => {
+                if self.missing_order_coverage_warnings.insert(client_order_id) {
+                    log::warn!(
+                        "Cannot prove inflight order {client_order_id} absent: responsible execution client coverage is unresolved, keeping it in flight"
+                    );
+                }
+                return None;
+            }
+        };
+
+        log::warn!(
+            "Inflight order {client_order_id} exhausted {} retries, asking the venue before rejecting it",
+            self.config.inflight_max_retries
+        );
+        self.targeted_order_queries.insert(client_order_id);
+
+        Some(TargetedOrderQuery {
+            client_order_id,
+            responsible_clients,
+            command: GenerateOrderStatusReport::new(
+                UUID4::new(),
+                self.clock.borrow().timestamp_ns(),
+                Some(order.instrument_id()),
+                Some(client_order_id),
+                order.venue_order_id(),
+                None,
+                None,
+            ),
+            inflight_proof: true,
+        })
+    }
+
+    /// Applies the answer of an inflight proof that found no report.
+    ///
+    /// The order is rejected only when every responsible client answered and the order is
+    /// still submitted. Otherwise it stays in flight and is proved again after the threshold.
+    fn resolve_inflight_proof(
+        &mut self,
+        client_order_id: ClientOrderId,
+        coverage_complete: bool,
+    ) -> Vec<OrderEventAny> {
+        let Some(order) = self.get_order(client_order_id) else {
+            self.clear_recon_tracking(&client_order_id, true);
+            return Vec::new();
+        };
+
+        if order.status() != OrderStatus::Submitted {
+            // An acknowledgement or a report moved the order on while the proof ran.
+            return Vec::new();
+        }
+
+        if !coverage_complete {
+            log::warn!(
+                "Keeping {client_order_id} in flight: the venue proof was incomplete, trying again after the threshold"
+            );
+            self.defer_inflight_proof(client_order_id);
+            return Vec::new();
+        }
+
+        let retries = self
+            .recon_check_retries
+            .get(&client_order_id)
+            .copied()
+            .unwrap_or_default();
+        log::warn!(
+            "Order {client_order_id} is unknown to the venue after {retries} inflight retries and a venue proof, marking as REJECTED"
+        );
+        let rejected = create_reconciliation_rejected(
+            &order,
+            Some("INFLIGHT_TIMEOUT"),
+            self.clock.borrow().timestamp_ns(),
+        );
+        self.clear_recon_tracking(&client_order_id, true);
+
+        rejected.into_iter().collect()
+    }
+
+    /// Makes the next inflight proof of an order wait a full threshold from now.
+    fn defer_inflight_proof(&mut self, client_order_id: ClientOrderId) {
+        if let Some(check) = self.inflight_checks.get_mut(&client_order_id) {
+            check.last_query_at = Some(dst::time::Instant::now());
+        }
     }
 
     fn filtered_open_orders_for_reconciliation(&self) -> Vec<OrderAny> {
@@ -1737,6 +1870,7 @@ impl ExecutionManager {
                     None,
                     None,
                 ),
+                inflight_proof: false,
             });
         }
 
@@ -1782,11 +1916,17 @@ impl ExecutionManager {
                     self.reconcile_order_report(&order, &report, instrument.as_ref())
                 {
                     events.push(event);
+                } else if result.inflight_proof {
+                    // The report moved nothing: prove the order again after the threshold.
+                    self.defer_inflight_proof(client_order_id);
                 }
                 continue;
             }
 
-            if result.coverage_complete {
+            if result.inflight_proof {
+                events
+                    .extend(self.resolve_inflight_proof(client_order_id, result.coverage_complete));
+            } else if result.coverage_complete {
                 events.extend(self.resolve_missing_order(client_order_id));
             } else {
                 log::warn!(
@@ -4031,6 +4171,7 @@ pub(crate) async fn request_targeted_order_reports(
             client_order_id: query.client_order_id,
             report,
             coverage_complete,
+            inflight_proof: query.inflight_proof,
         });
     }
 
@@ -4784,5 +4925,379 @@ mod tests {
         let order_filled: OrderFilled = fill.into();
         position.apply(&order_filled);
         position
+    }
+
+    fn insert_submitted_limit_order(
+        cache: &Rc<RefCell<Cache>>,
+        client_order_id: ClientOrderId,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+    ) {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(client_order_id)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("TEST-001"));
+        cache
+            .borrow_mut()
+            .add_order(order, None, client_id, false)
+            .unwrap();
+        cache.borrow_mut().update_order(&submitted).unwrap();
+    }
+
+    fn inflight_proof_report(
+        client_order_id: ClientOrderId,
+        order_status: OrderStatus,
+        filled_qty: &str,
+    ) -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("TEST-001"),
+            crypto_perpetual_ethusdt().id(),
+            Some(client_order_id),
+            VenueOrderId::from("V-PROOF"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            order_status,
+            Quantity::from("10.0"),
+            Quantity::from(filled_qty),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            None,
+        )
+        .with_price(Price::from("100.0"))
+    }
+
+    fn inflight_proof_result(
+        client_order_id: ClientOrderId,
+        report: Option<OrderStatusReport>,
+        coverage_complete: bool,
+    ) -> TargetedOrderReportResult {
+        TargetedOrderReportResult {
+            client_order_id,
+            report,
+            coverage_complete,
+            inflight_proof: true,
+        }
+    }
+
+    /// Builds a manager with one order submitted and registered inflight, and advances time
+    /// past the threshold so the first inflight pass reaches the retry limit.
+    async fn manager_with_expired_submitted_order(
+        client_id: Option<ClientId>,
+    ) -> (ExecutionManager, Rc<RefCell<TestClock>>, ClientOrderId) {
+        let client_order_id = ClientOrderId::from("O-PROOF");
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+            .unwrap();
+        insert_submitted_limit_order(
+            &cache,
+            client_order_id,
+            crypto_perpetual_ethusdt().id(),
+            client_id,
+        );
+        let mut manager = ExecutionManager::new(
+            clock.clone(),
+            cache,
+            ExecutionManagerConfig {
+                inflight_threshold_ms: 100,
+                inflight_max_retries: 1,
+                ..Default::default()
+            },
+        );
+        manager.register_inflight(client_order_id);
+        dst::time::sleep(Duration::from_millis(101)).await;
+
+        (manager, clock, client_order_id)
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_timeout_plans_venue_proof_instead_of_rejecting_submitted_order() {
+        let client_id = ClientId::from("TEST");
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(client_id)).await;
+
+        let result = manager.check_inflight_orders_for_clients(&[]);
+
+        assert!(result.events.is_empty(), "a timeout is not proof");
+        assert!(result.queries.is_empty());
+        let [query] = result.targeted_queries.as_slice() else {
+            panic!(
+                "expected one venue proof, was {:?}",
+                result.targeted_queries
+            );
+        };
+        assert!(query.inflight_proof);
+        assert_eq!(query.client_order_id, client_order_id);
+        assert_eq!(query.responsible_clients, IndexSet::from([client_id]));
+        assert_eq!(query.command.client_order_id, Some(client_order_id));
+        assert_eq!(query.command.venue_order_id, None);
+        assert!(manager.inflight_checks.contains_key(&client_order_id));
+        assert!(manager.targeted_order_queries.contains(&client_order_id));
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_is_not_planned_again_while_it_runs() {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+        assert_eq!(
+            manager
+                .check_inflight_orders_for_clients(&[])
+                .targeted_queries
+                .len(),
+            1
+        );
+
+        dst::time::sleep(Duration::from_millis(101)).await;
+        let again = manager.check_inflight_orders_for_clients(&[]);
+
+        assert!(again.events.is_empty());
+        assert!(again.targeted_queries.is_empty());
+        assert!(manager.targeted_order_queries.contains(&client_order_id));
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_unknown_to_every_client_rejects_with_inflight_timeout() {
+        let (mut manager, clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+        manager.check_inflight_orders_for_clients(&[]);
+        clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(7_000), true);
+
+        let events = manager.reconcile_targeted_order_reports(vec![inflight_proof_result(
+            client_order_id,
+            None,
+            true,
+        )]);
+
+        let [OrderEventAny::Rejected(rejected)] = events.as_slice() else {
+            panic!("expected one rejection, was {events:?}");
+        };
+        assert_eq!(rejected.client_order_id, client_order_id);
+        assert_eq!(rejected.reason.as_str(), "INFLIGHT_TIMEOUT");
+        assert_eq!(
+            rejected.ts_event,
+            UnixNanos::from(7_000),
+            "the event carries the domain time of the decision, not the monotonic gate"
+        );
+        assert!(!manager.inflight_checks.contains_key(&client_order_id));
+        assert!(!manager.targeted_order_queries.contains(&client_order_id));
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_without_a_client_to_ask_keeps_the_order_in_flight() {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(None).await;
+
+        let result = manager.check_inflight_orders_for_clients(&[]);
+
+        assert!(result.events.is_empty());
+        assert!(result.targeted_queries.is_empty());
+        assert!(manager.inflight_checks.contains_key(&client_order_id));
+        assert!(!manager.targeted_order_queries.contains(&client_order_id));
+
+        dst::time::sleep(Duration::from_millis(101)).await;
+        let again = manager.check_inflight_orders_for_clients(&[]);
+
+        assert!(again.events.is_empty());
+        assert!(again.targeted_queries.is_empty());
+        assert!(manager.inflight_checks.contains_key(&client_order_id));
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_incomplete_answer_keeps_order_and_proves_it_again_later() {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+        manager.check_inflight_orders_for_clients(&[]);
+
+        let events = manager.reconcile_targeted_order_reports(vec![inflight_proof_result(
+            client_order_id,
+            None,
+            false,
+        )]);
+
+        assert!(events.is_empty(), "a failed query is not an answer");
+        assert!(manager.inflight_checks.contains_key(&client_order_id));
+        assert!(!manager.targeted_order_queries.contains(&client_order_id));
+        assert!(
+            manager
+                .check_inflight_orders_for_clients(&[])
+                .targeted_queries
+                .is_empty(),
+            "the next proof waits a full threshold from the failed answer"
+        );
+
+        dst::time::sleep(Duration::from_millis(101)).await;
+        let again = manager.check_inflight_orders_for_clients(&[]);
+
+        assert!(again.events.is_empty());
+        assert_eq!(again.targeted_queries.len(), 1);
+    }
+
+    #[rstest]
+    #[case(OrderStatus::Accepted, "0.0", "Accepted")]
+    #[case(OrderStatus::Canceled, "0.0", "Canceled")]
+    #[case(OrderStatus::Filled, "10.0", "Filled")]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_report_applies_the_real_venue_state(
+        #[case] venue_status: OrderStatus,
+        #[case] filled_qty: &str,
+        #[case] expected_event: &str,
+    ) {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+        manager.check_inflight_orders_for_clients(&[]);
+        let report = inflight_proof_report(client_order_id, venue_status, filled_qty);
+
+        let events = manager.reconcile_targeted_order_reports(vec![inflight_proof_result(
+            client_order_id,
+            Some(report),
+            true,
+        )]);
+
+        let [event] = events.as_slice() else {
+            panic!("expected one event, was {events:?}");
+        };
+        let name = match event {
+            OrderEventAny::Accepted(_) => "Accepted",
+            OrderEventAny::Canceled(_) => "Canceled",
+            OrderEventAny::Filled(_) => "Filled",
+            other => panic!("unexpected event {other:?}"),
+        };
+        assert_eq!(name, expected_event);
+        assert!(!manager.targeted_order_queries.contains(&client_order_id));
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_report_that_moves_nothing_defers_the_next_proof() {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+        manager.check_inflight_orders_for_clients(&[]);
+        // A venue-side pending state drives no local event.
+        let report = inflight_proof_report(client_order_id, OrderStatus::PendingUpdate, "0.0");
+
+        let events = manager.reconcile_targeted_order_reports(vec![inflight_proof_result(
+            client_order_id,
+            Some(report),
+            true,
+        )]);
+
+        assert!(events.is_empty());
+        assert!(manager.inflight_checks.contains_key(&client_order_id));
+        assert!(
+            manager
+                .check_inflight_orders_for_clients(&[])
+                .targeted_queries
+                .is_empty()
+        );
+
+        dst::time::sleep(Duration::from_millis(101)).await;
+
+        assert_eq!(
+            manager
+                .check_inflight_orders_for_clients(&[])
+                .targeted_queries
+                .len(),
+            1
+        );
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_proof_answer_for_an_order_that_moved_on_rejects_nothing() {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+        manager.check_inflight_orders_for_clients(&[]);
+        // The acknowledgement arrives while the proof runs.
+        let accepted = {
+            let cache = manager.cache.borrow();
+            let order = cache.order(&client_order_id).unwrap();
+            TestOrderEventStubs::accepted(
+                &order,
+                AccountId::from("TEST-001"),
+                VenueOrderId::from("V-LATE"),
+            )
+        };
+        manager.cache.borrow_mut().update_order(&accepted).unwrap();
+        manager.observe_order_event(&accepted);
+
+        let events = manager.reconcile_targeted_order_reports(vec![inflight_proof_result(
+            client_order_id,
+            None,
+            true,
+        )]);
+
+        assert!(events.is_empty());
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_check_without_clients_releases_the_proof_it_cannot_run() {
+        let (mut manager, _clock, client_order_id) =
+            manager_with_expired_submitted_order(Some(ClientId::from("TEST"))).await;
+
+        let result = manager.check_inflight_orders();
+
+        assert!(result.events.is_empty());
+        assert!(result.targeted_queries.is_empty());
+        assert!(!manager.targeted_order_queries.contains(&client_order_id));
+
+        dst::time::sleep(Duration::from_millis(101)).await;
+        let later = manager.check_inflight_orders_for_clients(&[]);
+
+        assert_eq!(
+            later.targeted_queries.len(),
+            1,
+            "a caller that can run the proof still gets it"
+        );
     }
 }

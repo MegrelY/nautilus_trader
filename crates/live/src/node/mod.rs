@@ -52,6 +52,11 @@
 //! Continuous checks do not await venue HTTP in the select loop: open-order
 //! and position checks poll bulk venue report futures from the loop.
 //!
+//! A submitted order that exhausts its inflight retries is not rejected on the
+//! timeout. The inflight check hands it to the targeted order report task, and
+//! the order is rejected only when the responsible execution clients answer
+//! that the venue does not know it.
+//!
 //! # Maintenance dispatcher
 //!
 //! Six periodic tasks share a single coarse `maintenance_timer`:
@@ -2510,11 +2515,19 @@ impl LiveNode {
             if self.state() == NodeState::ShuttingDown {
                 return;
             }
-            let result = self.exec_manager.check_inflight_orders();
+            let client_refs = self
+                .exec_clients
+                .iter()
+                .map(|client| client as &dyn ExecutionClient)
+                .collect::<Vec<_>>();
+            let result = self
+                .exec_manager
+                .check_inflight_orders_for_clients(&client_refs);
             self.process_reconciliation_events(&result.events);
             for cmd in result.queries {
                 AsyncRunner::handle_exec_command(cmd);
             }
+            self.start_inflight_proofs(result.targeted_queries, state.targeted_order_report_task);
             *state.last_inflight_check = now;
         }
 
@@ -2649,6 +2662,32 @@ impl LiveNode {
                 }
             }),
         })
+    }
+
+    /// Starts the venue proofs of submitted orders that exhausted their inflight retries.
+    ///
+    /// The proofs use the targeted order report slot. A busy slot releases them instead, and
+    /// the next inflight check plans them again after the threshold.
+    fn start_inflight_proofs(
+        &mut self,
+        queries: Vec<TargetedOrderQuery>,
+        targeted_order_report_task: &mut Option<TargetedOrderReportTask>,
+    ) {
+        if queries.is_empty() {
+            return;
+        }
+
+        if targeted_order_report_task.is_some() {
+            let client_order_ids = queries
+                .iter()
+                .map(TargetedOrderQuery::client_order_id)
+                .collect::<Vec<_>>();
+            self.exec_manager
+                .remove_targeted_order_queries(&client_order_ids);
+            return;
+        }
+
+        *targeted_order_report_task = Some(self.start_targeted_order_report_check(queries));
     }
 
     fn start_targeted_order_report_check(
@@ -4017,6 +4056,92 @@ mod tests {
             1
         );
         assert!(result.events.is_empty());
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_busy_targeted_slot_releases_inflight_proofs_for_the_next_check() {
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecEngineConfig {
+                reconciliation: true,
+                inflight_check_threshold_ms: 100,
+                inflight_check_retries: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("InflightProofSlotNode".to_string(), Some(config)).unwrap();
+        let instrument = crypto_perpetual_ethusdt();
+        let client_order_id = ClientOrderId::from("O-PROOF-SLOT");
+        {
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .client_order_id(client_order_id)
+                .instrument_id(instrument.id())
+                .quantity(Quantity::from("10.0"))
+                .price(Price::from("100.0"))
+                .build();
+            let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("TEST-001"));
+            let mut cache = node.kernel.cache.borrow_mut();
+            cache
+                .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+                .unwrap();
+            cache
+                .add_order(order, None, Some(ClientId::from("TEST")), false)
+                .unwrap();
+            cache.update_order(&submitted).unwrap();
+        }
+        node.exec_manager.register_inflight(client_order_id);
+        advance_clock(Duration::from_millis(101)).await;
+        let planned = node
+            .exec_manager
+            .check_inflight_orders_for_clients(&[])
+            .targeted_queries;
+        assert_eq!(planned.len(), 1);
+
+        // The single targeted-report slot is busy, so the proof must not start. It is
+        // released, which lets the next inflight check plan it again after the threshold.
+        let mut busy_slot = Some(TargetedOrderReportTask {
+            future: Box::pin(std::future::pending()),
+            planned_client_order_ids: Vec::new(),
+        });
+        node.start_inflight_proofs(planned, &mut busy_slot);
+
+        assert!(
+            busy_slot
+                .as_ref()
+                .is_some_and(|task| task.planned_client_order_ids.is_empty()),
+            "the running task keeps the slot"
+        );
+        assert!(
+            node.exec_manager
+                .check_inflight_orders_for_clients(&[])
+                .targeted_queries
+                .is_empty(),
+            "the released proof waits for the threshold"
+        );
+        advance_clock(Duration::from_millis(101)).await;
+        let planned_again = node
+            .exec_manager
+            .check_inflight_orders_for_clients(&[])
+            .targeted_queries;
+        assert_eq!(
+            planned_again.len(),
+            1,
+            "the released proof is planned again"
+        );
+
+        let mut free_slot = None;
+        node.start_inflight_proofs(planned_again, &mut free_slot);
+
+        assert_eq!(
+            free_slot.map(|task| task.planned_client_order_ids),
+            Some(vec![client_order_id]),
+            "a free slot starts the proof"
+        );
     }
 
     #[rstest]

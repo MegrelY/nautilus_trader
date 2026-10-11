@@ -20,6 +20,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     fmt::Debug,
     rc::Rc,
     sync::{
@@ -59,6 +60,7 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
         Venue, VenueOrderId,
@@ -910,6 +912,14 @@ mod serial_tests {
         (node, data_state, exec_state)
     }
 
+    /// Scripted answer of a targeted order status query. An empty script answers `Unknown`.
+    #[derive(Clone, Debug)]
+    enum TargetedOrderReply {
+        Unknown,
+        Fail,
+        Report(OrderStatusReport),
+    }
+
     #[derive(Clone, Debug, Default)]
     struct BlockingReportClientState {
         query_order_received: Arc<AtomicBool>,
@@ -917,6 +927,7 @@ mod serial_tests {
         bulk_order_report_requested: Arc<AtomicBool>,
         bulk_order_report_count: Arc<AtomicUsize>,
         targeted_order_report_ids: Arc<Mutex<Vec<ClientOrderId>>>,
+        targeted_order_replies: Arc<Mutex<VecDeque<TargetedOrderReply>>>,
         position_report_requested: Arc<AtomicBool>,
         position_report_count: Arc<AtomicUsize>,
         instrument_received: Arc<AtomicBool>,
@@ -1218,7 +1229,18 @@ mod serial_tests {
                 return std::future::pending::<anyhow::Result<Option<OrderStatusReport>>>().await;
             }
 
-            Ok(None)
+            let reply = self
+                .state
+                .targeted_order_replies
+                .lock()
+                .unwrap()
+                .pop_front();
+
+            match reply {
+                Some(TargetedOrderReply::Fail) => anyhow::bail!("scripted venue failure"),
+                Some(TargetedOrderReply::Report(report)) => Ok(Some(report)),
+                Some(TargetedOrderReply::Unknown) | None => Ok(None),
+            }
         }
 
         async fn generate_position_status_reports(
@@ -3281,6 +3303,194 @@ mod serial_tests {
         assert!(node.exec_manager().recon_check_retry_count(&order_b) > 0);
         assert!(node.exec_manager().recon_check_retry_count(&order_c) > 0);
         assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    fn add_submitted_test_order(
+        node: &LiveNode,
+        client_order_id: ClientOrderId,
+        client_id: ClientId,
+    ) {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(client_order_id)
+            .instrument_id(crypto_perpetual_ethusdt().id())
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted =
+            TestOrderEventStubs::submitted(&order, AccountId::from("BLOCKING-REPORT-001"));
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_order(order, None, Some(client_id), false)
+            .unwrap();
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .update_order(&submitted)
+            .unwrap();
+    }
+
+    /// Runs a node whose only order is submitted, never acknowledged and registered inflight.
+    /// The inflight check queries it once and then proves it, with `replies` as the venue's
+    /// scripted answers to the proofs. Returns the node after it stopped, and the order ID.
+    async fn run_node_with_unacknowledged_order(
+        name: &str,
+        replies: Vec<TargetedOrderReply>,
+        proofs_to_wait_for: usize,
+    ) -> (LiveNode, BlockingReportClientState, ClientOrderId) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                reconciliation: false,
+                inflight_check_interval_ms: 100,
+                inflight_check_threshold_ms: 0,
+                inflight_check_retries: 2,
+                single_order_query_delay_ms: 0,
+                ..Default::default()
+            },
+            timeout_reconciliation: Duration::from_millis(250),
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+        let state = BlockingReportClientState::default();
+        state.targeted_order_replies.lock().unwrap().extend(replies);
+        let factory = BlockingReportExecutionClientFactory::configurable(
+            ClientId::from("BLOCKING-REPORT"),
+            AccountId::from("BLOCKING-REPORT-001"),
+            state.clone(),
+        )
+        .with_order_reports(Vec::new())
+        .with_position_reports_complete();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name(name)
+            .add_exec_client(
+                Some("blocking-report".to_string()),
+                Box::new(factory),
+                Box::new(BlockingReportExecutionClientConfig),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+            .unwrap();
+        let client_order_id = ClientOrderId::from("O-UNACKNOWLEDGED");
+        add_submitted_test_order(&node, client_order_id, ClientId::from("BLOCKING-REPORT"));
+        node.exec_manager_mut().register_inflight(client_order_id);
+
+        let stop_handle = node.handle();
+        let targeted_order_report_ids = state.targeted_order_report_ids.clone();
+        tokio::spawn(async move {
+            wait_until_async(
+                || async { targeted_order_report_ids.lock().unwrap().len() >= proofs_to_wait_for },
+                Duration::from_secs(5),
+            )
+            .await;
+            // Let the node apply the last answer, then stop it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            stop_handle.stop();
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(10), node.run()).await;
+        assert!(result.is_ok(), "the node should stop");
+        assert!(result.unwrap().is_ok());
+
+        (node, state, client_order_id)
+    }
+
+    fn cached_order_status(node: &LiveNode, client_order_id: &ClientOrderId) -> OrderStatus {
+        node.kernel()
+            .cache
+            .borrow()
+            .order(client_order_id)
+            .expect("the order stays cached")
+            .status()
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_inflight_timeout_rejects_unacknowledged_order_the_venue_does_not_know() {
+        let (node, state, client_order_id) = run_node_with_unacknowledged_order(
+            "InflightProofUnknownNode",
+            vec![TargetedOrderReply::Unknown],
+            1,
+        )
+        .await;
+
+        assert_eq!(
+            *state.targeted_order_report_ids.lock().unwrap(),
+            vec![client_order_id],
+            "one proof, and no more once the order is rejected"
+        );
+        assert_eq!(
+            state.query_order_ids.lock().unwrap().first(),
+            Some(&client_order_id),
+            "the first retry is the plain query"
+        );
+        assert_eq!(
+            cached_order_status(&node, &client_order_id),
+            OrderStatus::Rejected
+        );
+        let cache = node.kernel().cache.borrow();
+        let rejection = cache.order(&client_order_id).unwrap().last_event().clone();
+        let OrderEventAny::Rejected(rejected) = rejection else {
+            panic!("expected a rejection, was {rejection:?}");
+        };
+        assert_eq!(rejected.reason.as_str(), "INFLIGHT_TIMEOUT");
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_inflight_timeout_keeps_unacknowledged_order_while_the_venue_cannot_answer() {
+        let (node, state, client_order_id) = run_node_with_unacknowledged_order(
+            "InflightProofFailureNode",
+            vec![
+                TargetedOrderReply::Fail,
+                TargetedOrderReply::Fail,
+                TargetedOrderReply::Unknown,
+            ],
+            3,
+        )
+        .await;
+
+        assert_eq!(
+            *state.targeted_order_report_ids.lock().unwrap(),
+            vec![client_order_id; 3],
+            "each failed proof is repeated, and only the venue's own answer rejects"
+        );
+        assert_eq!(
+            cached_order_status(&node, &client_order_id),
+            OrderStatus::Rejected
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_inflight_timeout_applies_the_real_state_of_a_canceled_unacknowledged_order() {
+        let report = test_order_report(
+            AccountId::from("BLOCKING-REPORT-001"),
+            ClientOrderId::from("O-UNACKNOWLEDGED"),
+            VenueOrderId::from("V-CANCELED"),
+            OrderStatus::Canceled,
+        );
+        let (node, state, client_order_id) = run_node_with_unacknowledged_order(
+            "InflightProofCanceledNode",
+            vec![TargetedOrderReply::Report(report)],
+            1,
+        )
+        .await;
+
+        assert_eq!(
+            *state.targeted_order_report_ids.lock().unwrap(),
+            vec![client_order_id]
+        );
+        assert_eq!(
+            cached_order_status(&node, &client_order_id),
+            OrderStatus::Canceled,
+            "the venue's cancel is applied instead of a blind rejection"
+        );
     }
 
     #[rstest]

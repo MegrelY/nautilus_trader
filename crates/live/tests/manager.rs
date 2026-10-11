@@ -3333,7 +3333,7 @@ async fn test_reconcile_mass_status_sorts_events_chronologically() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_order_generates_rejection_after_max_retries() {
+async fn test_inflight_submitted_order_is_not_rejected_on_the_timeout_alone() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
@@ -3345,7 +3345,6 @@ async fn test_inflight_order_generates_rejection_after_max_retries() {
 
     ctx.add_instrument(test_instrument());
 
-    // Order must be submitted (have account_id) to generate rejection
     let order = create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
@@ -3353,44 +3352,20 @@ async fn test_inflight_order_generates_rejection_after_max_retries() {
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await; // 200ms, past threshold
 
+    // The venue may hold the order behind a lost acknowledgement, so the timeout is no proof.
+    // Nothing here can ask a venue, so the order stays in flight instead of being rejected.
     let result = ctx.manager.check_inflight_orders();
 
-    assert_eq!(result.events.len(), 1);
-    assert!(matches!(result.events[0], OrderEventAny::Rejected(_)));
+    assert!(result.events.is_empty());
+    assert!(result.queries.is_empty());
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
 
-    if let OrderEventAny::Rejected(rejected) = &result.events[0] {
-        assert_eq!(rejected.client_order_id, client_order_id);
-        assert_eq!(rejected.reason.as_str(), "INFLIGHT_TIMEOUT");
-    }
-}
+    ctx.advance_both(dst::time::Duration::from_millis(200))
+        .await;
+    let again = ctx.manager.check_inflight_orders();
 
-#[cfg_attr(
-    not(all(feature = "simulation", madsim)),
-    tokio::test(start_paused = true)
-)]
-#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_timeout_uses_monotonic_gate_and_domain_event_timestamp() {
-    let config = ExecutionManagerConfig {
-        inflight_threshold_ms: 100,
-        inflight_max_retries: 1,
-        ..Default::default()
-    };
-    let mut ctx = TestContext::with_config(config);
-    let instrument_id = test_instrument_id();
-    let client_order_id = ClientOrderId::from("O-SPLIT");
-
-    ctx.add_instrument(test_instrument());
-    let order = create_submitted_order("O-SPLIT", instrument_id, OrderSide::Buy, "1.0", "3000.00");
-    ctx.add_order(order);
-
-    ctx.manager.register_inflight(client_order_id);
-    let domain_ts = ctx.clock.borrow().timestamp_ns();
-    advance_clock(dst::time::Duration::from_millis(200)).await;
-
-    let result = ctx.manager.check_inflight_orders();
-
-    assert_eq!(result.events.len(), 1);
-    assert_eq!(result.events[0].ts_event(), domain_ts);
+    assert!(again.events.is_empty());
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 2);
 }
 
 #[cfg_attr(
@@ -3600,13 +3575,14 @@ async fn test_inflight_increments_retry_count_before_max() {
     assert!(result2.events.is_empty()); // Still not at max
     assert_eq!(result2.queries.len(), 1);
 
-    // Third check - retry count becomes 3, equals max, generates rejection
+    // Third check - retry count becomes 3, equals max: no query, and no rejection either,
+    // because a submitted order is rejected only after a venue proof
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
     let result3 = ctx.manager.check_inflight_orders();
-    assert_eq!(result3.events.len(), 1);
-    assert!(matches!(result3.events[0], OrderEventAny::Rejected(_)));
+    assert!(result3.events.is_empty());
     assert!(result3.queries.is_empty());
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 3);
 }
 
 #[cfg_attr(
@@ -3768,21 +3744,20 @@ async fn test_inflight_no_query_at_max_retries() {
     assert!(result1.events.is_empty());
     assert_eq!(result1.queries.len(), 1);
 
-    // Second check - at max retries, generates terminal event only
+    // Second check - at max retries, generates no query. The submitted order gets no
+    // rejection from the timeout alone either: it waits for a venue proof.
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
     let result2 = ctx.manager.check_inflight_orders();
 
-    assert_eq!(
-        result2.events.len(),
-        1,
-        "Should generate terminal event at max retries"
-    );
     assert!(
         result2.queries.is_empty(),
         "Should not generate queries at max retries"
     );
-    assert!(matches!(result2.events[0], OrderEventAny::Rejected(_)));
+    assert!(
+        result2.events.is_empty(),
+        "A submitted order is not rejected on the timeout alone"
+    );
 }
 
 #[cfg_attr(
@@ -3960,17 +3935,24 @@ async fn test_inflight_terminal_event_clears_tracking() {
     let client_order_id = ClientOrderId::from("O-TERM");
 
     ctx.add_instrument(test_instrument());
-    let order = create_submitted_order("O-TERM", instrument_id, OrderSide::Buy, "1.0", "3000.00");
+    let order = create_pending_cancel_order(
+        "O-TERM",
+        instrument_id,
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+        VenueOrderId::from("V-TERM"),
+    );
     ctx.add_order(order);
 
     ctx.manager.register_inflight(client_order_id);
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
-    // First check generates terminal rejection
+    // First check generates the terminal cancellation of the pending cancel
     let result1 = ctx.manager.check_inflight_orders();
     assert_eq!(result1.events.len(), 1);
-    assert!(matches!(result1.events[0], OrderEventAny::Rejected(_)));
+    assert!(matches!(result1.events[0], OrderEventAny::Canceled(_)));
 
     // Second check should return empty (tracking was cleared)
     ctx.advance_both(dst::time::Duration::from_millis(200))

@@ -179,7 +179,7 @@ reconciliation completes, giving the system time to stabilize.
 
 | Scenario                            | Description                                               | System behavior                                 |
 | ----------------------------------- | --------------------------------------------------------- | ----------------------------------------------- |
-| **In‑flight submit timeout**        | `SUBMITTED` remains unconfirmed beyond retry exhaustion.  | Resolves to `REJECTED` with `INFLIGHT_TIMEOUT`. |
+| **In‑flight submit timeout**        | `SUBMITTED` remains unconfirmed beyond retry exhaustion.  | Asks the venue before it resolves the order.    |
 | **In‑flight cancel/update timeout** | `PENDING_CANCEL` or `PENDING_UPDATE` exceeds the retries. | Resolves to `CANCELED` through reconciliation.  |
 | **Open orders check discrepancy**   | Periodic poll detects a venue state change.               | Confirms status and applies transitions.        |
 | **Position check discrepancy**      | Periodic poll detects a position mismatch.                | Generates reconciliation events when eligible.  |
@@ -189,11 +189,23 @@ reconciliation completes, giving the system time to stabilize.
 
 | Current status   | Resolved to | Rationale                                                      |
 | ---------------- | ----------- | -------------------------------------------------------------- |
-| `SUBMITTED`      | `REJECTED`  | No acceptance was received before the retry limit.             |
+| `SUBMITTED`      | `REJECTED`  | The venue reported that it does not know the order.            |
 | `PENDING_UPDATE` | `CANCELED`  | The in‑flight checker applies a terminal reconciliation event. |
 | `PENDING_CANCEL` | `CANCELED`  | The in‑flight checker applies a terminal reconciliation event. |
 
-These terminal results come from the in‑flight timeout checker. A missing open‑order report does
+A `SUBMITTED` order is not rejected on the timeout alone: the venue may hold the order behind a
+lost acknowledgement. When the retries are exhausted, the engine issues a targeted
+`GenerateOrderStatusReport` query to each execution client that is responsible for the order:
+
+- A report goes through the normal order reconciliation, so a filled or canceled order gets its
+  real fill or cancel.
+- If every client answers `Ok(None)` and the order is still `SUBMITTED`, the engine rejects it with
+  `INFLIGHT_TIMEOUT`. An execution client must therefore return `Ok(None)` only when the venue
+  itself says that it does not know the order, and return an error when the request fails.
+- If a client fails, or no client can be asked, the order stays in flight. The engine asks again
+  after the threshold.
+
+The other terminal results come from the in‑flight timeout checker. A missing open‑order report does
 not by itself prove a pending modify or cancel outcome, so the consistency checks below leave those
 states unresolved until another check can determine the venue state.
 
