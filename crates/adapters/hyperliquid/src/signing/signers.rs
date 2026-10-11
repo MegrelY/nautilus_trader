@@ -473,6 +473,94 @@ mod tests {
         );
     }
 
+    /// The Hyperliquid SDK `action_hash`, written out byte by byte:
+    /// `msgpack(action) || nonce (8 bytes, big endian) || (0x00 | 0x01 || vault address)
+    /// || (0x00 || expiresAfter (8 bytes, big endian))`, hashed with keccak256.
+    fn sdk_action_hash(
+        action_bytes: &[u8],
+        nonce: u64,
+        vault: Option<&[u8]>,
+        expires_after: Option<u64>,
+    ) -> B256 {
+        let mut data = action_bytes.to_vec();
+        data.extend_from_slice(&nonce.to_be_bytes());
+
+        match vault {
+            None => data.push(0),
+            Some(vault) => {
+                data.push(1);
+                data.extend_from_slice(vault);
+            }
+        }
+
+        if let Some(expires_after) = expires_after {
+            data.push(0);
+            data.extend_from_slice(&expires_after.to_be_bytes());
+        }
+
+        let mut hasher = Keccak256::new();
+        hasher.update(&data);
+        hasher.finalize()
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(None, Some(1_640_995_215_000))]
+    #[case(
+        Some("0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"),
+        Some(1_640_995_215_000)
+    )]
+    fn test_connection_id_follows_the_sdk_action_hash_layout(
+        #[case] vault: Option<&str>,
+        #[case] expires_after: Option<u64>,
+    ) {
+        let private_key = EvmPrivateKey::new(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        )
+        .unwrap();
+        let signer = HyperliquidEip712Signer::new(&private_key).unwrap();
+        let typed_action = HyperliquidExecAction::Order {
+            orders: vec![HyperliquidExecPlaceOrderRequest {
+                asset: 0,
+                is_buy: true,
+                price: dec!(50000),
+                size: dec!(0.1),
+                reduce_only: false,
+                kind: HyperliquidExecOrderKind::Limit {
+                    limit: HyperliquidExecLimitParams {
+                        tif: HyperliquidExecTif::Gtc,
+                    },
+                },
+                cloid: None,
+            }],
+            grouping: HyperliquidExecGrouping::Na,
+            builder: None,
+        };
+        let action_bytes = rmp_serde::to_vec_named(&typed_action).unwrap();
+        let vault = vault.map(|vault| VaultAddress::parse(vault).unwrap());
+        let request = SignRequest {
+            action: None,
+            action_bytes: Some(action_bytes.clone()),
+            time_nonce: TimeNonce::from_millis(1640995200000),
+            action_type: HyperliquidActionType::L1,
+            is_testnet: false,
+            vault_address: vault,
+            expires_after,
+        };
+
+        let connection_id = signer.compute_connection_id(&request).unwrap();
+
+        assert_eq!(
+            connection_id,
+            sdk_action_hash(
+                &action_bytes,
+                1640995200000,
+                vault.as_ref().map(|vault| vault.as_bytes().as_slice()),
+                expires_after,
+            ),
+        );
+    }
+
     #[rstest]
     fn test_connection_id_with_vault_matches_reference() {
         let private_key = EvmPrivateKey::new(

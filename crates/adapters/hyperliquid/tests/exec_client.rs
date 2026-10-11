@@ -108,6 +108,8 @@ struct TestServerState {
     all_perp_metas_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     perp_dexs_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     last_exchange_action: Arc<tokio::sync::Mutex<Option<Value>>>,
+    /// Signed envelopes (action, nonce, signature, expiresAfter) of the WS exchange posts.
+    exchange_post_envelopes: Arc<tokio::sync::Mutex<Vec<Value>>>,
     reject_next_order: Arc<std::sync::atomic::AtomicBool>,
     /// Returns a `status="ok"` envelope whose inner `statuses[0]` carries a
     /// per-order `error` object on the next exchange call. This exercises
@@ -170,6 +172,7 @@ impl Default for TestServerState {
             all_perp_metas_response: Arc::new(tokio::sync::Mutex::new(None)),
             perp_dexs_response: Arc::new(tokio::sync::Mutex::new(None)),
             last_exchange_action: Arc::new(tokio::sync::Mutex::new(None)),
+            exchange_post_envelopes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reject_next_order: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inner_order_error_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_response_override: Arc::new(tokio::sync::Mutex::new(None)),
@@ -678,6 +681,11 @@ async fn handle_ws_post(socket: &mut WebSocket, state: &TestServerState, payload
     }
 
     *state.last_exchange_action.lock().await = Some(action.clone());
+    state
+        .exchange_post_envelopes
+        .lock()
+        .await
+        .push(payload["request"]["payload"].clone());
 
     if state.fail_next_exchange.swap(false, Ordering::Relaxed) {
         return send_ws_post_error_response(socket, id, "503 Service Unavailable").await;
@@ -4141,6 +4149,113 @@ async fn test_generate_order_status_report_without_oid_open_orders_failure_is_an
     );
     assert!(requests.lock().await.is_empty());
 
+    client.disconnect().await.unwrap();
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_order_and_modify_posts_expire_and_cancel_posts_do_not() {
+    // An order or modify whose post the adapter stopped waiting for must not reach the venue
+    // later, so the venue is told to refuse it after the post timeout plus a margin. The test
+    // config has a post timeout of 1 s, so the bound is 6 s after signing. A cancel is still
+    // wanted late and carries no bound.
+    let state = TestServerState::default();
+    let envelopes = state.exchange_post_envelopes.clone();
+    let exchange_count = state.exchange_request_count.clone();
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let order = make_limit_order("O-EXPIRY-001");
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    let coid = order.client_order_id();
+    let signed_after_ms = wall_clock_ms();
+
+    client
+        .submit_order(SubmitOrder::from_order(
+            &order,
+            order.trader_id(),
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        ))
+        .unwrap();
+    client
+        .modify_order(ModifyOrder::new(
+            order.trader_id(),
+            Some(*HYPERLIQUID_CLIENT_ID),
+            order.strategy_id(),
+            order.instrument_id(),
+            coid,
+            Some(VenueOrderId::from("88001")),
+            Some(Quantity::from("0.0002")),
+            Some(Price::from("56800.0")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None, // correlation_id
+        ))
+        .unwrap();
+    client
+        .cancel_order(make_cancel_entry(coid, VenueOrderId::from("88001")))
+        .unwrap();
+
+    wait_until_async(
+        move || {
+            let exchange_count = exchange_count.clone();
+            async move { *exchange_count.lock().await >= 3 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let signed_before_ms = wall_clock_ms();
+
+    let envelopes = envelopes.lock().await;
+    let envelope_of = |action_type: &str| {
+        envelopes
+            .iter()
+            .find(|envelope| envelope["action"]["type"] == action_type)
+            .unwrap_or_else(|| panic!("no {action_type} post, was {envelopes:?}"))
+    };
+
+    for action_type in ["order", "modify"] {
+        let expires_after = envelope_of(action_type)["expiresAfter"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{action_type} post carries no expiresAfter"));
+        assert!(
+            (signed_after_ms + 6_000..=signed_before_ms + 6_000).contains(&expires_after),
+            "{action_type} expires {expires_after} outside the window {signed_after_ms}..{signed_before_ms} plus 6 s",
+        );
+    }
+
+    let cancel = envelopes
+        .iter()
+        .find(|envelope| {
+            matches!(
+                envelope["action"]["type"].as_str(),
+                Some("cancel" | "cancelByCloid")
+            )
+        })
+        .expect("no cancel post");
+    assert!(
+        cancel.get("expiresAfter").is_none(),
+        "a cancel never expires, was {cancel}"
+    );
+
+    drop(envelopes);
     client.disconnect().await.unwrap();
 }
 

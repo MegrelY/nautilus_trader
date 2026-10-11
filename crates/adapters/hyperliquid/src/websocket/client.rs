@@ -75,6 +75,7 @@ use crate::{
         },
         rate_limits::{WeightedLimiter, exec_action_weight},
     },
+    signing::TimeNonce,
     websocket::{
         book::{BookStreamOptions, BookStreamRegistry, BookStreamRelease, BookStreamUse},
         enums::HyperliquidWsChannel,
@@ -92,6 +93,33 @@ use crate::{
 };
 
 const HYPERLIQUID_HEARTBEAT_MSG: &str = r#"{"method":"ping"}"#;
+
+/// Time that the venue gets on top of the post timeout before it refuses a stale order or
+/// modify. It covers the network latency of a post that the client waited for until its own
+/// timeout, and a small offset between the local clock and the venue clock.
+const ACTION_EXPIRY_MARGIN: Duration = Duration::from_secs(5);
+
+/// Returns the `expiresAfter` bound (Unix milliseconds) that `action` carries when posted.
+///
+/// An order or modify expires, so that a post whose answer the caller stopped waiting for can
+/// never reach the venue later: an order that the venue does not know after the expiry never
+/// will be known. A cancel never expires, because a late cancel is still wanted.
+fn action_expires_after(
+    action: &HyperliquidExecAction,
+    now_ms: u64,
+    post_timeout: Duration,
+) -> Option<u64> {
+    match action {
+        HyperliquidExecAction::Order { .. }
+        | HyperliquidExecAction::Modify { .. }
+        | HyperliquidExecAction::BatchModify { .. } => {
+            let window = post_timeout.saturating_add(ACTION_EXPIRY_MARGIN);
+            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+            Some(now_ms.saturating_add(window_ms))
+        }
+        _ => None,
+    }
+}
 
 /// FIFO bound on the cloid -> `ClientOrderId` resolution cache so missed
 /// evictions self-recover (see GH-3972 cancel-replace drain path).
@@ -528,12 +556,19 @@ impl HyperliquidWebSocketClient {
     /// The supplied HTTP client is used only as the canonical signer for the
     /// action envelope. The signed payload is sent over the active WebSocket
     /// connection and the response is correlated by post id.
+    ///
+    /// An order or modify is signed with an `expiresAfter` bound of the post timeout plus a
+    /// margin, so the venue refuses it if it arrives later. See [`action_expires_after`].
     pub async fn post_action_exec(
         &self,
         signer: &HyperliquidHttpClient,
         action: &HyperliquidExecAction,
     ) -> HyperliquidResult<HyperliquidExchangeResponse> {
-        self.post_action_exec_with_timeout(signer, action, self.post_timeout, None)
+        let expires_after = u64::try_from(TimeNonce::now_millis().as_millis())
+            .ok()
+            .and_then(|now_ms| action_expires_after(action, now_ms, self.post_timeout));
+
+        self.post_action_exec_with_timeout(signer, action, self.post_timeout, expires_after)
             .await
     }
 
@@ -2390,6 +2425,55 @@ mod tests {
 
         let topic = subscription_topic(&sub);
         assert_eq!(topic, "candle:BTC:1h");
+    }
+
+    fn order_action() -> HyperliquidExecAction {
+        HyperliquidExecAction::Order {
+            orders: Vec::new(),
+            grouping: HyperliquidExecGrouping::Na,
+            builder: None,
+        }
+    }
+
+    #[rstest]
+    #[case(order_action())]
+    #[case(HyperliquidExecAction::BatchModify { modifies: Vec::new() })]
+    fn test_order_and_modify_actions_expire_after_the_post_timeout_plus_the_margin(
+        #[case] action: HyperliquidExecAction,
+    ) {
+        let expires_after =
+            action_expires_after(&action, 1_700_000_000_000, Duration::from_secs(10));
+
+        assert_eq!(expires_after, Some(1_700_000_015_000));
+    }
+
+    #[rstest]
+    fn test_expiry_follows_the_configured_post_timeout() {
+        let expires_after =
+            action_expires_after(&order_action(), 1_700_000_000_000, Duration::from_secs(3));
+
+        assert_eq!(expires_after, Some(1_700_000_008_000));
+    }
+
+    #[rstest]
+    #[case(HyperliquidExecAction::Cancel { cancels: Vec::new(), fast: None })]
+    #[case(HyperliquidExecAction::CancelByCloid { cancels: Vec::new(), fast: None })]
+    #[case(HyperliquidExecAction::ScheduleCancel { time: None })]
+    #[case(HyperliquidExecAction::UpdateLeverage { asset: 0, is_cross: true, leverage: 3 })]
+    #[case(HyperliquidExecAction::Noop)]
+    fn test_other_actions_never_expire(#[case] action: HyperliquidExecAction) {
+        let expires_after =
+            action_expires_after(&action, 1_700_000_000_000, Duration::from_secs(10));
+
+        assert_eq!(expires_after, None);
+    }
+
+    #[rstest]
+    fn test_expiry_saturates_instead_of_overflowing() {
+        let expires_after =
+            action_expires_after(&order_action(), u64::MAX, Duration::from_secs(10));
+
+        assert_eq!(expires_after, Some(u64::MAX));
     }
 
     #[rstest]
