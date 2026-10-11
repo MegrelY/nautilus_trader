@@ -18,8 +18,9 @@ use serde::Serialize;
 use crate::{
     common::enums::{HyperliquidBarInterval, HyperliquidInfoRequestType},
     http::models::{
-        HyperliquidExecBuilderFee, HyperliquidExecCancelByCloidRequest, HyperliquidExecGrouping,
-        HyperliquidExecModifyOrderRequest, HyperliquidExecPlaceOrderRequest,
+        Cloid, HyperliquidExecBuilderFee, HyperliquidExecCancelByCloidRequest,
+        HyperliquidExecGrouping, HyperliquidExecModifyOrderRequest,
+        HyperliquidExecPlaceOrderRequest,
     },
 };
 
@@ -124,11 +125,24 @@ pub struct UserFillsByTimeParams {
     pub aggregate_by_time: bool,
 }
 
+/// Identifier of the order that an `orderStatus` request asks about.
+///
+/// The venue takes either the numeric order ID or the 16-byte hex client order ID in the
+/// same `oid` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum OrderStatusId {
+    /// Numeric venue order ID.
+    Oid(u64),
+    /// Client order ID as `0x`-prefixed 16-byte hex.
+    Cloid(String),
+}
+
 /// Parameters for order status request.
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderStatusParams {
     pub user: String,
-    pub oid: u64,
+    pub oid: OrderStatusId,
 }
 
 /// Parameters for open orders request.
@@ -319,7 +333,21 @@ impl InfoRequest {
             request_type: HyperliquidInfoRequestType::OrderStatus,
             params: InfoRequestParams::OrderStatus(OrderStatusParams {
                 user: user.to_string(),
-                oid,
+                oid: OrderStatusId::Oid(oid),
+            }),
+        }
+    }
+
+    /// Creates a request to get order status for a user by client order ID.
+    ///
+    /// The venue answers for open, filled, canceled and rejected orders alike, and
+    /// `unknownOid` when it holds no order under the client order ID.
+    pub fn order_status_by_cloid(user: &str, cloid: &Cloid) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::OrderStatus,
+            params: InfoRequestParams::OrderStatus(OrderStatusParams {
+                user: user.to_string(),
+                oid: OrderStatusId::Cloid(cloid.to_hex()),
             }),
         }
     }
@@ -610,6 +638,40 @@ mod tests {
                 "user": "0xabc",
                 "coin": "PUMP",
             })
+        );
+    }
+
+    #[rstest]
+    fn test_info_request_order_status_by_oid_serializes_a_number() {
+        let request = InfoRequest::order_status("0xabc", 12345);
+
+        assert_eq!(
+            request.request_type,
+            HyperliquidInfoRequestType::OrderStatus
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"type": "orderStatus", "user": "0xabc", "oid": 12345}),
+        );
+    }
+
+    #[rstest]
+    fn test_info_request_order_status_by_cloid_serializes_the_hex_string() {
+        let cloid = Cloid::from_hex("0x00112233445566778899aabbccddeeff").unwrap();
+
+        let request = InfoRequest::order_status_by_cloid("0xabc", &cloid);
+
+        assert_eq!(
+            request.request_type,
+            HyperliquidInfoRequestType::OrderStatus
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type": "orderStatus",
+                "user": "0xabc",
+                "oid": "0x00112233445566778899aabbccddeeff",
+            }),
         );
     }
 

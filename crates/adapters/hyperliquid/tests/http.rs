@@ -49,7 +49,7 @@ use nautilus_hyperliquid::{
 use nautilus_model::{
     data::BarType,
     enums::{OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
-    identifiers::{AccountId, ClientOrderId, InstrumentId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
 };
 use nautilus_network::http::{HttpClient, Method};
 use rstest::rstest;
@@ -62,6 +62,8 @@ struct TestServerState {
     rate_limit_after: Arc<AtomicUsize>,
     frontend_open_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     order_status_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    order_status_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    order_status_fails: Arc<std::sync::atomic::AtomicBool>,
     clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     spot_clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     spot_fails: Arc<std::sync::atomic::AtomicBool>,
@@ -75,6 +77,8 @@ impl Default for TestServerState {
             rate_limit_after: Arc::new(AtomicUsize::new(usize::MAX)),
             frontend_open_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
+            order_status_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -197,6 +201,20 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         }
         "userFills" | "userFillsByTime" => Json(json!([])).into_response(),
         "orderStatus" => {
+            state
+                .order_status_requests
+                .lock()
+                .await
+                .push(request_body.clone());
+
+            if state.order_status_fails.load(Ordering::Relaxed) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "orderStatus unavailable"})),
+                )
+                    .into_response();
+            }
+
             let custom = state.order_status_response.lock().await;
             Json(custom.clone().unwrap_or(json!({"statuses": []}))).into_response()
         }
@@ -1897,4 +1915,233 @@ async fn test_request_order_status_report_by_client_order_id_errors_for_malforme
         .await
         .expect_err("a malformed private source must not look absent");
     assert!(matches!(error, Error::Decode(message) if message.contains("frontend open orders")));
+}
+
+fn order_status_entry(oid: u64, status: &str, cloid: Option<&str>) -> Value {
+    let mut order = json!({
+        "coin": "BTC",
+        "side": "B",
+        "limitPx": "95000.0",
+        "sz": "0.0",
+        "oid": oid,
+        "timestamp": 1700000000000u64,
+        "origSz": "0.1",
+    });
+
+    if let Some(cloid) = cloid {
+        order["cloid"] = json!(cloid);
+    }
+
+    json!({
+        "status": "order",
+        "order": {
+            "order": order,
+            "status": status,
+            "statusTimestamp": 1700001000000u64,
+        }
+    })
+}
+
+#[rstest]
+#[case("filled", OrderStatus::Filled)]
+#[case("canceled", OrderStatus::Canceled)]
+#[case("rejected", OrderStatus::Rejected)]
+#[case("open", OrderStatus::Accepted)]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_finds_order_that_is_not_open(
+    #[case] venue_status: &str,
+    #[case] expected: OrderStatus,
+) {
+    let coid = ClientOrderId::new("O-20240101-000101");
+    let cloid_hex = Cloid::from_client_order_id(coid).to_hex();
+
+    let state = TestServerState::default();
+    let requests = state.order_status_requests.clone();
+    *state.order_status_response.lock().await =
+        Some(order_status_entry(66666, venue_status, Some(&cloid_hex)));
+
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let report = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .unwrap()
+        .expect("the venue knows an order under the cloid");
+
+    assert_eq!(report.order_status, expected);
+    assert_eq!(
+        report.client_order_id,
+        Some(coid),
+        "the report carries the Nautilus client order id, not the venue cloid"
+    );
+    assert_eq!(report.venue_order_id, VenueOrderId::from("66666"));
+    assert_eq!(
+        report.ts_last.as_u64(),
+        1700001000000u64 * 1_000_000,
+        "ts_last should use statusTimestamp"
+    );
+    assert_eq!(
+        *requests.lock().await,
+        vec![json!({"type": "orderStatus", "user": "0xuser", "oid": cloid_hex})],
+        "the cloid goes out as the 16-byte hex string in the oid field"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_unknown_oid_is_none() {
+    let state = TestServerState::default();
+    *state.order_status_response.lock().await = Some(json!({"status": "unknownOid"}));
+
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let coid = ClientOrderId::new("O-20240101-000102");
+    let report = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .unwrap();
+
+    assert!(report.is_none(), "unknownOid is the venue's own answer");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_asks_cached_and_derived_cloid() {
+    let coid = ClientOrderId::new("O-20240101-000103");
+    let cached = Cloid::from_hex("0x00112233445566778899aabbccddeeff").unwrap();
+    let derived = Cloid::from_client_order_id(coid);
+
+    let state = TestServerState::default();
+    let requests = state.order_status_requests.clone();
+    *state.order_status_response.lock().await = Some(json!({"status": "unknownOid"}));
+
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+    client.cache_client_order_id_cloid(coid, cached);
+
+    let report = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .unwrap();
+
+    assert!(report.is_none());
+    assert_eq!(
+        *requests.lock().await,
+        vec![
+            json!({"type": "orderStatus", "user": "0xuser", "oid": cached.to_hex()}),
+            json!({"type": "orderStatus", "user": "0xuser", "oid": derived.to_hex()}),
+        ],
+        "unknown needs both cloids that the order can sit under to be unknown"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_malformed_body_is_an_error() {
+    // The mock answers {"statuses": []} when no response is set: not an orderStatus body.
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let coid = ClientOrderId::new("O-20240101-000104");
+    let error = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .expect_err("a body that is not an orderStatus answer must not look like unknownOid");
+
+    assert!(matches!(error, Error::Serde(_)), "was {error:?}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_http_error_is_an_error() {
+    let state = TestServerState::default();
+    state.order_status_fails.store(true, Ordering::Relaxed);
+    *state.order_status_response.lock().await = Some(json!({"status": "unknownOid"}));
+
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let coid = ClientOrderId::new("O-20240101-000105");
+    let error = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .expect_err("an HTTP 500 must not look like unknownOid");
+
+    assert!(
+        matches!(error, Error::Http { status: 500, .. }),
+        "was {error:?}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_transport_failure_is_an_error() {
+    // Nothing listens on port 1, so the request cannot reach a venue at all.
+    let mut client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+    client.set_base_info_url("http://127.0.0.1:1/info".to_string());
+    client.set_account_id(AccountId::new("HYPERLIQUID-master"));
+    cache_btc_instrument(&client);
+
+    let coid = ClientOrderId::new("O-20240101-000106");
+    let result = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a transport failure is not unknown, was {result:?}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_unresolved_instrument_is_an_error()
+ {
+    let coid = ClientOrderId::new("O-20240101-000107");
+    let cloid_hex = Cloid::from_client_order_id(coid).to_hex();
+
+    let state = TestServerState::default();
+    let mut entry = order_status_entry(66667, "filled", Some(&cloid_hex));
+    entry["order"]["order"]["coin"] = json!("UNKNOWN");
+    *state.order_status_response.lock().await = Some(entry);
+
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+
+    let error = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .expect_err("an unresolved order instrument must not look absent");
+
+    assert!(matches!(error, Error::Decode(message) if message.contains("UNKNOWN")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_report_by_client_order_id_exact_another_cloid_is_an_error() {
+    let coid = ClientOrderId::new("O-20240101-000108");
+    let other_hex = Cloid::from_client_order_id(ClientOrderId::new("O-SOMETHING-ELSE")).to_hex();
+
+    let state = TestServerState::default();
+    *state.order_status_response.lock().await =
+        Some(order_status_entry(66668, "filled", Some(&other_hex)));
+
+    let addr = start_mock_server(state).await;
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let error = client
+        .request_order_status_report_by_client_order_id_exact("0xuser", &coid)
+        .await
+        .expect_err("an order under another cloid must not be taken for this one");
+
+    assert!(matches!(error, Error::Decode(message) if message.contains(&other_hex)));
 }

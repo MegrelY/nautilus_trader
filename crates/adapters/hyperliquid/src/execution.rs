@@ -2236,7 +2236,27 @@ impl ExecutionClient for HyperliquidExecutionClient {
             }
 
             let Some(venue_order_id) = venue_order_id else {
-                log::debug!("No order status report found for {client_order_id}");
+                // Nothing to ask for by oid: the order was never acknowledged, or its
+                // acknowledgement was lost. `orderStatus` by client order ID also finds
+                // it when it has already filled or canceled.
+                match http_client
+                    .request_order_status_report_by_client_order_id_exact(
+                        &account_address,
+                        &client_order_id,
+                    )
+                    .await
+                {
+                    Ok(Some(report)) => {
+                        log::debug!("Queried order status for {client_order_id} by client order ID");
+                        emitter.send_order_status_report(report);
+                    }
+                    Ok(None) => {
+                        log::debug!("No order status report found for {client_order_id}");
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to query order status for {client_order_id}: {e}");
+                    }
+                }
                 return Ok(());
             };
 
@@ -2365,6 +2385,11 @@ impl ExecutionClient for HyperliquidExecutionClient {
         Ok(())
     }
 
+    /// Generates a single order status report.
+    ///
+    /// `Ok(None)` is the venue's own answer that it does not know the order. A request that
+    /// fails, a response that does not parse, and an old-leg report that a modify in flight
+    /// supersedes are errors, because the live node rejects an in-flight order on `Ok(None)`.
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -2381,30 +2406,23 @@ impl ExecutionClient for HyperliquidExecutionClient {
         // Search open orders by cloid first when supplied. Hyperliquid modify
         // produces a new venue oid while preserving cloid, so a cached oid can
         // point at the canceled leg rather than the live replacement.
-        if let Some(client_order_id) = &cmd.client_order_id {
-            match self
+        if let Some(client_order_id) = &cmd.client_order_id
+            && let Some(report) = self
                 .http_client
                 .request_order_status_report_by_client_order_id(&account_address, client_order_id)
                 .await
-            {
-                Ok(Some(report)) => {
-                    promote_replacement_from_query(
-                        &report,
-                        &self.ws_dispatch_state,
-                        &self.emitter,
-                        self.clock.get_time_ns(),
-                    );
-                    log::debug!("Generated order status report for {client_order_id}");
-                    return Ok(Some(report));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!(
-                        "Failed to generate order status report for {client_order_id}: {e}; \
-                         falling back to oid lookup"
-                    );
-                }
-            }
+                .with_context(|| {
+                    format!("failed to look up {client_order_id} among the open orders")
+                })?
+        {
+            promote_replacement_from_query(
+                &report,
+                &self.ws_dispatch_state,
+                &self.emitter,
+                self.clock.get_time_ns(),
+            );
+            log::debug!("Generated order status report for {client_order_id}");
+            return Ok(Some(report));
         }
 
         let oid = match &cmd.venue_order_id {
@@ -2423,8 +2441,29 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     match cached_oid {
                         Some(oid) => oid,
                         None => {
-                            log::debug!("No order status report found for {client_order_id}");
-                            return Ok(None);
+                            // No oid to ask for: `orderStatus` by client order ID is the
+                            // venue's own answer, and finds a filled or canceled order.
+                            let report = self
+                                .http_client
+                                .request_order_status_report_by_client_order_id_exact(
+                                    &account_address,
+                                    client_order_id,
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to look up {client_order_id} by client order ID"
+                                    )
+                                })?;
+
+                            if report.is_some() {
+                                log::debug!(
+                                    "Generated order status report for {client_order_id} by client order ID"
+                                );
+                            } else {
+                                log::debug!("No order status report found for {client_order_id}");
+                            }
+                            return Ok(report);
                         }
                     }
                 }
@@ -2442,10 +2481,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
             && let Some(client_order_id) = &cmd.client_order_id
             && is_inflight_modify_old_leg_cancel(&self.ws_dispatch_state, client_order_id, report)
         {
-            log::debug!(
-                "Suppressing stale old-leg Canceled for {client_order_id}: modify in flight"
+            // Not `Ok(None)`: that would tell the caller the venue does not know the order.
+            anyhow::bail!(
+                "order {client_order_id} has a modify in flight, so the Canceled report for its old leg is not an answer"
             );
-            return Ok(None);
         }
 
         if report.is_some() {

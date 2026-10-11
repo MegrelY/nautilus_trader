@@ -545,6 +545,17 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
+    /// Get order status for a user by client order ID.
+    pub async fn info_order_status_by_cloid(
+        &self,
+        user: &str,
+        cloid: &Cloid,
+    ) -> Result<HyperliquidOrderStatus> {
+        let request = InfoRequest::order_status_by_cloid(user, cloid);
+        let response = self.send_info_request(&request).await?;
+        serde_json::from_value(response).map_err(Error::Serde)
+    }
+
     /// Get all open orders for a user.
     pub async fn info_open_orders(&self, user: &str) -> Result<Value> {
         let request = InfoRequest::open_orders(user);
@@ -2168,6 +2179,15 @@ impl HyperliquidHttpClient {
         self.inner.info_order_status(user, oid).await
     }
 
+    /// Get order status for a user by client order ID.
+    pub async fn info_order_status_by_cloid(
+        &self,
+        user: &str,
+        cloid: &Cloid,
+    ) -> Result<HyperliquidOrderStatus> {
+        self.inner.info_order_status_by_cloid(user, cloid).await
+    }
+
     /// Get all open orders for a user.
     pub async fn info_open_orders(&self, user: &str) -> Result<Value> {
         self.inner.info_open_orders(user).await
@@ -3088,11 +3108,77 @@ impl HyperliquidHttpClient {
         let ts_init = self.clock.get_time_ns();
         // Order not in open set: query by oid (returns limited HyperliquidOrderInfo)
         let response = self.info_order_status(user, oid).await?;
-        let entry = match response.into_order() {
-            Some(e) => e,
-            None => return Ok(None),
-        };
 
+        response
+            .into_order()
+            .map(|entry| self.order_status_entry_report(entry, account_id, ts_init))
+            .transpose()
+    }
+
+    /// Request an order status report by client order ID from the `orderStatus` endpoint.
+    ///
+    /// Unlike [`Self::request_order_status_report_by_client_order_id`], which sees open
+    /// orders only, the venue answers for filled, canceled and rejected orders too, and for
+    /// an order that has no known venue order ID. `Ok(None)` is the venue's own answer that
+    /// it holds no order under the client order ID. Every transport, HTTP, decode and
+    /// instrument failure is an error, never `Ok(None)`.
+    ///
+    /// The order sits under the cached CLOID when one is cached and under the CLOID that
+    /// derives from the client order ID otherwise, so both are asked when they differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails, the response does not parse, the order
+    /// belongs to another CLOID, or its instrument is not cached.
+    pub async fn request_order_status_report_by_client_order_id_exact(
+        &self,
+        user: &str,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<OrderStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let ts_init = self.clock.get_time_ns();
+
+        let derived = Cloid::from_client_order_id(*client_order_id);
+        let mut cloids = Vec::with_capacity(2);
+        cloids.extend(self.cached_client_order_id_cloid(client_order_id));
+
+        if !cloids.contains(&derived) {
+            cloids.push(derived);
+        }
+
+        for cloid in cloids {
+            let response = self.info_order_status_by_cloid(user, &cloid).await?;
+            let Some(entry) = response.into_order() else {
+                continue;
+            };
+            let cloid_hex = cloid.to_hex();
+
+            if let Some(reported) = &entry.order.cloid
+                && !reported.eq_ignore_ascii_case(&cloid_hex)
+            {
+                return Err(Error::decode(format!(
+                    "orderStatus for cloid {cloid_hex} returned an order under cloid {reported}"
+                )));
+            }
+
+            let mut report = self.order_status_entry_report(entry, account_id, ts_init)?;
+            report.client_order_id = Some(*client_order_id);
+            return Ok(Some(report));
+        }
+
+        Ok(None)
+    }
+
+    /// Builds the status report for an order that the `orderStatus` endpoint returned.
+    fn order_status_entry_report(
+        &self,
+        entry: HyperliquidOrderStatusEntry,
+        account_id: AccountId,
+        ts_init: UnixNanos,
+    ) -> Result<OrderStatusReport> {
+        let oid = entry.order.oid;
         let instrument = self
             .get_or_create_instrument(&entry.order.coin, None)
             .ok_or_else(|| {
@@ -3124,31 +3210,34 @@ impl HyperliquidHttpClient {
             trailing_stop: None,
         };
 
-        match parse_order_status_report_from_basic(
+        let mut report = parse_order_status_report_from_basic(
             &basic,
             &entry.status,
             &instrument,
             account_id,
             ts_init,
-        ) {
-            Ok(mut report) => {
-                // Use status_timestamp for ts_last when available (more accurate
-                // than the order creation timestamp for filled/canceled orders)
-                if entry.status_timestamp > 0 {
-                    report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
-                }
-                Ok(Some(report))
-            }
-            Err(error) => Err(Error::decode(format!(
+        )
+        .map_err(|error| {
+            Error::decode(format!(
                 "Failed to parse order status report for oid {oid}: {error}"
-            ))),
+            ))
+        })?;
+
+        // Use status_timestamp for ts_last when available (more accurate
+        // than the order creation timestamp for filled/canceled orders)
+        if entry.status_timestamp > 0 {
+            report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
         }
+
+        Ok(report)
     }
 
     /// Request a single order status report by client order ID.
     ///
     /// Searches `info_frontend_open_orders` for an order whose cloid matches the
-    /// cached CLOID or the generated CLOID. Only finds open orders.
+    /// cached CLOID or the generated CLOID. Only finds open orders: use
+    /// [`Self::request_order_status_report_by_client_order_id_exact`] for an order that
+    /// may have filled, canceled or been rejected.
     ///
     /// # Errors
     ///
