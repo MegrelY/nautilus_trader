@@ -20,7 +20,9 @@
 //!
 //! 1. The execution client registers an [`OrderIdentity`] in [`WsDispatchState`]
 //!    when it submits an order, and refreshes the cached venue order id when a
-//!    modify is sent so the WebSocket consumer can detect cancel-replace.
+//!    modify is sent so the WebSocket consumer can detect cancel-replace. A modify
+//!    of a cached order that this client did not submit first tracks that order
+//!    through [`WsDispatchState::track_cached_order`].
 //! 2. Incoming [`OrderStatusReport`] and [`FillReport`] messages are routed
 //!    through [`dispatch_order_event`] and [`dispatch_order_fill`].
 //!    For tracked orders these build typed [`OrderEventAny`] events and emit
@@ -84,6 +86,7 @@ use nautilus_model::{
         OrderTriggered, OrderUpdated,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, VenueOrderId},
+    orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport},
     types::{Price, Quantity},
 };
@@ -328,6 +331,50 @@ impl WsDispatchState {
         self.order_identities
             .get(client_order_id)
             .map(|r| r.clone())
+    }
+
+    /// Tracks a cached order that this client did not submit, before a modify of it.
+    ///
+    /// An order restored from the cache after a restart has no identity here, so both
+    /// legs of its cancel-replace, `ACCEPTED(new_voi)` and `CANCELED(old_voi)`, would
+    /// route as external reports and the engine would see a cancel of a live order.
+    /// Registering the identity, the cached venue order id, the accepted mark, and the
+    /// filled quantity first lets the cancel-replace handling promote the replacement
+    /// leg and suppress the stale cancel, as for an order submitted by this client.
+    ///
+    /// Does nothing for an order that is already tracked, or for a quote-quantity order
+    /// (see `register_order_identity_into` in the execution client). The order was
+    /// submitted earlier, so no submission is marked as pending.
+    pub fn track_cached_order(&self, order: &OrderAny) {
+        let client_order_id = order.client_order_id();
+
+        if order.is_quote_quantity() || self.order_identities.contains_key(&client_order_id) {
+            return;
+        }
+
+        if let Some(venue_order_id) = order.venue_order_id() {
+            self.record_venue_order_id(client_order_id, venue_order_id);
+            self.insert_accepted(client_order_id);
+        }
+
+        let filled_qty = order.filled_qty();
+        if filled_qty.is_positive() {
+            self.record_filled_qty(client_order_id, filled_qty);
+        }
+
+        // Register the identity last: the dispatch reads it first, so no report can
+        // find an order that is only partly tracked
+        self.register_identity(
+            client_order_id,
+            OrderIdentity {
+                strategy_id: order.strategy_id(),
+                instrument_id: order.instrument_id(),
+                order_side: order.order_side(),
+                order_type: order.order_type(),
+                quantity: order.quantity(),
+                price: order.price(),
+            },
+        );
     }
 
     /// Marks a tracked order as awaiting its submission POST response.

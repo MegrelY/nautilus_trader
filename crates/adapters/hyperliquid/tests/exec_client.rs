@@ -3021,6 +3021,61 @@ async fn test_modify_order_success_marks_pending_modify() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_modify_order_tracks_cached_order_without_identity() {
+    // An order restored from the cache after a restart was not submitted by this
+    // client, so the dispatch state holds no identity for it. A modify must track
+    // the cached order first: otherwise the `ACCEPTED(new_voi)` and the
+    // `CANCELED(old_voi)` of the cancel-replace both route as external reports,
+    // and the engine sees a cancel of a live order.
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let old_voi = VenueOrderId::from("55002");
+    let filled_qty = Quantity::from("0.00004");
+    let order =
+        open_limit_order_with_filled_qty(&cache, "O-MOD-CACHED", old_voi.as_str(), filled_qty);
+    let cid = order.client_order_id();
+    assert!(client.ws_dispatch_state().lookup_identity(&cid).is_none());
+
+    client
+        .modify_order(make_modify_cmd(&order, Some(old_voi)))
+        .unwrap();
+
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let dispatch = client.ws_dispatch_state();
+    let identity = dispatch
+        .lookup_identity(&cid)
+        .expect("a modify must track the cached order");
+    assert_eq!(identity.strategy_id, order.strategy_id());
+    assert_eq!(identity.instrument_id, order.instrument_id());
+    assert_eq!(identity.order_side, OrderSide::Buy);
+    assert_eq!(identity.order_type, OrderType::Limit);
+    assert_eq!(identity.quantity, order.quantity());
+    assert_eq!(identity.price, order.price());
+    assert_eq!(dispatch.cached_venue_order_id(&cid), Some(old_voi));
+    assert!(dispatch.emitted_accepted.contains(&cid));
+    assert_eq!(dispatch.previous_filled_qty(&cid), Some(filled_qty));
+    assert!(!dispatch.submission_pending(&cid));
+    assert_eq!(dispatch.pending_modify(&cid), Some(old_voi));
+    assert_eq!(
+        dispatch.pending_modify_target_qty(&cid),
+        Some(Quantity::from("0.0002")),
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_modify_order_uses_cached_cloid_target_without_venue_order_id() {
     let state = TestServerState::default();
     let last_action = state.last_exchange_action.clone();
@@ -3402,6 +3457,18 @@ async fn test_batch_modify_orders_posts_one_native_action() {
             .pending_modify(&second.client_order_id()),
         Some(VenueOrderId::from("41002")),
     );
+    // Neither child was submitted by this client: the batch tracks each cached order
+    for (order, old_voi) in [(&first, "41001"), (&second, "41002")] {
+        let dispatch = client.ws_dispatch_state();
+        assert!(
+            dispatch.lookup_identity(&order.client_order_id()).is_some(),
+            "a batch modify must track the cached order",
+        );
+        assert_eq!(
+            dispatch.cached_venue_order_id(&order.client_order_id()),
+            Some(VenueOrderId::from(old_voi)),
+        );
+    }
     let outcome = recv_batch_modify_outcome(&mut outcomes, command_id).await;
     let HyperliquidBatchModifyResponse::Complete(children) = outcome.response else {
         panic!("expected complete batch-modify response evidence")

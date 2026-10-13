@@ -974,10 +974,13 @@ The Rust-native `HyperliquidExecutionClient` (used through
 Rust side via the
 [`WsDispatchState`](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/hyperliquid/src/websocket/dispatch.rs)
 owned by the execution client. On submission the client registers an `OrderIdentity` (strategy,
-instrument, side, type, quantity, last-known price) keyed by `client_order_id`. Each inbound
-status report or fill is routed through the dispatch: tracked orders emit typed
-`OrderEventAny::*` events via `ExecutionEventEmitter::send_order_event`; external orders fall
-back to the raw `OrderStatusReport` / `FillReport` so the engine can reconcile. The dispatch
+instrument, side, type, quantity, last-known price) keyed by `client_order_id`. A modify of a
+cached order that this client did not submit, such as an order restored after a restart, first
+registers the same identity together with the cached venue order id, the accepted mark, and any
+filled quantity, so that its cancel-replace routes as a tracked update and not as external
+reports. Each inbound status report or fill is routed through the dispatch: tracked orders emit
+typed `OrderEventAny::*` events via `ExecutionEventEmitter::send_order_event`; external orders
+fall back to the raw `OrderStatusReport` / `FillReport` so the engine can reconcile. The dispatch
 compares the report's `venue_order_id` against the last cached value for the `cloid`; when
 they differ it promotes the `ACCEPTED` to `OrderUpdated` and suppresses the paired stale cancel:
 

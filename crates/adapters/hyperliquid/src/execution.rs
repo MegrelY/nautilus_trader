@@ -3185,6 +3185,8 @@ struct PreparedModify {
     venue_order_id: Option<VenueOrderId>,
     old_venue_order_id: Option<VenueOrderId>,
     target_total_qty: Quantity,
+    /// The cached order, tracked by the dispatch before its modify intent is queued.
+    order: OrderAny,
     request: HyperliquidExecModifyOrderRequest,
     generated_modify_cloid: Option<(ClientOrderId, Cloid)>,
 }
@@ -3330,6 +3332,7 @@ fn prepare_modify(
         venue_order_id,
         old_venue_order_id,
         target_total_qty,
+        order,
         request: HyperliquidExecModifyOrderRequest {
             oid: modify_target,
             order: order_request,
@@ -3350,6 +3353,9 @@ fn activate_modify(client: &HyperliquidExecutionClient, prepared: PreparedModify
     client
         .ws_client
         .cache_cloid_mapping(Ustr::from(&cloid.to_hex()), prepared.client_order_id);
+    // An order of an earlier session has no identity here yet: track it before the
+    // modify intent, so both legs of the cancel-replace route as tracked updates
+    client.ws_dispatch_state.track_cached_order(&prepared.order);
     let modify_generation = prepared.old_venue_order_id.map(|old_venue_order_id| {
         let generation = client.ws_dispatch_state.mark_pending_modify(
             prepared.client_order_id,
@@ -4453,7 +4459,7 @@ mod tests {
             AccountType, ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
             TimeInForce, TriggerType,
         },
-        events::OrderEventAny,
+        events::{OrderAccepted, OrderEventAny, OrderFilled, OrderSubmitted},
         identifiers::{
             AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
         },
@@ -5873,6 +5879,242 @@ mod tests {
             state
                 .lookup_identity(&ClientOrderId::from("O-QQ-001"))
                 .is_none()
+        );
+    }
+
+    /// A LIMIT order as the cache holds it after a restart: accepted at the venue
+    /// under `venue_order_id`, and partly filled when `filled_qty` is given.
+    fn accepted_limit_order(
+        client_order_id: &str,
+        venue_order_id: &str,
+        filled_qty: Option<Quantity>,
+    ) -> OrderAny {
+        let account_id = AccountId::from("HYPERLIQUID-001");
+        let venue_order_id = VenueOrderId::new(venue_order_id);
+        let mut order = limit_order_with_flags(client_order_id, false, false);
+        let mut events = vec![
+            OrderEventAny::Submitted(OrderSubmitted::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                account_id,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            )),
+            OrderEventAny::Accepted(OrderAccepted::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                venue_order_id,
+                account_id,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+            )),
+        ];
+
+        if let Some(last_qty) = filled_qty {
+            events.push(OrderEventAny::Filled(OrderFilled::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                venue_order_id,
+                account_id,
+                TradeId::new("trade-partial"),
+                order.order_side(),
+                OrderType::Limit,
+                last_qty,
+                Price::from("56730.0"),
+                Currency::USD(),
+                LiquiditySide::Taker,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+                None,
+                Some(Money::new(0.0, Currency::USD())),
+                None,
+            )));
+        }
+
+        for event in events {
+            order
+                .apply(event)
+                .expect("cached order should accept the event");
+        }
+
+        order
+    }
+
+    #[rstest]
+    fn test_track_cached_order_registers_what_a_modify_needs() {
+        let state = WsDispatchState::new();
+        let filled_qty = Quantity::from("0.00004");
+        let order = accepted_limit_order("O-TRACK-001", "old-voi", Some(filled_qty));
+        let cid = order.client_order_id();
+
+        state.track_cached_order(&order);
+
+        let identity = state
+            .lookup_identity(&cid)
+            .expect("identity should be registered");
+        assert_eq!(identity.strategy_id, StrategyId::from("S-001"));
+        assert_eq!(
+            identity.instrument_id,
+            InstrumentId::from(TEST_INSTRUMENT_ID)
+        );
+        assert_eq!(identity.order_side, OrderSide::Buy);
+        assert_eq!(identity.order_type, OrderType::Limit);
+        assert_eq!(identity.quantity, Quantity::from("0.0001"));
+        assert_eq!(identity.price, Some(Price::from("56730.0")));
+        assert_eq!(
+            state.cached_venue_order_id(&cid),
+            Some(VenueOrderId::new("old-voi")),
+        );
+        assert!(state.emitted_accepted.contains(&cid));
+        assert_eq!(state.previous_filled_qty(&cid), Some(filled_qty));
+        // The order was submitted earlier, so no submission POST response is pending
+        assert!(!state.submission_pending(&cid));
+    }
+
+    #[rstest]
+    fn test_track_cached_order_skips_tracked_and_quote_quantity_orders() {
+        let state = WsDispatchState::new();
+
+        // An order that is already tracked keeps its identity, and nothing else is recorded
+        let tracked = accepted_limit_order("O-TRACK-002", "old-voi", None);
+        let tracked_id = tracked.client_order_id();
+        let mut identity = test_identity();
+        identity.quantity = Quantity::from("0.0005");
+        state.register_identity(tracked_id, identity);
+
+        state.track_cached_order(&tracked);
+
+        assert_eq!(
+            state.lookup_identity(&tracked_id).map(|i| i.quantity),
+            Some(Quantity::from("0.0005")),
+        );
+        assert!(state.cached_venue_order_id(&tracked_id).is_none());
+        assert!(!state.emitted_accepted.contains(&tracked_id));
+
+        // A quote-quantity order flows through the untracked path, as at submission
+        let quote = limit_order_with_flags("O-TRACK-003", true, false);
+        state.track_cached_order(&quote);
+        assert!(state.lookup_identity(&quote.client_order_id()).is_none());
+    }
+
+    /// A modify of a cached order that this client did not submit. The venue reports
+    /// the cancel-replace as `ACCEPTED(new_voi)` and `CANCELED(old_voi)`, in either
+    /// order. With the order tracked first, the pair is one `OrderUpdated` and never
+    /// a cancel.
+    #[rstest]
+    #[case::replacement_first(true)]
+    #[case::cancel_first(false)]
+    fn test_modify_of_tracked_cached_order_emits_one_update_and_no_cancel(
+        #[case] replacement_first: bool,
+    ) {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let order = accepted_limit_order("O-HER-CACHED", "old-voi", None);
+        let cid = order.client_order_id();
+        let target_total = Quantity::from("0.0002");
+
+        // What `activate_modify` does for a prepared modify
+        state.track_cached_order(&order);
+        state.mark_pending_modify(cid, VenueOrderId::new("old-voi"), target_total);
+
+        let replacement = make_status_report_with_quantity(
+            Some("O-HER-CACHED"),
+            "new-voi",
+            OrderStatus::Accepted,
+            target_total,
+        );
+        let old_leg = make_status_report(Some("O-HER-CACHED"), "old-voi", OrderStatus::Canceled);
+        let reports = if replacement_first {
+            [replacement, old_leg]
+        } else {
+            [old_leg, replacement]
+        };
+
+        for report in reports {
+            handle_execution_report(
+                ExecutionReport::Order(report),
+                &state,
+                &emitter,
+                &ws_client,
+                &make_http_client(),
+                &mut pending_cloids,
+                UnixNanos::default(),
+            );
+        }
+
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            1,
+            "expected one OrderUpdated, found {events:?}"
+        );
+        match &events[0] {
+            ExecutionEvent::Order(OrderEventAny::Updated(updated)) => {
+                assert_eq!(updated.venue_order_id, Some(VenueOrderId::new("new-voi")));
+                assert_eq!(updated.quantity, target_total);
+            }
+            other => panic!("expected OrderUpdated, found {other:?}"),
+        }
+        assert_eq!(
+            state.cached_venue_order_id(&cid),
+            Some(VenueOrderId::new("new-voi")),
+        );
+        assert!(!state.filled_orders.contains(&cid));
+    }
+
+    /// Without tracking, the same two legs route as external reports, so the engine
+    /// receives the cancel of the old leg of a live order.
+    #[rstest]
+    fn test_modify_of_untracked_cached_order_forwards_both_legs_as_reports() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-UNTRACKED");
+        state.mark_pending_modify(cid, VenueOrderId::new("old-voi"), Quantity::from("0.0002"));
+
+        let replacement = make_status_report_with_quantity(
+            Some("O-HER-UNTRACKED"),
+            "new-voi",
+            OrderStatus::Accepted,
+            Quantity::from("0.0002"),
+        );
+        let old_leg = make_status_report(Some("O-HER-UNTRACKED"), "old-voi", OrderStatus::Canceled);
+
+        for report in [replacement, old_leg] {
+            handle_execution_report(
+                ExecutionReport::Order(report),
+                &state,
+                &emitter,
+                &ws_client,
+                &make_http_client(),
+                &mut pending_cloids,
+                UnixNanos::default(),
+            );
+        }
+
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, ExecutionEvent::Report(_))),
+            "an untracked order forwards raw reports, found {events:?}",
         );
     }
 
