@@ -47,12 +47,13 @@ use nautilus_core::{
 use nautilus_execution::{
     engine::ExecutionEngine,
     reconciliation::{
-        calculate_reconciliation_price, create_inferred_fill_for_qty,
+        SnapshotFillCoverage, calculate_reconciliation_price, create_inferred_fill_for_qty,
         create_position_reconciliation_venue_order_id, create_reconciliation_rejected,
         create_reconciliation_triggered, generate_external_order_status_events,
         generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, process_mass_status_for_reconciliation,
-        reconcile_order_report, should_reconciliation_update,
+        generate_reconciliation_order_snapshot_events_with_coverage,
+        process_mass_status_for_reconciliation, reconcile_order_report,
+        should_reconciliation_update,
     },
 };
 use nautilus_model::{
@@ -544,12 +545,18 @@ impl ExecutionManager {
 
         let retained_fill_state = self.retained_fill_state();
         let flat_historical_orders = self.flat_historical_orders(&mass_status);
-        let reported_fill_keys: IndexSet<(AccountId, InstrumentId, TradeId)> = mass_status
-            .fill_reports()
+        let reported_fills = mass_status.fill_reports();
+        let reported_fill_keys: IndexSet<(AccountId, InstrumentId, TradeId)> = reported_fills
             .values()
             .flatten()
             .map(|fill| (fill.account_id, fill.instrument_id, fill.trade_id))
             .collect();
+        // The snapshot can lag the live stream: it voids an applied fill only with this proof.
+        let fill_coverage = SnapshotFillCoverage::new(
+            mass_status.ts_init,
+            self.config.open_check_threshold_ns,
+            reported_fills.values().flatten(),
+        );
         let (adjusted_order_reports, adjusted_fill_reports) =
             self.adjust_mass_status_fills(&mass_status);
 
@@ -560,6 +567,7 @@ impl ExecutionManager {
         let mut open_orders_initialized = 0usize;
         let mut orders_skipped_no_instrument = 0usize;
         let mut orders_skipped_duplicate = 0usize;
+        let mut orders_deferred = 0usize;
         let mut fills_applied = 0usize;
         let mut fill_queue = ReconciliationFillQueue::default();
 
@@ -624,6 +632,11 @@ impl ExecutionManager {
                 }
 
                 if let Some(order) = self.get_order(*client_order_id) {
+                    if self.defers_for_recent_local_activity(*client_order_id) {
+                        orders_deferred += 1;
+                        continue;
+                    }
+
                     let instrument = self.get_instrument(&report.instrument_id);
                     log::info!(
                         color = LogColor::Blue as u8;
@@ -644,6 +657,7 @@ impl ExecutionManager {
                         report,
                         &order_fills,
                         instrument.as_ref(),
+                        &fill_coverage,
                         &mut fill_queue,
                     );
 
@@ -667,6 +681,11 @@ impl ExecutionManager {
                 } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id)
                 {
                     // Fallback: match by venue_order_id
+                    if self.defers_for_recent_local_activity(order.client_order_id()) {
+                        orders_deferred += 1;
+                        continue;
+                    }
+
                     let instrument = self.get_instrument(&report.instrument_id);
 
                     log::info!(
@@ -688,6 +707,7 @@ impl ExecutionManager {
                         report,
                         &order_fills,
                         instrument.as_ref(),
+                        &fill_coverage,
                         &mut fill_queue,
                     );
 
@@ -745,6 +765,11 @@ impl ExecutionManager {
                 }
             } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id) {
                 // Fallback: match by venue_order_id
+                if self.defers_for_recent_local_activity(order.client_order_id()) {
+                    orders_deferred += 1;
+                    continue;
+                }
+
                 let instrument = self.get_instrument(&report.instrument_id);
                 log::info!(
                     color = LogColor::Blue as u8;
@@ -765,6 +790,7 @@ impl ExecutionManager {
                     report,
                     &order_fills,
                     instrument.as_ref(),
+                    &fill_coverage,
                     &mut fill_queue,
                 );
 
@@ -1015,7 +1041,7 @@ impl ExecutionManager {
 
         log::info!(
             color = LogColor::Blue as u8;
-            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills_queued={fills_applied}, history_projected={history_projected}, positions={positions_created}, skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}",
+            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills_queued={fills_applied}, history_projected={history_projected}, positions={positions_created}, skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}, deferred={orders_deferred}",
         );
 
         ReconciliationResult {
@@ -1699,15 +1725,7 @@ impl ExecutionManager {
                 && let Some(order) = self.get_order(*client_order_id)
             {
                 // Check for recent local activity to avoid race conditions with in-flight fills
-                let threshold = Duration::from_nanos(self.config.open_check_threshold_ns);
-                if let Some(elapsed) = self.order_local_activity.elapsed(client_order_id)
-                    && elapsed < threshold
-                {
-                    let elapsed_ms = elapsed.as_millis();
-                    let threshold_ms = threshold.as_millis();
-                    log::debug!(
-                        "Deferring reconciliation for {client_order_id}: recent local activity ({elapsed_ms}ms < threshold={threshold_ms}ms)",
-                    );
+                if self.defers_for_recent_local_activity(*client_order_id) {
                     continue;
                 }
 
@@ -2259,6 +2277,29 @@ impl ExecutionManager {
     /// though they just arrived.
     pub fn record_local_activity(&mut self, client_order_id: ClientOrderId) {
         self.order_local_activity.mark(client_order_id);
+    }
+
+    /// Returns whether a venue report must wait because the order had local activity
+    /// inside the open-check threshold.
+    ///
+    /// A venue report or snapshot can lag the live stream by seconds, so it is not evidence
+    /// against an order that changed locally a moment ago. The next check handles that order.
+    fn defers_for_recent_local_activity(&self, client_order_id: ClientOrderId) -> bool {
+        let threshold = Duration::from_nanos(self.config.open_check_threshold_ns);
+        let Some(elapsed) = self.order_local_activity.elapsed(&client_order_id) else {
+            return false;
+        };
+
+        if elapsed >= threshold {
+            return false;
+        }
+
+        let elapsed_ms = elapsed.as_millis();
+        let threshold_ms = threshold.as_millis();
+        log::debug!(
+            "Deferring reconciliation for {client_order_id}: recent local activity ({elapsed_ms}ms < threshold={threshold_ms}ms)",
+        );
+        true
     }
 
     /// Clears reconciliation tracking state for an order.
@@ -3554,12 +3595,16 @@ impl ExecutionManager {
     }
 
     /// Reconciles an order with its associated fills atomically.
+    ///
+    /// `coverage` is the fill evidence of the whole snapshot. It gates a fill void that
+    /// would reopen the order.
     fn reconcile_order_with_fills(
         &mut self,
         order: &OrderAny,
         report: &OrderStatusReport,
         fills: &[&FillReport],
         instrument: Option<&InstrumentAny>,
+        coverage: &SnapshotFillCoverage,
         fill_queue: &mut ReconciliationFillQueue,
     ) -> Vec<OrderEventAny> {
         let mut events = Vec::new();
@@ -3628,9 +3673,9 @@ impl ExecutionManager {
             }
         }
 
-        for event in
-            generate_reconciliation_order_snapshot_events(&working, report, instrument, ts_now)
-        {
+        for event in generate_reconciliation_order_snapshot_events_with_coverage(
+            &working, report, instrument, ts_now, coverage,
+        ) {
             if let Err(e) = working.apply(event.clone()) {
                 log::warn!(
                     "Cannot project reconciliation snapshot event for {}: {e}",
@@ -4817,11 +4862,13 @@ mod tests {
         );
 
         let mut fill_queue = ReconciliationFillQueue::default();
+        let coverage = SnapshotFillCoverage::new(UnixNanos::default(), 0, [&companion_fill]);
         let events = manager.reconcile_order_with_fills(
             &order,
             &report,
             &[&companion_fill],
             Some(&instrument),
+            &coverage,
             &mut fill_queue,
         );
         let mut projected = order;

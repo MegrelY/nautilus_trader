@@ -50,11 +50,12 @@ pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
 };
 pub use orders::{
-    create_incremental_inferred_fill, create_inferred_fill_for_qty, create_reconciliation_rejected,
-    create_reconciliation_triggered, generate_external_order_status_events,
-    generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
-    generate_reconciliation_order_snapshot_events, reconcile_fill_report, reconcile_order_report,
-    should_reconciliation_update,
+    SnapshotFillCoverage, create_incremental_inferred_fill, create_inferred_fill_for_qty,
+    create_reconciliation_rejected, create_reconciliation_triggered,
+    generate_external_order_status_events, generate_reconciliation_order_events,
+    generate_reconciliation_order_pre_fill_events, generate_reconciliation_order_snapshot_events,
+    generate_reconciliation_order_snapshot_events_with_coverage, reconcile_fill_report,
+    reconcile_order_report, should_reconciliation_update,
 };
 pub use positions::{
     calculate_reconciliation_price, check_position_reconciliation,

@@ -41,9 +41,10 @@ mod serial_tests {
             OrderEventAny,
             order::spec::{
                 OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec,
-                OrderEmulatedSpec, OrderExpiredSpec, OrderFilledSpec, OrderModifyRejectedSpec,
-                OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderRejectedSpec,
-                OrderReleasedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
+                OrderEmulatedSpec, OrderExpiredSpec, OrderFillVoidedSpec, OrderFilledSpec,
+                OrderInitializedSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
+                OrderPendingUpdateSpec, OrderRejectedSpec, OrderReleasedSpec, OrderSubmittedSpec,
+                OrderTriggeredSpec, OrderUpdatedSpec,
             },
         },
         identifiers::{
@@ -56,7 +57,7 @@ mod serial_tests {
         },
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
     use ustr::Ustr;
 
@@ -557,6 +558,59 @@ mod serial_tests {
         )
     }
 
+    /// Returns the position of an event variant in the round trip list. The match is
+    /// exhaustive: a new `OrderEventAny` variant fails to build here until the round trip
+    /// test lists it, so a new variant cannot reach the cache database without a decoder.
+    fn variant_index(event: &OrderEventAny) -> usize {
+        match event {
+            OrderEventAny::Initialized(_) => 0,
+            OrderEventAny::Denied(_) => 1,
+            OrderEventAny::Emulated(_) => 2,
+            OrderEventAny::Released(_) => 3,
+            OrderEventAny::Submitted(_) => 4,
+            OrderEventAny::Accepted(_) => 5,
+            OrderEventAny::Rejected(_) => 6,
+            OrderEventAny::Canceled(_) => 7,
+            OrderEventAny::Expired(_) => 8,
+            OrderEventAny::Triggered(_) => 9,
+            OrderEventAny::PendingUpdate(_) => 10,
+            OrderEventAny::PendingCancel(_) => 11,
+            OrderEventAny::ModifyRejected(_) => 12,
+            OrderEventAny::CancelRejected(_) => 13,
+            OrderEventAny::Updated(_) => 14,
+            OrderEventAny::Filled(_) => 15,
+            OrderEventAny::FillVoided(_) => 16,
+        }
+    }
+
+    const ORDER_EVENT_VARIANTS: usize = 17;
+
+    fn fill_voided_event(
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        reopened: bool,
+    ) -> OrderEventAny {
+        OrderEventAny::FillVoided(
+            OrderFillVoidedSpec::builder()
+                .instrument_id(instrument_id)
+                .client_order_id(client_order_id)
+                .venue_order_id(VenueOrderId::from("venue-order-1"))
+                .account_id(AccountId::from("HYPERLIQUID-TESTNET-001"))
+                .correction_id(Ustr::from("reconciliation-report-1-trade-2"))
+                .trade_id(TradeId::from("trade-2"))
+                .voided_qty(Quantity::from("2.66"))
+                .maybe_commission_voided(Some(Money::new(0.5, Currency::from("USDT"))))
+                .order_type(OrderType::StopLimit)
+                .last_px(Price::from("7.6122"))
+                .currency(Currency::from("USDT"))
+                .position_id(PositionId::from("POSITION-1"))
+                .reason(Ustr::from("snapshot lists less filled quantity"))
+                .reconciliation(true)
+                .is_reopened(reopened)
+                .build(),
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_all_order_lifecycle_events_round_trip() {
         let db = get_test_pg_cache_database().await.expect("connect db");
@@ -570,6 +624,23 @@ mod serial_tests {
         };
 
         let events = vec![
+            OrderEventAny::Initialized(
+                OrderInitializedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .order_type(OrderType::Limit)
+                    .quantity(Quantity::from("2.66"))
+                    .price(Price::from("7.6122"))
+                    .build(),
+            ),
+            OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(next_client_order_id())
+                    .account_id(account_id)
+                    .build(),
+            ),
+            fill_voided_event(instrument_id, next_client_order_id(), true),
             OrderEventAny::Accepted(
                 OrderAcceptedSpec::builder()
                     .instrument_id(instrument_id)
@@ -702,11 +773,86 @@ mod serial_tests {
             ),
         ];
 
+        let mut listed = [false; ORDER_EVENT_VARIANTS];
+        for event in &events {
+            listed[variant_index(event)] = true;
+        }
+        assert!(
+            listed.iter().all(|listed| *listed),
+            "the round trip lists every order event variant"
+        );
+
         for event in events {
             assert_order_event_round_trip(pool, event)
                 .await
                 .expect("round-trip order event");
         }
+    }
+
+    /// A fill void keeps `is_reopened` and `correction_id`: the flag selects the status that a
+    /// replay restores, and a row without them read back as another event. Both values of the
+    /// flag survive, and so does a void with no optional field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fill_voided_keeps_its_reopen_flag_and_correction_identity() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        let instrument_id = ensure_order_event_instrument(pool).await;
+        let next_client_order_id = || {
+            let value = UUID4::new().to_string();
+            ClientOrderId::from(value.as_str())
+        };
+
+        for reopened in [true, false] {
+            assert_order_event_round_trip(
+                pool,
+                fill_voided_event(instrument_id, next_client_order_id(), reopened),
+            )
+            .await
+            .expect("round-trip fill void");
+        }
+        let bare = OrderEventAny::FillVoided(
+            OrderFillVoidedSpec::builder()
+                .instrument_id(instrument_id)
+                .client_order_id(next_client_order_id())
+                .currency(Currency::from("USDT"))
+                .build(),
+        );
+        assert_order_event_round_trip(pool, bare)
+            .await
+            .expect("round-trip fill void without optional fields");
+    }
+
+    /// A row written before the flag and the identity were kept has neither. The known case
+    /// is a void that reopened its order, and a replay needs the flag, so the row reads as
+    /// reopened and the order cache loads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fill_voided_row_without_the_flag_reads_as_reopened() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        let instrument_id = ensure_order_event_instrument(pool).await;
+        let client_order_id = ClientOrderId::from(UUID4::new().to_string().as_str());
+        let event = fill_voided_event(instrument_id, client_order_id, true);
+        let event_id = event.clone().into_boxed().id().to_string();
+        DatabaseQueries::add_order_event(pool, event.into_boxed(), None)
+            .await
+            .expect("persist fill void");
+        sqlx::query(
+            "UPDATE order_event SET reduce_only = NULL, exec_spawn_id = NULL WHERE id = $1",
+        )
+        .bind(&event_id)
+        .execute(pool)
+        .await
+        .expect("make the row legacy");
+
+        let events = DatabaseQueries::load_order_events(pool, &client_order_id)
+            .await
+            .expect("load the legacy row");
+
+        let [OrderEventAny::FillVoided(voided)] = events.as_slice() else {
+            panic!("expected one fill void, was {events:?}");
+        };
+        assert!(voided.is_reopened);
+        assert_eq!(voided.correction_id, Ustr::from(""));
     }
 
     #[ignore = "orchestrated before the fresh-process pending-cancel restore test"]

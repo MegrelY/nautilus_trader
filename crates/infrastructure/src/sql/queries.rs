@@ -635,7 +635,9 @@ impl DatabaseQueries {
             // kind-discriminated row stores `due_post_only` here without a
             // schema extension.
             .bind(order_event.post_only().or_else(|| order_event.due_post_only()))
-            .bind(order_event.reduce_only())
+            // `reduce_only` is otherwise unused by OrderFillVoided, so the row stores its
+            // `is_reopened` flag here: the flag selects the order status that a replay restores.
+            .bind(order_event.reduce_only().or_else(|| order_event.is_reopened()))
             .bind(order_event.quote_quantity())
             .bind(order_event.reconciliation())
             // `price` is otherwise unused by OrderReleased and preserves its
@@ -662,7 +664,14 @@ impl DatabaseQueries {
             .bind(order_event.linked_order_ids().map(|x| x.iter().map(ToString::to_string).collect::<Vec<String>>()))
             .bind(order_event.parent_order_id().map(|x| x.to_string()))
             .bind(order_event.exec_algorithm_id().map(|x| x.to_string()))
-            .bind(order_event.exec_spawn_id().map(|x| x.to_string()))
+            // `exec_spawn_id` is otherwise unused by OrderFillVoided, so the row stores its
+            // `correction_id` here.
+            .bind(
+                order_event
+                    .exec_spawn_id()
+                    .map(|x| x.to_string())
+                    .or_else(|| order_event.correction_id().map(|x| x.to_string())),
+            )
             .bind(order_event.venue_order_id().map(|x| x.to_string()))
             .bind(order_event.account_id().map(|x| x.to_string()))
             .bind(order_event.position_id().map(|x| x.to_string()))

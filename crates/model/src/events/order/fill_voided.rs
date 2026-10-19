@@ -339,6 +339,14 @@ impl OrderEvent for OrderFillVoided {
         self.commission_voided
     }
 
+    fn is_reopened(&self) -> Option<bool> {
+        Some(self.is_reopened)
+    }
+
+    fn correction_id(&self) -> Option<Ustr> {
+        Some(self.correction_id)
+    }
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }

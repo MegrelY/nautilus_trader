@@ -120,6 +120,17 @@ pub trait OrderEvent: 'static + Send {
     fn released_price(&self) -> Option<Price> {
         None
     }
+    /// Whether a fill void reopened the order for execution.
+    ///
+    /// Event persistence keeps it in a column that other event kinds do not use, because the
+    /// flag selects the order status that a replay restores.
+    fn is_reopened(&self) -> Option<bool> {
+        None
+    }
+    /// The identity of the correction that a fill void records.
+    fn correction_id(&self) -> Option<Ustr> {
+        None
+    }
     fn trigger_price(&self) -> Option<Price>;
     fn trigger_type(&self) -> Option<TriggerType>;
     fn limit_offset(&self) -> Option<Decimal>;

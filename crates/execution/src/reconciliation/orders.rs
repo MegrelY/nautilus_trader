@@ -19,6 +19,7 @@
 //! helper turns a venue-sourced report into zero or more `OrderEventAny`s that are
 //! safe to apply to the local order model.
 
+use ahash::AHashSet;
 use nautilus_common::enums::LogColor;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
@@ -27,7 +28,7 @@ use nautilus_model::{
         OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled,
         OrderRejected, OrderTriggered, OrderUpdated,
     },
-    identifiers::{AccountId, PositionId, TradeId},
+    identifiers::{AccountId, InstrumentId, PositionId, TradeId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny, TRIGGERABLE_ORDER_TYPES},
     reports::{FillReport, OrderStatusReport},
@@ -40,6 +41,70 @@ use super::{
     ids::create_inferred_reconciliation_trade_id,
     positions::{cap_price_at_instrument_max, is_within_single_unit_tolerance},
 };
+
+/// The fills that a venue snapshot listed, with the time at which its collection started.
+///
+/// A venue snapshot can lag the live stream by seconds. A working report with a lower
+/// cumulative filled quantity than the local order voids an applied fill only when this
+/// evidence proves that the snapshot lacks that fill:
+/// - the snapshot's fills span the `ts_event` of the applied fill,
+/// - no fill in the snapshot has the trade ID of the applied fill, and
+/// - the collection started at least the minimum age after the applied fill.
+///
+/// A trade that the snapshot lists is never voided on this evidence.
+#[derive(Clone, Debug)]
+pub struct SnapshotFillCoverage {
+    collected_at: UnixNanos,
+    min_age_ns: u64,
+    span: Option<(UnixNanos, UnixNanos)>,
+    listed: AHashSet<(AccountId, InstrumentId, TradeId)>,
+}
+
+impl SnapshotFillCoverage {
+    /// Creates the coverage of the fills that a snapshot listed.
+    ///
+    /// `collected_at` is the time at which the snapshot collection started. `min_age_ns` is the
+    /// minimum age of an applied fill, at `collected_at`, for its absence to count as evidence.
+    #[must_use]
+    pub fn new<'a>(
+        collected_at: UnixNanos,
+        min_age_ns: u64,
+        fills: impl IntoIterator<Item = &'a FillReport>,
+    ) -> Self {
+        let mut span: Option<(UnixNanos, UnixNanos)> = None;
+        let mut listed = AHashSet::new();
+
+        for fill in fills {
+            span = Some(
+                span.map_or((fill.ts_event, fill.ts_event), |(oldest, newest)| {
+                    (oldest.min(fill.ts_event), newest.max(fill.ts_event))
+                }),
+            );
+            listed.insert((fill.account_id, fill.instrument_id, fill.trade_id));
+        }
+
+        Self {
+            collected_at,
+            min_age_ns,
+            span,
+            listed,
+        }
+    }
+
+    fn proves_absent(&self, fill: &OrderFilled) -> bool {
+        let covered = self
+            .span
+            .is_some_and(|(oldest, newest)| oldest <= fill.ts_event && fill.ts_event <= newest);
+        let aged =
+            fill.ts_event.as_u64().saturating_add(self.min_age_ns) <= self.collected_at.as_u64();
+
+        covered
+            && aged
+            && !self
+                .listed
+                .contains(&(fill.account_id, fill.instrument_id, fill.trade_id))
+    }
+}
 
 /// Generates reconciliation events for a live order status report.
 ///
@@ -64,6 +129,7 @@ pub fn generate_reconciliation_order_events(
         instrument,
         ts_now,
         report.order_status == OrderStatus::Voided,
+        None,
     )
 }
 
@@ -73,6 +139,9 @@ pub fn generate_reconciliation_order_events(
 /// quantity is treated as evidence that previously applied fills were voided. This is intended for
 /// status reports paired with the snapshot's fill reports, where the caller can project the full
 /// venue state before applying corrections.
+///
+/// A snapshot that can lag the live stream needs
+/// [`generate_reconciliation_order_snapshot_events_with_coverage`] instead.
 #[must_use]
 pub fn generate_reconciliation_order_snapshot_events(
     order: &OrderAny,
@@ -80,7 +149,32 @@ pub fn generate_reconciliation_order_snapshot_events(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
 ) -> Vec<OrderEventAny> {
-    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true)
+    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true, None)
+}
+
+/// Generates reconciliation events for a venue snapshot that can lag the live stream.
+///
+/// Like [`generate_reconciliation_order_snapshot_events`], except that a working report
+/// with a lower cumulative filled quantity voids an applied fill only when `coverage`
+/// proves that the snapshot lacks that fill. When it does not, the fill decrease yields no event
+/// and the local order keeps its fills; a later snapshot or the position reconciliation settles it.
+/// A terminal report, including `Voided`, is not gated: it is final venue state.
+#[must_use]
+pub fn generate_reconciliation_order_snapshot_events_with_coverage(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: Option<&InstrumentAny>,
+    ts_now: UnixNanos,
+    coverage: &SnapshotFillCoverage,
+) -> Vec<OrderEventAny> {
+    generate_reconciliation_order_events_inner(
+        order,
+        report,
+        instrument,
+        ts_now,
+        true,
+        Some(coverage),
+    )
 }
 
 fn generate_reconciliation_order_events_inner(
@@ -89,6 +183,7 @@ fn generate_reconciliation_order_events_inner(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
     allow_fill_decrease: bool,
+    coverage: Option<&SnapshotFillCoverage>,
 ) -> Vec<OrderEventAny> {
     if is_superseded_cancel_report(order, report) {
         let _ = reconcile_order_report(order, report, instrument, ts_now);
@@ -107,7 +202,7 @@ fn generate_reconciliation_order_events_inner(
         }
 
         let mut working = order.clone();
-        let mut events = create_reconciliation_fill_voids(&working, report, ts_now);
+        let mut events = create_reconciliation_fill_voids(&working, report, ts_now, coverage);
         if events.is_empty() {
             return reconcile_fill_decrease_terminal(order, report, instrument, ts_now);
         }
@@ -532,10 +627,13 @@ fn create_reconciliation_fill_voids(
     order: &OrderAny,
     report: &OrderStatusReport,
     ts_now: UnixNanos,
+    coverage: Option<&SnapshotFillCoverage>,
 ) -> Vec<OrderEventAny> {
     let mut remaining = order.filled_qty() - report.filled_qty;
     let order_events = order.events();
     let mut corrections = Vec::new();
+    // Only a void that reopens the order needs proof: a stale snapshot shows a working order.
+    let gate = coverage.filter(|_| report_is_working(report));
 
     for candidate in order_events.iter().rev() {
         let OrderEventAny::Filled(fill) = candidate else {
@@ -556,6 +654,17 @@ fn create_reconciliation_fill_voids(
         let effective = fill.last_qty - prior_qty;
         if effective.is_zero() {
             continue;
+        }
+
+        if let Some(coverage) = gate
+            && !coverage.proves_absent(fill)
+        {
+            log::warn!(
+                "Ignoring fill decrease for {}: the snapshot does not prove that fill {} is absent",
+                order.client_order_id(),
+                fill.trade_id,
+            );
+            return Vec::new();
         }
         let removed = remaining.min(effective);
         let voided_qty = prior_qty + removed;

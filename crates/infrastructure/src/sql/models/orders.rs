@@ -23,9 +23,9 @@ use nautilus_model::{
     },
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected,
-        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSnapshot,
-        OrderSubmitted, OrderTriggered, OrderUpdated,
+        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
+        OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
@@ -59,6 +59,9 @@ pub struct OrderEmulatedModel(pub OrderEmulated);
 
 #[derive(Debug)]
 pub struct OrderExpiredModel(pub OrderExpired);
+
+#[derive(Debug)]
+pub struct OrderFillVoidedModel(pub OrderFillVoided);
 
 #[derive(Debug)]
 pub struct OrderFilledModel(pub OrderFilled);
@@ -141,63 +144,123 @@ fn reconciliation(row: &PgRow) -> Result<bool, sqlx::Error> {
         .unwrap_or(false))
 }
 
+/// The `kind` column values of the order event rows: one for each [`OrderEventAny`] variant.
+///
+/// The row decoder matches on this enum with no wildcard arm. A kind added here, for a new
+/// event variant, fails to build until the decoder has an arm for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderEventKind {
+    Accepted,
+    CancelRejected,
+    Canceled,
+    Denied,
+    Emulated,
+    Expired,
+    FillVoided,
+    Filled,
+    Initialized,
+    ModifyRejected,
+    PendingCancel,
+    PendingUpdate,
+    Rejected,
+    Released,
+    Submitted,
+    Triggered,
+    Updated,
+}
+
+impl OrderEventKind {
+    /// Returns the kind that a row names, which is the `type_name` of its event.
+    fn parse(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "OrderAccepted" => Self::Accepted,
+            "OrderCancelRejected" => Self::CancelRejected,
+            "OrderCanceled" => Self::Canceled,
+            "OrderDenied" => Self::Denied,
+            "OrderEmulated" => Self::Emulated,
+            "OrderExpired" => Self::Expired,
+            "OrderFillVoided" => Self::FillVoided,
+            "OrderFilled" => Self::Filled,
+            "OrderInitialized" => Self::Initialized,
+            "OrderModifyRejected" => Self::ModifyRejected,
+            "OrderPendingCancel" => Self::PendingCancel,
+            "OrderPendingUpdate" => Self::PendingUpdate,
+            "OrderRejected" => Self::Rejected,
+            "OrderReleased" => Self::Released,
+            "OrderSubmitted" => Self::Submitted,
+            "OrderTriggered" => Self::Triggered,
+            "OrderUpdated" => Self::Updated,
+            _ => return None,
+        })
+    }
+}
+
 impl<'r> FromRow<'r, PgRow> for OrderEventAnyModel {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let kind = row.get::<String, _>("kind");
-        if kind == "OrderAccepted" {
-            let model = OrderAcceptedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Accepted(model.0)))
-        } else if kind == "OrderCancelRejected" {
-            let model = OrderCancelRejectedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::CancelRejected(model.0)))
-        } else if kind == "OrderCanceled" {
-            let model = OrderCanceledModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Canceled(model.0)))
-        } else if kind == "OrderDenied" {
-            let model = OrderDeniedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Denied(model.0)))
-        } else if kind == "OrderEmulated" {
-            let model = OrderEmulatedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Emulated(model.0)))
-        } else if kind == "OrderExpired" {
-            let model = OrderExpiredModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Expired(model.0)))
-        } else if kind == "OrderFilled" {
-            let model = OrderFilledModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Filled(model.0)))
-        } else if kind == "OrderInitialized" {
-            let model = OrderInitializedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Initialized(model.0)))
-        } else if kind == "OrderModifyRejected" {
-            let model = OrderModifyRejectedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::ModifyRejected(model.0)))
-        } else if kind == "OrderPendingCancel" {
-            let model = OrderPendingCancelModel::from_row(row)?;
-            Ok(Self(OrderEventAny::PendingCancel(model.0)))
-        } else if kind == "OrderPendingUpdate" {
-            let model = OrderPendingUpdateModel::from_row(row)?;
-            Ok(Self(OrderEventAny::PendingUpdate(model.0)))
-        } else if kind == "OrderRejected" {
-            let model = OrderRejectedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Rejected(model.0)))
-        } else if kind == "OrderReleased" {
-            let model = OrderReleasedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Released(model.0)))
-        } else if kind == "OrderSubmitted" {
-            let model = OrderSubmittedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Submitted(model.0)))
-        } else if kind == "OrderTriggered" {
-            let model = OrderTriggeredModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Triggered(model.0)))
-        } else if kind == "OrderUpdated" {
-            let model = OrderUpdatedModel::from_row(row)?;
-            Ok(Self(OrderEventAny::Updated(model.0)))
-        } else {
-            Err(sqlx::Error::Decode(
+        let Some(kind) = OrderEventKind::parse(&kind) else {
+            return Err(sqlx::Error::Decode(
                 format!("Unknown order event kind: {kind} in Postgres transformation").into(),
-            ))
-        }
+            ));
+        };
+
+        let event = match kind {
+            OrderEventKind::Accepted => {
+                OrderEventAny::Accepted(OrderAcceptedModel::from_row(row)?.0)
+            }
+            OrderEventKind::CancelRejected => {
+                OrderEventAny::CancelRejected(OrderCancelRejectedModel::from_row(row)?.0)
+            }
+            OrderEventKind::Canceled => {
+                OrderEventAny::Canceled(OrderCanceledModel::from_row(row)?.0)
+            }
+            OrderEventKind::Denied => OrderEventAny::Denied(OrderDeniedModel::from_row(row)?.0),
+            OrderEventKind::Emulated => {
+                OrderEventAny::Emulated(OrderEmulatedModel::from_row(row)?.0)
+            }
+            OrderEventKind::Expired => OrderEventAny::Expired(OrderExpiredModel::from_row(row)?.0),
+            OrderEventKind::FillVoided => {
+                OrderEventAny::FillVoided(OrderFillVoidedModel::from_row(row)?.0)
+            }
+            OrderEventKind::Filled => OrderEventAny::Filled(OrderFilledModel::from_row(row)?.0),
+            OrderEventKind::Initialized => {
+                OrderEventAny::Initialized(OrderInitializedModel::from_row(row)?.0)
+            }
+            OrderEventKind::ModifyRejected => {
+                OrderEventAny::ModifyRejected(OrderModifyRejectedModel::from_row(row)?.0)
+            }
+            OrderEventKind::PendingCancel => {
+                OrderEventAny::PendingCancel(OrderPendingCancelModel::from_row(row)?.0)
+            }
+            OrderEventKind::PendingUpdate => {
+                OrderEventAny::PendingUpdate(OrderPendingUpdateModel::from_row(row)?.0)
+            }
+            OrderEventKind::Rejected => {
+                OrderEventAny::Rejected(OrderRejectedModel::from_row(row)?.0)
+            }
+            OrderEventKind::Released => {
+                OrderEventAny::Released(OrderReleasedModel::from_row(row)?.0)
+            }
+            OrderEventKind::Submitted => {
+                OrderEventAny::Submitted(OrderSubmittedModel::from_row(row)?.0)
+            }
+            OrderEventKind::Triggered => {
+                OrderEventAny::Triggered(OrderTriggeredModel::from_row(row)?.0)
+            }
+            OrderEventKind::Updated => OrderEventAny::Updated(OrderUpdatedModel::from_row(row)?.0),
+        };
+        Ok(Self(event))
     }
+}
+
+fn parse_text_column<T>(row: &PgRow, column: &str) -> Result<T, sqlx::Error>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    row.try_get::<&str, _>(column)?
+        .parse::<T>()
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
@@ -562,6 +625,66 @@ impl<'r> FromRow<'r, PgRow> for OrderFilledModel {
             None,
         );
         Ok(Self(order_event))
+    }
+}
+
+impl<'r> FromRow<'r, PgRow> for OrderFillVoidedModel {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let fields = CommonOrderEventFields::from_row(row)?;
+        let venue_order_id = row
+            .try_get::<&str, _>("venue_order_id")
+            .map(VenueOrderId::from)?;
+        let account_id = row.try_get::<&str, _>("account_id").map(AccountId::from)?;
+        let trade_id = row.try_get::<&str, _>("trade_id").map(TradeId::from)?;
+        let voided_qty = row.try_get::<&str, _>("quantity").map(Quantity::from)?;
+        let order_side = parse_text_column::<OrderSide>(row, "order_side")?;
+        let order_type = parse_text_column::<OrderType>(row, "order_type")?;
+        let last_px = row.try_get::<&str, _>("last_px").map(Price::from)?;
+        let currency = row.try_get::<&str, _>("currency").map(Currency::from)?;
+        let liquidity_side = parse_text_column::<LiquiditySide>(row, "liquidity_side")?;
+        let position_id = row
+            .try_get::<Option<&str>, _>("position_id")?
+            .map(PositionId::from);
+        let commission_voided = row
+            .try_get::<Option<&str>, _>("commission")?
+            .map(|x| Money::from_str(x).map_err(|e| sqlx::Error::Decode(e.into())))
+            .transpose()?;
+        let reason = row.try_get::<Option<&str>, _>("reason")?.map(Ustr::from);
+        // The writer keeps the correction identity in `exec_spawn_id` and the reopen flag in
+        // `reduce_only`. A row written before it kept them has neither. The known case of such
+        // a row is a void that reopened its order, and a replay needs that flag to restore the
+        // order, so a row without the flag is read as reopened.
+        let correction_id = row
+            .try_get::<Option<&str>, _>("exec_spawn_id")?
+            .map_or_else(Ustr::default, Ustr::from);
+        let is_reopened = row
+            .try_get::<Option<bool>, _>("reduce_only")?
+            .unwrap_or(true);
+        Ok(Self(OrderFillVoided::new(
+            fields.trader_id,
+            fields.strategy_id,
+            fields.instrument_id,
+            fields.client_order_id,
+            venue_order_id,
+            account_id,
+            correction_id,
+            trade_id,
+            voided_qty,
+            commission_voided,
+            order_side,
+            order_type,
+            last_px,
+            currency,
+            liquidity_side,
+            position_id,
+            reason,
+            None,
+            fields.event_id,
+            fields.ts_event,
+            fields.ts_init,
+            reconciliation(row)?,
+            is_reopened,
+        )))
     }
 }
 
@@ -988,5 +1111,179 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotModel {
         };
 
         Ok(Self(snapshot))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{
+        events::order::spec::{
+            OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec,
+            OrderEmulatedSpec, OrderExpiredSpec, OrderFillVoidedSpec, OrderFilledSpec,
+            OrderInitializedSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
+            OrderPendingUpdateSpec, OrderRejectedSpec, OrderReleasedSpec, OrderSubmittedSpec,
+            OrderTriggeredSpec, OrderUpdatedSpec,
+        },
+        orders::OrderAny,
+    };
+    use rstest::rstest;
+
+    use super::*;
+
+    impl OrderEventKind {
+        const ALL: [Self; 17] = [
+            Self::Accepted,
+            Self::CancelRejected,
+            Self::Canceled,
+            Self::Denied,
+            Self::Emulated,
+            Self::Expired,
+            Self::FillVoided,
+            Self::Filled,
+            Self::Initialized,
+            Self::ModifyRejected,
+            Self::PendingCancel,
+            Self::PendingUpdate,
+            Self::Rejected,
+            Self::Released,
+            Self::Submitted,
+            Self::Triggered,
+            Self::Updated,
+        ];
+    }
+
+    /// Returns the kind that the row of an event names. The match is exhaustive: a new
+    /// `OrderEventAny` variant fails to build here until it has a kind and a decoder.
+    fn kind_of(event: &OrderEventAny) -> OrderEventKind {
+        match event {
+            OrderEventAny::Accepted(_) => OrderEventKind::Accepted,
+            OrderEventAny::CancelRejected(_) => OrderEventKind::CancelRejected,
+            OrderEventAny::Canceled(_) => OrderEventKind::Canceled,
+            OrderEventAny::Denied(_) => OrderEventKind::Denied,
+            OrderEventAny::Emulated(_) => OrderEventKind::Emulated,
+            OrderEventAny::Expired(_) => OrderEventKind::Expired,
+            OrderEventAny::FillVoided(_) => OrderEventKind::FillVoided,
+            OrderEventAny::Filled(_) => OrderEventKind::Filled,
+            OrderEventAny::Initialized(_) => OrderEventKind::Initialized,
+            OrderEventAny::ModifyRejected(_) => OrderEventKind::ModifyRejected,
+            OrderEventAny::PendingCancel(_) => OrderEventKind::PendingCancel,
+            OrderEventAny::PendingUpdate(_) => OrderEventKind::PendingUpdate,
+            OrderEventAny::Rejected(_) => OrderEventKind::Rejected,
+            OrderEventAny::Released(_) => OrderEventKind::Released,
+            OrderEventAny::Submitted(_) => OrderEventKind::Submitted,
+            OrderEventAny::Triggered(_) => OrderEventKind::Triggered,
+            OrderEventAny::Updated(_) => OrderEventKind::Updated,
+        }
+    }
+
+    /// Returns one event of a kind. The match is exhaustive: a new kind fails to build here.
+    fn sample_of(kind: OrderEventKind) -> OrderEventAny {
+        match kind {
+            OrderEventKind::Accepted => {
+                OrderEventAny::Accepted(OrderAcceptedSpec::builder().build())
+            }
+            OrderEventKind::CancelRejected => {
+                OrderEventAny::CancelRejected(OrderCancelRejectedSpec::builder().build())
+            }
+            OrderEventKind::Canceled => {
+                OrderEventAny::Canceled(OrderCanceledSpec::builder().build())
+            }
+            OrderEventKind::Denied => OrderEventAny::Denied(OrderDeniedSpec::builder().build()),
+            OrderEventKind::Emulated => {
+                OrderEventAny::Emulated(OrderEmulatedSpec::builder().build())
+            }
+            OrderEventKind::Expired => OrderEventAny::Expired(OrderExpiredSpec::builder().build()),
+            OrderEventKind::FillVoided => {
+                OrderEventAny::FillVoided(OrderFillVoidedSpec::builder().build())
+            }
+            OrderEventKind::Filled => OrderEventAny::Filled(OrderFilledSpec::builder().build()),
+            OrderEventKind::Initialized => {
+                OrderEventAny::Initialized(OrderInitializedSpec::builder().build())
+            }
+            OrderEventKind::ModifyRejected => {
+                OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build())
+            }
+            OrderEventKind::PendingCancel => {
+                OrderEventAny::PendingCancel(OrderPendingCancelSpec::builder().build())
+            }
+            OrderEventKind::PendingUpdate => {
+                OrderEventAny::PendingUpdate(OrderPendingUpdateSpec::builder().build())
+            }
+            OrderEventKind::Rejected => {
+                OrderEventAny::Rejected(OrderRejectedSpec::builder().build())
+            }
+            OrderEventKind::Released => {
+                OrderEventAny::Released(OrderReleasedSpec::builder().build())
+            }
+            OrderEventKind::Submitted => {
+                OrderEventAny::Submitted(OrderSubmittedSpec::builder().build())
+            }
+            OrderEventKind::Triggered => {
+                OrderEventAny::Triggered(OrderTriggeredSpec::builder().build())
+            }
+            OrderEventKind::Updated => OrderEventAny::Updated(OrderUpdatedSpec::builder().build()),
+        }
+    }
+
+    #[rstest]
+    fn test_every_order_event_variant_has_a_decoder_kind() {
+        for kind in OrderEventKind::ALL {
+            let event = sample_of(kind);
+            let name = event.clone().into_boxed().type_name();
+
+            assert_eq!(kind_of(&event), kind);
+            assert_eq!(OrderEventKind::parse(name), Some(kind), "row kind {name}");
+        }
+        assert_eq!(OrderEventKind::parse("OrderUnknown"), None);
+    }
+
+    fn fill(trade_id: &str, last_qty: u64, reconciliation: bool) -> OrderEventAny {
+        OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trade_id(TradeId::from(trade_id))
+                .last_qty(Quantity::from(last_qty))
+                .reconciliation(reconciliation)
+                .build(),
+        )
+    }
+
+    /// The incident of 2026-10-19: a lagging snapshot voids the newest fill and reopens the
+    /// order, and the reconciliation then accepts the order and infers the same fill again.
+    fn reopened_void_events(is_reopened: bool) -> Vec<OrderEventAny> {
+        vec![
+            OrderEventAny::Initialized(
+                OrderInitializedSpec::builder()
+                    .order_type(OrderType::Limit)
+                    .quantity(Quantity::from(7))
+                    .price(Price::from("1.00000"))
+                    .build(),
+            ),
+            OrderEventAny::Submitted(OrderSubmittedSpec::builder().build()),
+            OrderEventAny::Accepted(OrderAcceptedSpec::builder().build()),
+            fill("T-LIVE-1", 4, false),
+            fill("T-LIVE-2", 3, false),
+            OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(TradeId::from("T-LIVE-2"))
+                    .voided_qty(Quantity::from(3))
+                    .reconciliation(true)
+                    .is_reopened(is_reopened)
+                    .build(),
+            ),
+            OrderEventAny::Accepted(OrderAcceptedSpec::builder().reconciliation(true).build()),
+            fill("T-INFERRED", 3, true),
+        ]
+    }
+
+    #[rstest]
+    #[case::reopened(true, true)]
+    #[case::not_reopened(false, false)]
+    fn test_reopen_flag_selects_the_replayed_order_status(
+        #[case] is_reopened: bool,
+        #[case] replays: bool,
+    ) {
+        let replay = OrderAny::from_events(reopened_void_events(is_reopened));
+
+        assert_eq!(replay.is_ok(), replays, "{replay:?}");
     }
 }

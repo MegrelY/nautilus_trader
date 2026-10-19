@@ -4382,6 +4382,73 @@ async fn test_no_inferred_fill_when_already_in_sync() {
     assert!(result.events.is_empty());
 }
 
+const SECOND_NS: u64 = 1_000_000_000;
+
+/// Creates a fill report of another order, at the given event time, for a snapshot fill list.
+fn create_snapshot_fill_report(
+    venue_order_id: &str,
+    instrument_id: InstrumentId,
+    trade_id: &str,
+    ts_event: u64,
+) -> FillReport {
+    let mut fill = create_fill_report(
+        ClientOrderId::from(venue_order_id),
+        VenueOrderId::from(venue_order_id),
+        instrument_id,
+        TradeId::from(trade_id),
+        "1.0",
+    );
+    fill.ts_event = UnixNanos::from(ts_event);
+    fill
+}
+
+/// Creates an accepted order with the fills `(trade_id, quantity, ts_event)` applied.
+fn create_order_with_fills(
+    client_order_id: &str,
+    venue_order_id: VenueOrderId,
+    quantity: &str,
+    fills: &[(&str, &str, u64)],
+) -> OrderAny {
+    let mut order = create_accepted_order(
+        client_order_id,
+        test_instrument_id(),
+        OrderSide::Buy,
+        quantity,
+        "3000.00",
+        venue_order_id,
+    );
+
+    for (trade_id, last_qty, ts_event) in fills {
+        let fill = OrderFilledTestBuilder::new(&order, &test_instrument())
+            .trade_id(TradeId::from(*trade_id))
+            .last_qty(Quantity::from(*last_qty))
+            .ts_event(UnixNanos::from(*ts_event))
+            .without_position_id()
+            .build();
+        order.apply(fill).unwrap();
+    }
+
+    order
+}
+
+/// Creates a snapshot that lists fills from before and after the lost fill, but not the lost
+/// fill (`T-LOST`, applied at 10 s), and that was collected long after the lost fill.
+fn create_snapshot_without_lost_fill(order_reports: Vec<OrderStatusReport>) -> ExecutionMassStatus {
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(60 * SECOND_NS),
+        Some(UUID4::new()),
+    );
+    mass_status.add_order_reports(order_reports);
+    mass_status.add_fill_reports(vec![
+        create_snapshot_fill_report("V-BEFORE", test_instrument_id(), "T-BEFORE", 5 * SECOND_NS),
+        create_snapshot_fill_report("V-AFTER", test_instrument_id(), "T-AFTER", 20 * SECOND_NS),
+    ]);
+    mass_status
+}
+
 #[tokio::test]
 async fn test_fill_qty_mismatch_venue_less_generates_fill_void() {
     let mut ctx = TestContext::new();
@@ -4392,30 +4459,15 @@ async fn test_fill_qty_mismatch_venue_less_generates_fill_void() {
     ctx.add_instrument(test_instrument());
 
     // Create an order that is already partially filled with 5
-    let mut order = create_accepted_order(
+    ctx.add_order(create_order_with_fills(
         "O-MISMATCH",
-        instrument_id,
-        OrderSide::Buy,
-        "10.0",
-        "3000.00",
         venue_order_id,
-    );
-    let fill = OrderFilledTestBuilder::new(&order, &test_instrument())
-        .last_qty(Quantity::from("5.0"))
-        .without_position_id()
-        .build();
-    order.apply(fill).unwrap();
-    ctx.add_order(order);
+        "10.0",
+        &[("T-LOST", "5.0", 10 * SECOND_NS)],
+    ));
 
-    // Venue reports less filled than Nautilus has applied.
-    let mut mass_status = ExecutionMassStatus::new(
-        test_client_id(),
-        test_account_id(),
-        test_venue(),
-        UnixNanos::default(),
-        Some(UUID4::new()),
-    );
-
+    // Venue reports less filled than Nautilus has applied, and its fill list does not
+    // contain the applied fill.
     let report = create_order_status_report(
         Some(client_order_id),
         venue_order_id,
@@ -4424,7 +4476,7 @@ async fn test_fill_qty_mismatch_venue_less_generates_fill_void() {
         Quantity::from("10.0"),
         Quantity::from("3.0"), // Less than our 5
     );
-    mass_status.add_order_reports(vec![report]);
+    let mass_status = create_snapshot_without_lost_fill(vec![report]);
 
     let result = ctx
         .manager
@@ -4446,6 +4498,133 @@ async fn test_fill_qty_mismatch_venue_less_generates_fill_void() {
     assert_eq!(order.status(), OrderStatus::PartiallyFilled);
     assert_eq!(order.filled_qty(), Quantity::from("3.0"));
     assert_eq!(order.voided_qty(), Quantity::from("2.0"));
+}
+
+#[rstest]
+#[case::list_ends_before_the_fill(&[("T-LIVE-1", 1_000_000_000)], 100 * SECOND_NS)]
+#[case::fill_too_new_for_the_collection(&[("T-LIVE-1", 1_000_000_000), ("T-OTHER", 2_000_000_000)], 2 * SECOND_NS)]
+#[case::list_starts_after_the_fill(&[("T-OTHER", 2_000_000_000)], 100 * SECOND_NS)]
+#[case::fill_is_listed(&[("T-LIVE-1", 1_000_000_000), ("T-LIVE-2", 1_700_000_000)], 100 * SECOND_NS)]
+#[tokio::test]
+async fn test_stale_snapshot_does_not_void_applied_fill(
+    #[case] listed: &[(&str, u64)],
+    #[case] collected_at: u64,
+) {
+    // Mirrors the incident of 2026-10-19: both live fills are applied, and the REST snapshot
+    // lags the live stream, so it shows the order with the first fill only.
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-STALE");
+    let venue_order_id = VenueOrderId::from("V-STALE");
+
+    ctx.add_instrument(test_instrument());
+    ctx.add_order(create_order_with_fills(
+        "O-STALE",
+        venue_order_id,
+        "7.0",
+        &[
+            ("T-LIVE-1", "4.0", SECOND_NS),
+            ("T-LIVE-2", "3.0", 1_700_000_000),
+        ],
+    ));
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(collected_at),
+        Some(UUID4::new()),
+    );
+    mass_status.add_order_reports(vec![create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("7.0"),
+        Quantity::from("4.0"),
+    )]);
+    mass_status.add_fill_reports(
+        listed
+            .iter()
+            .map(|(trade_id, ts_event)| {
+                create_snapshot_fill_report("V-OTHER", instrument_id, trade_id, *ts_event)
+            })
+            .collect(),
+    );
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    let order = ctx.get_order(&client_order_id).unwrap();
+    assert!(
+        result.events.is_empty(),
+        "a lagging snapshot must not void a fill, was {:?}",
+        result.events
+    );
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from("7.0"));
+    assert_eq!(order.voided_qty(), Quantity::from("0.0"));
+}
+
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_mass_status_defers_order_with_recent_local_activity() {
+    // The snapshot proves the fill absent, so only the recent local activity of the order
+    // holds back the void.
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: 5 * SECOND_NS,
+        ..Default::default()
+    });
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-DEFER");
+    let venue_order_id = VenueOrderId::from("V-DEFER");
+
+    ctx.add_instrument(test_instrument());
+    ctx.add_order(create_order_with_fills(
+        "O-DEFER",
+        venue_order_id,
+        "10.0",
+        &[("T-LOST", "5.0", 10 * SECOND_NS)],
+    ));
+    let mass_status = create_snapshot_without_lost_fill(vec![create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("10.0"),
+        Quantity::from("3.0"),
+    )]);
+
+    ctx.manager.record_local_activity(client_order_id);
+    let deferred = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status.clone(), ctx.exec_engine.clone())
+        .await;
+    let order = ctx.get_order(&client_order_id).unwrap();
+
+    assert!(deferred.events.is_empty());
+    assert_eq!(order.filled_qty(), Quantity::from("5.0"));
+    assert_eq!(order.voided_qty(), Quantity::from("0.0"));
+
+    advance_clock(dst::time::Duration::from_secs(5)).await;
+    let settled = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+    let order = ctx.get_order(&client_order_id).unwrap();
+
+    assert_eq!(settled.events.len(), 1);
+    assert!(matches!(settled.events[0], OrderEventAny::FillVoided(_)));
+    assert_eq!(order.filled_qty(), Quantity::from("3.0"));
 }
 
 #[tokio::test]

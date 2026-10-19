@@ -5901,6 +5901,173 @@ fn test_reconciliation_fill_void_carries_proportional_commission(instrument: Ins
 }
 
 #[rstest]
+#[case::snapshot_lacks_an_old_fill(&[("T-OTHER-1", 5), ("T-OTHER-2", 20)], 60, true)]
+#[case::list_ends_before_the_fill(&[("T-FIRST", 8)], 60, false)]
+#[case::list_starts_after_the_fill(&[("T-OTHER-2", 20)], 60, false)]
+#[case::empty_list(&[], 60, false)]
+#[case::fill_too_new_for_the_collection(&[("T-OTHER-1", 5), ("T-OTHER-2", 20)], 12, false)]
+#[case::fill_is_listed(&[("T-OTHER-1", 5), ("T-LAST", 10), ("T-OTHER-2", 20)], 60, false)]
+fn test_snapshot_fill_void_needs_coverage(
+    instrument: InstrumentAny,
+    #[case] listed: &[(&str, u64)],
+    #[case] collected_at_secs: u64,
+    #[case] expects_void: bool,
+) {
+    const SECOND_NS: u64 = 1_000_000_000;
+
+    let client_order_id = ClientOrderId::from("O-FILL-VOID-COVERAGE");
+    let venue_order_id = VenueOrderId::from("V-FILL-VOID-COVERAGE");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    for (trade_id, quantity, ts_event_secs) in [("T-FIRST", 40, 8), ("T-LAST", 60, 10)] {
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .trade_id(TradeId::from(trade_id))
+                    .order_side(OrderSide::Buy)
+                    .order_type(OrderType::Limit)
+                    .last_qty(Quantity::from(quantity))
+                    .last_px(Price::from("1.00000"))
+                    .currency(instrument.quote_currency())
+                    .ts_event(UnixNanos::from(ts_event_secs * SECOND_NS))
+                    .build(),
+            ))
+            .unwrap();
+    }
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(100),
+        Quantity::from(50),
+    );
+    report.avg_px = Some(dec!(1.0));
+    let snapshot_fills: Vec<FillReport> = listed
+        .iter()
+        .map(|(trade_id, ts_event_secs)| {
+            let mut fill = create_test_fill_report(
+                instrument.id(),
+                VenueOrderId::from("V-OTHER"),
+                TradeId::from(*trade_id),
+                Quantity::from(1),
+                Price::from("1.00000"),
+            );
+            fill.account_id = account_id;
+            fill.ts_event = UnixNanos::from(ts_event_secs * SECOND_NS);
+            fill
+        })
+        .collect();
+    // The collection age needed to prove a fill absent is 5 s.
+    let coverage = SnapshotFillCoverage::new(
+        UnixNanos::from(collected_at_secs * SECOND_NS),
+        5 * SECOND_NS,
+        &snapshot_fills,
+    );
+
+    let events = generate_reconciliation_order_snapshot_events_with_coverage(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(100 * SECOND_NS),
+        &coverage,
+    );
+
+    if expects_void {
+        let [OrderEventAny::FillVoided(voided)] = events.as_slice() else {
+            panic!("expected one fill correction, was {events:?}");
+        };
+        assert_eq!(voided.trade_id, TradeId::from("T-LAST"));
+        assert_eq!(voided.voided_qty, Quantity::from(50));
+        assert!(voided.is_reopened);
+    } else {
+        assert!(
+            events.is_empty(),
+            "the snapshot must not void a fill, was {events:?}"
+        );
+        // The ungated snapshot path voids the newest fill on the same report.
+        let ungated = generate_reconciliation_order_snapshot_events(
+            &order,
+            &report,
+            Some(&instrument),
+            UnixNanos::from(100 * SECOND_NS),
+        );
+        assert_eq!(ungated.len(), 1);
+    }
+}
+
+#[rstest]
+fn test_snapshot_coverage_does_not_gate_terminal_reports(instrument: InstrumentAny) {
+    let client_order_id = ClientOrderId::from("O-FILL-VOID-TERMINAL-COVERAGE");
+    let venue_order_id = VenueOrderId::from("V-FILL-VOID-TERMINAL-COVERAGE");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    order
+        .apply(OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .venue_order_id(venue_order_id)
+                .account_id(account_id)
+                .trade_id(TradeId::from("T-ONLY"))
+                .order_side(OrderSide::Buy)
+                .order_type(OrderType::Limit)
+                .last_qty(Quantity::from(60))
+                .last_px(Price::from("1.00000"))
+                .currency(instrument.quote_currency())
+                .build(),
+        ))
+        .unwrap();
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Canceled,
+        Quantity::from(100),
+        Quantity::from(20),
+    );
+    report.avg_px = Some(dec!(1.0));
+    // An empty snapshot proves nothing, but a terminal report is final venue state.
+    let coverage = SnapshotFillCoverage::new(UnixNanos::default(), 0, &[]);
+
+    let events = generate_reconciliation_order_snapshot_events_with_coverage(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(10),
+        &coverage,
+    );
+
+    assert!(
+        matches!(events.first(), Some(OrderEventAny::FillVoided(voided)) if voided.voided_qty == Quantity::from(40))
+    );
+}
+
+#[rstest]
 fn test_terminal_fill_void_uses_remaining_leaves_after_fill_correction(instrument: InstrumentAny) {
     let client_order_id = ClientOrderId::from("O-FILL-VOID-TERMINAL");
     let venue_order_id = VenueOrderId::from("V-FILL-VOID-TERMINAL");
