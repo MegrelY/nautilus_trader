@@ -21,7 +21,7 @@ use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
     events::{
         OrderAccepted, OrderEventAny, OrderFilled, OrderPendingCancel, OrderPendingUpdate,
-        OrderSubmitted,
+        OrderSubmitted, OrderTriggered,
         order::spec::{
             OrderAcceptedSpec, OrderFilledSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
             OrderSubmittedSpec, OrderUpdatedSpec,
@@ -3581,6 +3581,144 @@ fn test_reconcile_order_report_generates_updated(instrument: InstrumentAny) {
     let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
     assert!(result.is_some());
     assert!(matches!(result.unwrap(), OrderEventAny::Updated(_)));
+}
+
+/// A stop-limit order that the venue accepted and then triggered, as the cache holds it.
+fn triggered_stop_limit_order(instrument: &InstrumentAny) -> OrderAny {
+    let venue_order_id = VenueOrderId::from("V-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00100"))
+        .trigger_price(Price::from("1.00000"))
+        .build();
+
+    let submitted = build_order_submitted(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        account_id,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+
+    let accepted = build_order_accepted(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        venue_order_id,
+        account_id,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+    );
+    order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+    let triggered = OrderTriggered::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+        Some(venue_order_id),
+        Some(account_id),
+    );
+    order.apply(OrderEventAny::Triggered(triggered)).unwrap();
+    assert_eq!(order.status(), OrderStatus::Triggered);
+    order
+}
+
+/// The report of a venue without a triggered state (Hyperliquid) for the order of
+/// `triggered_stop_limit_order`: the triggered order rests on the book, and the venue calls it open.
+fn open_stop_limit_report(
+    instrument: &InstrumentAny,
+    price: &str,
+    quantity: u64,
+) -> OrderStatusReport {
+    let mut report = create_test_order_status_report(
+        ClientOrderId::from("O-001"),
+        VenueOrderId::from("V-001"),
+        instrument.id(),
+        OrderType::StopLimit,
+        OrderStatus::Accepted,
+        Quantity::from(quantity),
+        Quantity::from(0),
+    );
+    report.price = Some(Price::from(price));
+    report.trigger_price = Some(Price::from("1.00000"));
+    report
+}
+
+#[rstest]
+fn test_reconcile_order_report_triggered_order_reported_open_is_in_sync(instrument: InstrumentAny) {
+    let order = triggered_stop_limit_order(&instrument);
+    let report = open_stop_limit_report(&instrument, "1.00100", 100);
+
+    // The order model has no transition from Triggered back to Accepted, so an
+    // acceptance here is an event that the engine refuses on every check.
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    assert!(result.is_none(), "{result:?}");
+}
+
+#[rstest]
+#[case::changed_price("1.00200", 100)]
+#[case::changed_quantity("1.00100", 90)]
+fn test_reconcile_order_report_triggered_order_reported_open_with_change_generates_updated(
+    instrument: InstrumentAny,
+    #[case] price: &str,
+    #[case] quantity: u64,
+) {
+    let mut order = triggered_stop_limit_order(&instrument);
+    let report = open_stop_limit_report(&instrument, price, quantity);
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    let Some(event @ OrderEventAny::Updated(_)) = result else {
+        panic!("Expected Updated event, was {result:?}");
+    };
+
+    // The model takes the update and keeps the triggered state.
+    order.apply(event).unwrap();
+    assert_eq!(order.status(), OrderStatus::Triggered);
+    assert_eq!(order.quantity(), report.quantity);
+    assert_eq!(order.price(), report.price);
+}
+
+#[rstest]
+fn test_generate_reconciliation_order_events_triggered_order_reported_open_gives_one_update(
+    instrument: InstrumentAny,
+) {
+    let order = triggered_stop_limit_order(&instrument);
+
+    let same = open_stop_limit_report(&instrument, "1.00100", 100);
+    let events = generate_reconciliation_order_events(
+        &order,
+        &same,
+        Some(&instrument),
+        UnixNanos::default(),
+    );
+    assert!(events.is_empty(), "{events:?}");
+
+    let moved = open_stop_limit_report(&instrument, "1.00200", 100);
+    let events = generate_reconciliation_order_events(
+        &order,
+        &moved,
+        Some(&instrument),
+        UnixNanos::default(),
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(matches!(events[0], OrderEventAny::Updated(_)), "{events:?}");
 }
 
 #[rstest]

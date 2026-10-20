@@ -402,6 +402,10 @@ fn prepare_reconciliation_order(
 /// Returns `None` for a `Canceled` report that references a previously-promoted
 /// `venue_order_id` whose successor is still live in the cache (the cancel-half
 /// of a cancel-replace modify).
+///
+/// Treats an `Accepted` report of a `Triggered` order as the same state, because
+/// a venue with no triggered state reports a triggered order that rests on the
+/// book as open. Only a changed quantity or price then yields an `OrderUpdated`.
 #[must_use]
 pub fn reconcile_order_report(
     order: &OrderAny,
@@ -421,7 +425,7 @@ pub fn reconcile_order_report(
         return None;
     }
 
-    if order.status() == report.order_status && order.filled_qty() == report.filled_qty {
+    if local_status_matches_report(order, report) && order.filled_qty() == report.filled_qty {
         if should_reconciliation_update(order, report) {
             log::info!(
                 "Order {} has been updated at venue: qty={}->{}, price={:?}->{:?}",
@@ -1380,6 +1384,19 @@ pub(crate) fn is_superseded_cancel_report(order: &OrderAny, report: &OrderStatus
             .venue_order_ids()
             .iter()
             .any(|venue_order_id| **venue_order_id == report.venue_order_id)
+}
+
+/// Whether the local order already holds the status that the report names.
+///
+/// A venue with no separate triggered state, such as Hyperliquid, reports a
+/// triggered conditional order that rests on the book as plainly open, which
+/// reads as `Accepted`. The local order is `Triggered`, and the order model has
+/// no transition from `Triggered` back to `Accepted`, so an acceptance would be
+/// refused each time the venue state is checked.
+fn local_status_matches_report(order: &OrderAny, report: &OrderStatusReport) -> bool {
+    order.status() == report.order_status
+        || (order.status() == OrderStatus::Triggered
+            && report.order_status == OrderStatus::Accepted)
 }
 
 fn local_accepts_amendment(order: &OrderAny) -> bool {
