@@ -1014,6 +1014,19 @@ pub fn parse_order_status_report_from_basic(
     let filled_qty = Quantity::from_decimal_dp(filled_sz, size_precision)
         .map_err(|e| anyhow::anyhow!("Failed to create quantity from filled_sz: {e}"))?;
 
+    // Hyperliquid can end a triggered order after a partial fill. It then reports the order
+    // as `filled` with the unfilled remainder in `sz`. A full fill has `sz` = 0. The venue
+    // ended the remainder, so the order is canceled. Only the status changes. The quantities
+    // stay as the venue reports them. The price rule below uses the venue status, so this
+    // report has no price.
+    let report_status =
+        if order_status == OrderStatus::Filled && filled_qty.is_positive() && filled_qty < quantity
+        {
+            OrderStatus::Canceled
+        } else {
+            order_status
+        };
+
     let ts_accepted = UnixNanos::from(order.timestamp * 1_000_000);
     let ts_last = ts_accepted;
     let report_id = UUID4::new();
@@ -1026,7 +1039,7 @@ pub fn parse_order_status_report_from_basic(
         order_side,
         order_type,
         time_in_force,
-        order_status,
+        report_status,
         quantity,
         filled_qty,
         ts_accepted,
@@ -2552,5 +2565,98 @@ mod tests {
         assert!(meta.parent_question(7).is_some());
         assert!(meta.parent_question(6).is_some());
         assert!(meta.parent_question(99).is_none());
+    }
+
+    fn atom_instrument() -> InstrumentAny {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+        create_instrument_from_def(&defs[2], UnixNanos::default()).unwrap()
+    }
+
+    /// An `orderStatus` entry carries no trigger fields, so it reads as a limit order.
+    fn order_status_entry(orig_sz: Decimal, sz: Decimal) -> WsBasicOrderData {
+        WsBasicOrderData {
+            coin: Ustr::from("ATOM"),
+            side: HyperliquidSide::Sell,
+            limit_px: dec!(4.1950),
+            sz,
+            oid: 608_474_641_349,
+            timestamp: 1_704_470_400_000,
+            orig_sz,
+            cloid: Some("0xd211f1c27288259290850338d22132a0".to_string()),
+            tif: None,
+            reduce_only: None,
+            trigger_px: None,
+            is_market: None,
+            tpsl: None,
+            trigger_activated: None,
+            trailing_stop: None,
+        }
+    }
+
+    fn order_status_report(
+        status: HyperliquidOrderStatusEnum,
+        orig_sz: Decimal,
+        sz: Decimal,
+    ) -> OrderStatusReport {
+        parse_order_status_report_from_basic(
+            &order_status_entry(orig_sz, sz),
+            &status,
+            &atom_instrument(),
+            AccountId::new("HYPERLIQUID-001"),
+            UnixNanos::default(),
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_filled_with_remainder_reads_as_canceled() {
+        // A live case: a triggered stop limit of 11140.8 units that the venue reported as
+        // `filled` with 3620.4 units unfilled.
+        let report = order_status_report(
+            HyperliquidOrderStatusEnum::Filled,
+            dec!(11140.8),
+            dec!(3620.4),
+        );
+
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.quantity, Quantity::from("11140.80"));
+        assert_eq!(report.filled_qty, Quantity::from("7520.40"));
+        assert_eq!(
+            report.price, None,
+            "a filled report carries no price, and neither does this one"
+        );
+        assert_eq!(report.venue_order_id, VenueOrderId::new("608474641349"));
+        assert_eq!(
+            report.ts_accepted,
+            UnixNanos::from(1_704_470_400_000 * 1_000_000)
+        );
+        assert_eq!(report.ts_last, report.ts_accepted);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_filled_in_full_stays_filled() {
+        let report =
+            order_status_report(HyperliquidOrderStatusEnum::Filled, dec!(11140.8), dec!(0));
+
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.filled_qty, report.quantity);
+        assert_eq!(report.price, None);
+    }
+
+    #[rstest]
+    #[case::open(HyperliquidOrderStatusEnum::Open, OrderStatus::Accepted)]
+    #[case::triggered(HyperliquidOrderStatusEnum::Triggered, OrderStatus::Triggered)]
+    #[case::canceled(HyperliquidOrderStatusEnum::Canceled, OrderStatus::Canceled)]
+    fn test_parse_order_status_report_with_remainder_keeps_a_status_that_is_not_filled(
+        #[case] status: HyperliquidOrderStatusEnum,
+        #[case] expected: OrderStatus,
+    ) {
+        let report = order_status_report(status, dec!(11140.8), dec!(3620.4));
+
+        assert_eq!(report.order_status, expected);
+        assert_eq!(report.quantity, Quantity::from("11140.80"));
+        assert_eq!(report.filled_qty, Quantity::from("7520.40"));
+        assert_eq!(report.price, Some(Price::from("4.1950")));
     }
 }
