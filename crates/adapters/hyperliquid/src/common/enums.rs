@@ -177,9 +177,13 @@ pub enum HyperliquidTimeInForce {
     /// Add Liquidity Only - post-only order.
     Alo,
     /// Immediate or Cancel - fill immediately or cancel.
-    // The info API labels frontend market orders this way. Normalize only
-    // reads; our outgoing immediate-or-cancel orders still serialize as Ioc.
+    // The info API labels a frontend market order `FrontendMarket`. It labels a
+    // market order that the venue places on an account to liquidate it
+    // `LiquidationMarket`. Both are immediate-or-cancel orders. The aliases
+    // normalize reads only: our outgoing immediate-or-cancel orders still
+    // serialize as Ioc.
     #[serde(alias = "FrontendMarket")]
+    #[serde(alias = "LiquidationMarket")]
     Ioc,
     /// Good Till Cancel - remain on book until filled or cancelled.
     Gtc,
@@ -1181,6 +1185,18 @@ mod tests {
                 tif
             );
         }
+    }
+
+    #[rstest]
+    fn test_time_in_force_liquidation_market_is_an_incoming_ioc_alias_only() {
+        assert_eq!(
+            serde_json::from_str::<HyperliquidTimeInForce>("\"LiquidationMarket\"").unwrap(),
+            HyperliquidTimeInForce::Ioc,
+        );
+        assert_eq!(
+            serde_json::to_string(&HyperliquidTimeInForce::Ioc).unwrap(),
+            "\"Ioc\"",
+        );
     }
 
     #[rstest]
